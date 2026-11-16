@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-power-system-analysis"
+version = "0.1.0"
+description = "Hybrid AC/DC power-flow and state-estimation program modules."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[tool.setuptools]
+py-modules = [
+    "algorithm_parameters",
+    "efile_read",
+    "hybrid_net_flow",
+    "paths",
+    "unit_system",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cacore", "drawcore", "lfcore", "model", "secore", "simu"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["tests", "benchmarks", "log", "output", "tmp"]
