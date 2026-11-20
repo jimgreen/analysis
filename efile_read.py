@@ -136,6 +136,15 @@ class EBook():
         
     def _read_file_(self, file_path):
         file_path = resolve_project_file(file_path)
+        if Path(file_path).suffix.lower() in {".sqlite3", ".sqlite", ".db"}:
+            from sqlite_io import read_sqlite_rows
+            for name, rows in read_sqlite_rows(file_path).items():
+                block = EBlock(name)
+                block.header_list = rows["header_list"]
+                for row in rows["rows"]:
+                    block.AddRow(row)
+                self.data[name] = block
+            return
         data = self.data
         block_read = None
         split_data_row = _split_data_row
@@ -202,6 +211,9 @@ class EBook():
 
 def _read_efile_rows(file_path):
     file_path = resolve_project_file(file_path)
+    if Path(file_path).suffix.lower() in {".sqlite3", ".sqlite", ".db"}:
+        from sqlite_io import read_sqlite_rows
+        return read_sqlite_rows(file_path)
     data = {}
     block_name = None
     header = None

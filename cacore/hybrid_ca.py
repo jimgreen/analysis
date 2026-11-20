@@ -296,10 +296,10 @@ def collect_limit_risks(result, constraints, source: str) -> list[CARisk]:
     return risks
 
 
-def _run_case(model_file: str | Path):
+def _run_case(model_file: str | Path, parameters=None):
     try:
         network = _read_lf_network_from_file(model_file)
-        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="full")
+        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="full", parameters=parameters)
         calc.run()
         result = calc.lf_result
         return result, None
@@ -341,7 +341,10 @@ def _write_outage_case(src_file: str | Path, dst_file: str | Path, table: str, i
             break
     else:
         raise ValueError(f"contingency device not found: {table}.{idx}")
-    book.apply_to_file(dst_file)
+    # Outage snapshots must use the UTF-8 encoding expected by the E-file reader.
+    Path(dst_file).write_text("".join(
+        _format_efile_block(name, b.header_list, b.data) for name, b in book.data.items()
+    ), encoding="utf8")
 
 
 def write_risk_result(risks: list[CARisk], result_file: str | Path) -> None:
@@ -419,6 +422,7 @@ def run_hybrid_ca(
     calc_info_file: str | Path = DEFAULT_CALC_INFO_FILE,
     *,
     scan_n1: bool = True,
+    parameters=None,
 ) -> tuple[list[CARisk], list[CARisk]]:
     start_clock = time.perf_counter()
     calc_start_time = datetime.now().isoformat(timespec="seconds")
@@ -427,7 +431,7 @@ def run_hybrid_ca(
     n1_risks: list[CARisk] = []
     n1_scan_count = 0
 
-    base_result, base_error = _run_case(model_file)
+    base_result, base_error = _run_case(model_file, parameters)
     if base_error is not None or base_result is None or not base_result.converged:
         detail = str(base_error) if base_error is not None else "hybrid_power_flow_not_converged"
         _add_risk(n0_risks, "BASE", "HybridPowerFlow", "潮流发散", 1, detail.replace(" ", "_"))
@@ -455,7 +459,7 @@ def run_hybrid_ca(
                 source = f"N-1:{source_table}.{display_name}"
                 outage_file = tmp_path / f"{table}_{idx}.e"
                 _write_outage_case(model_file, outage_file, table, idx)
-                result, error = _run_case(outage_file)
+                result, error = _run_case(outage_file, parameters)
                 if error is not None or result is None or not result.converged:
                     detail = str(error) if error is not None else "hybrid_power_flow_not_converged"
                     _add_risk(n1_risks, source, "HybridPowerFlow", "潮流发散", 1, detail.replace(" ", "_"))
