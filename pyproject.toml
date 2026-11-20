@@ -20,15 +20,7 @@ py-modules = [
     "hybrid_net_flow",
     "paths",
     "unit_system",
-    "workspace",
-    "sqlite_io",
-    "scada_measurements",
-    "result_sqlite",
-    "workspace_analysis",
 ]
-
-[project.scripts]
-analysis-workspace = "workspace_analysis:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

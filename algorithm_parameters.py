@@ -118,8 +118,6 @@ class StateEstimationParameters:
 
 def load_lf_parameters(path: Optional[Path] = None) -> PowerFlowParameters:
     parameter_file = resolve_project_file(path) if path is not None else DEFAULT_LF_PARAMETER_FILE
-    if parameter_file == DEFAULT_LF_PARAMETER_FILE and not parameter_file.exists():
-        return PowerFlowParameters(1e-8, 50, 0.01, 1e6)
     values = _load_key_value_block(parameter_file, "PowerFlowParameter")
     return PowerFlowParameters(
         tol=float(_require(values, "tol")),
@@ -131,9 +129,6 @@ def load_lf_parameters(path: Optional[Path] = None) -> PowerFlowParameters:
 
 def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters:
     parameter_file = resolve_project_file(path) if path is not None else DEFAULT_SE_PARAMETER_FILE
-    if parameter_file == DEFAULT_SE_PARAMETER_FILE and not parameter_file.exists():
-        return StateEstimationParameters(1e-8, 20, 1e-6, False, 3.0, 10, 1e-4,
-                                         2000, 0.0, 10, 0.05, 0.01, 1e-8, 200, 0.01)
     values = _load_key_value_block(parameter_file, "StateEstimationParameter")
     return StateEstimationParameters(
         tol=float(_require(values, "tol")),

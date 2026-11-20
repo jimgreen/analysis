@@ -4,7 +4,7 @@ from pathlib import Path
 
 PROJECT_ROOT = next(
     (path for path in Path(__file__).resolve().parents if (path / "pyproject.toml").exists()),
-    Path(__file__).resolve().parent,
+    Path(__file__).resolve().parents[2],
 )
 DATA_DIR = PROJECT_ROOT / "data"
 MODEL_DATA_DIR = DATA_DIR / "model"

@@ -984,9 +984,6 @@ def build_meas_ppc_from_e_file(
     source = resolve_project_file(file_path).resolve()
     include_strings = bool(include_strings)
     include_matrix = bool(include_matrix)
-    if source.suffix.lower() in {".sqlite3", ".sqlite", ".db"}:
-        from sqlite_io import read_sqlite_rows
-        return copy_meas_ppc(_build_meas_ppc_from_rows_dict(read_sqlite_rows(source), source))
     parsed = _build_meas_ppc_from_measurement_file(
         source,
         include_strings=include_strings,
