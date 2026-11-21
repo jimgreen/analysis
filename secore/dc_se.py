@@ -4043,17 +4043,40 @@ class DCStateEstimator:
         observability = self.observability_analysis()
         return self._add_weak_direction_observability_pseudo_measurements(observability, max_add, refresh)
 
-    def _observability_pseudo_candidate_measurements(self) -> MeasurementTableView:
-        """Build low-weight candidate pseudo rows for weak-direction observability repair."""
-        existing_keys = self._active_measurement_keys_ref()
+    def _observability_pseudo_candidate_measurements(
+        self,
+        allowed_device_type_codes: Optional[Sequence[int]] = None,
+        allowed_meas_types_by_device: Optional[Dict[int, Sequence[int]]] = None,
+    ) -> MeasurementTableView:
+        """构建低权重可观性修补候选伪量测；支持按设备类型码与量测类型码过滤跳过无关候选。"""
+        allowed_meas_map = (
+            {int(k): frozenset(int(m) for m in v) for k, v in allowed_meas_types_by_device.items()}
+            if allowed_meas_types_by_device is not None
+            else None
+        )
+        if allowed_device_type_codes is not None:
+            allowed_set = frozenset(int(c) for c in allowed_device_type_codes)
+        elif allowed_meas_map is not None:
+            allowed_set = frozenset(allowed_meas_map.keys())
+        else:
+            allowed_set = None
+        # 直接使用底层 Python set 引用与电压覆盖掩码，避免在循环内反复触发视图包装查表
+        existing_keys = self._active_measurement_key_set_ref()
+        covered_v_mask = self._real_voltage_observed_solver_pos_mask()
+        covered_v_size = int(covered_v_mask.size)
         candidate_keys = set()
         store_strings = False
+        need_node = allowed_set is None or DEVICE_TYPE_DCNode in allowed_set
+        need_load = allowed_set is None or DEVICE_TYPE_DCLoad in allowed_set
+        need_gen = allowed_set is None or DEVICE_TYPE_DCGenerator in allowed_set
+        need_branch = allowed_set is None or DEVICE_TYPE_DCBranch in allowed_set
+        need_dcdc = allowed_set is None or DEVICE_TYPE_DCDCConverter in allowed_set
         capacity = (
-            int(self._raw_node_names_alive.size)
-            + 2 * int(self._load_names.size)
-            + 2 * int(self._generator_names.size)
-            + 2 * int(self._branch_names.size)
-            + 2 * int(self._dcdc_names.size)
+            (int(self._raw_node_names_alive.size) if need_node else 0)
+            + (2 * int(self._load_names.size) if need_load else 0)
+            + (2 * int(self._generator_names.size) if need_gen else 0)
+            + (2 * int(self._branch_names.size) if need_branch else 0)
+            + (2 * int(self._dcdc_names.size) if need_dcdc else 0)
         )
         names = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
         device_types = np.empty(capacity, dtype=object) if store_strings else np.asarray([], dtype=object)
@@ -4077,14 +4100,19 @@ class DCStateEstimator:
             meas_type_code = int(meas_type_code)
             if device_type_code <= 0 or device_pos < 0 or meas_type_code <= 0:
                 return
+            if allowed_meas_map is not None:
+                allowed_mts = allowed_meas_map.get(device_type_code)
+                if allowed_mts is None or meas_type_code not in allowed_mts:
+                    return
             key = self._active_measurement_key(device_type_code, device_pos, meas_type_code)
-            if (
-                _is_voltage_measurement_type_code(meas_type_code)
-                and self._voltage_pseudo_is_covered_by_pos(device_type_code, device_pos, meas_type_code)
-            ):
-                return
             if key in existing_keys or key in candidate_keys:
                 return
+            if _is_voltage_measurement_type_code(meas_type_code):
+                node_idx = self._voltage_measurement_node_idx_from_pos(device_type_code, device_pos, meas_type_code)
+                if node_idx is not None:
+                    pos = self._node_pos_from_idx(int(node_idx))
+                    if 0 <= pos < covered_v_size and covered_v_mask[pos]:
+                        return
             row = count
             if store_strings:
                 names[row] = ""
@@ -4098,60 +4126,65 @@ class DCStateEstimator:
             count = row + 1
             candidate_keys.add(key)
 
-        for device_pos in range(int(self._raw_node_names_alive.size)):
-            node_pos = self._raw_node_solver_pos_alive[device_pos]
-            node_pos = int(node_pos)
-            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
-            add(DEVICE_TYPE_DCNode, int(device_pos), MEAS_TYPE_V, voltage)
+        if need_node:
+            for device_pos in range(int(self._raw_node_names_alive.size)):
+                node_pos = self._raw_node_solver_pos_alive[device_pos]
+                node_pos = int(node_pos)
+                voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+                add(DEVICE_TYPE_DCNode, int(device_pos), MEAS_TYPE_V, voltage)
 
-        load_rows = self._load_rows.astype(np.intp, copy=False)
-        for device_pos in range(int(self._load_names.size)):
-            node_pos = int(self._load_pos[device_pos])
-            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
-            row = int(load_rows[device_pos])
-            table_row = self._load_table[row]
-            p_value = float(table_row[DC_LOAD_COLS["p"]])
-            if p_value == 0.0:
-                p_value = float(table_row[DC_LOAD_COLS["pbase"]]) * (
-                    float(table_row[DC_LOAD_COLS["pv0"]])
-                    + float(table_row[DC_LOAD_COLS["pv1"]]) * voltage
-                    + float(table_row[DC_LOAD_COLS["pv2"]]) * voltage * voltage
-                )
-            add(DEVICE_TYPE_DCLoad, device_pos, MEAS_TYPE_P_LOAD, p_value)
-            add(DEVICE_TYPE_DCLoad, device_pos, MEAS_TYPE_V_LOAD, voltage)
+        if need_load:
+            load_rows = self._load_rows.astype(np.intp, copy=False)
+            for device_pos in range(int(self._load_names.size)):
+                node_pos = int(self._load_pos[device_pos])
+                voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+                row = int(load_rows[device_pos])
+                table_row = self._load_table[row]
+                p_value = float(table_row[DC_LOAD_COLS["p"]])
+                if p_value == 0.0:
+                    p_value = float(table_row[DC_LOAD_COLS["pbase"]]) * (
+                        float(table_row[DC_LOAD_COLS["pv0"]])
+                        + float(table_row[DC_LOAD_COLS["pv1"]]) * voltage
+                        + float(table_row[DC_LOAD_COLS["pv2"]]) * voltage * voltage
+                    )
+                add(DEVICE_TYPE_DCLoad, device_pos, MEAS_TYPE_P_LOAD, p_value)
+                add(DEVICE_TYPE_DCLoad, device_pos, MEAS_TYPE_V_LOAD, voltage)
 
-        gen_rows = self._generator_rows.astype(np.intp, copy=False)
-        for device_pos in range(int(self._generator_names.size)):
-            node_pos = int(self._generator_pos[device_pos])
-            voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
-            row = int(gen_rows[device_pos])
-            table_row = self._gen_table[row]
-            p_value = float(table_row[DC_GEN_COLS["p"]])
-            if p_value == 0.0:
-                ctrl = int(table_row[DC_GEN_COLS["control_type"]])
-                p_value = (
-                    float(table_row[DC_GEN_COLS["i_set"]]) * voltage
-                    if ctrl == DC_CTRL_I
-                    else float(table_row[DC_GEN_COLS["p_set"]])
-                )
-            add(DEVICE_TYPE_DCGenerator, device_pos, MEAS_TYPE_P_GEN, p_value)
-            add(DEVICE_TYPE_DCGenerator, device_pos, MEAS_TYPE_V_GEN, voltage)
+        if need_gen:
+            gen_rows = self._generator_rows.astype(np.intp, copy=False)
+            for device_pos in range(int(self._generator_names.size)):
+                node_pos = int(self._generator_pos[device_pos])
+                voltage = float(self._node_voltage_by_pos[node_pos] if 0 <= node_pos < self._node_voltage_by_pos.size else 1.0)
+                row = int(gen_rows[device_pos])
+                table_row = self._gen_table[row]
+                p_value = float(table_row[DC_GEN_COLS["p"]])
+                if p_value == 0.0:
+                    ctrl = int(table_row[DC_GEN_COLS["control_type"]])
+                    p_value = (
+                        float(table_row[DC_GEN_COLS["i_set"]]) * voltage
+                        if ctrl == DC_CTRL_I
+                        else float(table_row[DC_GEN_COLS["p_set"]])
+                    )
+                add(DEVICE_TYPE_DCGenerator, device_pos, MEAS_TYPE_P_GEN, p_value)
+                add(DEVICE_TYPE_DCGenerator, device_pos, MEAS_TYPE_V_GEN, voltage)
 
-        branch_table = np.asarray(self._dc_ppc.get("branch", np.zeros((0, len(DC_BRANCH_COLS)))), dtype=np.float64)
-        branch_rows = self._branch_rows.astype(np.intp, copy=False)
-        for device_pos in range(int(self._branch_names.size)):
-            row = int(branch_rows[device_pos])
-            if 0 <= row < branch_table.shape[0]:
-                add(DEVICE_TYPE_DCBranch, device_pos, MEAS_TYPE_P_FROM, float(branch_table[row, DC_BRANCH_COLS["i_p"]]))
-                add(DEVICE_TYPE_DCBranch, device_pos, MEAS_TYPE_P_TO, float(branch_table[row, DC_BRANCH_COLS["j_p"]]))
+        if need_branch:
+            branch_table = np.asarray(self._dc_ppc.get("branch", np.zeros((0, len(DC_BRANCH_COLS)))), dtype=np.float64)
+            branch_rows = self._branch_rows.astype(np.intp, copy=False)
+            for device_pos in range(int(self._branch_names.size)):
+                row = int(branch_rows[device_pos])
+                if 0 <= row < branch_table.shape[0]:
+                    add(DEVICE_TYPE_DCBranch, device_pos, MEAS_TYPE_P_FROM, float(branch_table[row, DC_BRANCH_COLS["i_p"]]))
+                    add(DEVICE_TYPE_DCBranch, device_pos, MEAS_TYPE_P_TO, float(branch_table[row, DC_BRANCH_COLS["j_p"]]))
 
-        dcdc_table = np.asarray(self._dc_ppc.get("dcdc", np.zeros((0, len(DC_DCDC_COLS)))), dtype=np.float64)
-        dcdc_rows = self._dcdc_rows.astype(np.intp, copy=False)
-        for device_pos in range(int(self._dcdc_names.size)):
-            row = int(dcdc_rows[device_pos])
-            if 0 <= row < dcdc_table.shape[0]:
-                add(DEVICE_TYPE_DCDCConverter, device_pos, MEAS_TYPE_P_FROM, float(dcdc_table[row, DC_DCDC_COLS["i_p"]]))
-                add(DEVICE_TYPE_DCDCConverter, device_pos, MEAS_TYPE_P_TO, float(dcdc_table[row, DC_DCDC_COLS["j_p"]]))
+        if need_dcdc:
+            dcdc_table = np.asarray(self._dc_ppc.get("dcdc", np.zeros((0, len(DC_DCDC_COLS)))), dtype=np.float64)
+            dcdc_rows = self._dcdc_rows.astype(np.intp, copy=False)
+            for device_pos in range(int(self._dcdc_names.size)):
+                row = int(dcdc_rows[device_pos])
+                if 0 <= row < dcdc_table.shape[0]:
+                    add(DEVICE_TYPE_DCDCConverter, device_pos, MEAS_TYPE_P_FROM, float(dcdc_table[row, DC_DCDC_COLS["i_p"]]))
+                    add(DEVICE_TYPE_DCDCConverter, device_pos, MEAS_TYPE_P_TO, float(dcdc_table[row, DC_DCDC_COLS["j_p"]]))
 
         candidate_table = self._pseudo_measurement_table(
             names[:count] if store_strings else np.asarray([], dtype=object),
@@ -5271,6 +5304,11 @@ class DCStateEstimator:
         """Assemble analytical DC measurement sensitivities directly as sparse CSR."""
         return self._assemble_jacobian(x, measurements, sparse=True)
 
+    def jacobian(self, x: np.ndarray, measurements: Optional[object] = None) -> np.ndarray:
+        """返回稠密量测雅可比矩阵（与 AC/Hybrid SE 接口保持一致）。"""
+        H = self.jacobian_sparse(x, measurements)
+        return H.toarray() if is_sparse_matrix(H) else np.asarray(H, dtype=np.float64)
+
     def observability_analysis(
         self,
         x: Optional[np.ndarray] = None,
@@ -5727,7 +5765,7 @@ class DCStateEstimator:
         if solve_profile_start is not None:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         result_table = self._common_measurement_plan_table(measurement_plan_tables).table
-        return EstimateResult(
+        estimate_result = EstimateResult(
             converged=converged,
             iterations=iteration,
             objective=objective,
@@ -5743,6 +5781,13 @@ class DCStateEstimator:
             measurement_plan_tables=measurement_plan_tables,
             measurement_table=result_table,
         )
+        cached_factor = (
+            aat_solver.last_cholmod_factor
+            if (final_diagnostics and final_quantities_current and aat_solver is not None and gain is None)
+            else None
+        )
+        self._last_estimate_cholmod_factor = (id(estimate_result), cached_factor) if cached_factor is not None else None
+        return estimate_result
 
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
         """Compute largest normalized residuals after accounting for measurement leverage."""
@@ -5770,18 +5815,37 @@ class DCStateEstimator:
                     self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
                 return [], normalized_upper_bound
         R_diag = 1.0 / weights
-        if self.n_state > 5000 and (result.H is None or result.gain is None):
+        cached_pair = getattr(self, "_last_estimate_cholmod_factor", None)
+        cached_factor = (
+            cached_pair[1]
+            if (isinstance(cached_pair, tuple) and len(cached_pair) == 2 and cached_pair[0] == id(result))
+            else None
+        )
+        if self.n_state > 5000 and (result.H is None or (result.gain is None and cached_factor is None)):
             leverage = None
         else:
-            if result.H is None or result.gain is None:
+            if result.H is None:
                 result.H = self.jacobian_sparse(result.x, plan_tables)
+                cached_factor = None
+            if result.gain is None and cached_factor is None:
                 result.gain, _ = build_normal_equations(
                     result.H,
                     result.residual,
                     weights,
                 )
             gain_inverse_start = time.perf_counter() if self.profile_enabled else None
-            leverage = measurement_leverage_for_bad_data(result.H, result.gain)
+            leverage = measurement_leverage_for_bad_data(
+                result.H,
+                result.gain,
+                cholmod_factor=cached_factor,
+            )
+            if leverage is None and result.gain is None and self.n_state <= 5000:
+                result.gain, _ = build_normal_equations(
+                    result.H,
+                    result.residual,
+                    weights,
+                )
+                leverage = measurement_leverage_for_bad_data(result.H, result.gain)
             if gain_inverse_start is not None:
                 self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
         if leverage is None:

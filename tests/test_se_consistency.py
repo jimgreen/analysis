@@ -257,6 +257,7 @@ def test_se_init_and_public_api_consistency():
         "apply_state",
         "initial_state",
         "evaluate",
+        "jacobian",
         "jacobian_sparse",
         "measurement_device_counts",
         "measurement_device_names",
@@ -272,6 +273,12 @@ def test_se_init_and_public_api_consistency():
         assert param_lists[0] == param_lists[1] == param_lists[2], (
             f"Signature mismatch for {method_name}: {param_lists}"
         )
+
+    for prop_name in ("state_labels", "state_meta"):
+        for cls in classes:
+            assert isinstance(getattr(cls, prop_name, None), property), (
+                f"{cls.__name__} missing @property {prop_name}"
+            )
 
 
 @pytest.mark.parametrize("kind", ["ac", "dc", "hybrid"])
@@ -296,11 +303,26 @@ def test_se_modes_bad_data_and_apply_state_consistency(tmp_path: Path, kind: str
             auto_prepare=False,
         )
         assert est.diff_step == SE_PARAMS.diff_step
+        assert list(est.state_labels) == []
+        assert list(est.state_meta) == []
         est.prepare()
+        assert len(est.state_labels) == est.n_state
+        assert len(est.state_meta) == est.n_state
         se_res = est.run(result_mode=mode, skip_bad_data=False, verbose=False)
         assert est.estimate_result is not None and est.estimate_result.converged
         assert len(est.bad_items) >= 1
+        assert "bad_data.total" in est.profile_times
         assert est.normalized_residual.size == est.estimate_result.residual.size
+        if mode == "full":
+            J_dense = est.jacobian(est.estimate_result.x)
+            J_sparse = est.jacobian_sparse(est.estimate_result.x).toarray()
+            assert np.allclose(J_dense, J_sparse, rtol=1e-12, atol=1e-12)
+            if kind == "hybrid":
+                # 验证兼容设备视图按需懒加载可用
+                assert not est._compatibility_device_views_ready
+                assert len(est.ac_nodes) > 0 and len(est.dc_nodes) > 0
+                assert "dcac_1" in est.dcac_by_name
+                assert est._compatibility_device_views_ready
         counts = est.measurement_device_counts()
         assert isinstance(counts, dict) and len(counts) > 0
         names = est.measurement_device_names()
@@ -336,3 +358,53 @@ def test_sparse_selected_inversion_leverage_matches_dense_exact(tmp_path: Path):
     assert lev_sparse is not None
     assert np.allclose(lev_sparse, lev_dense, rtol=1e-10, atol=1e-11)
     assert measurement_leverage_for_bad_data(H, G, dense_state_limit=100) is None
+
+
+@pytest.mark.parametrize("kind", ["ac", "dc", "hybrid"])
+def test_se_bad_data_removal_end_to_end(tmp_path: Path, kind: str):
+    """AC / DC / Hybrid SE 在平启动下均应正确完成端到端坏数据剔除。"""
+    if kind == "ac":
+        ef, mf = _generate_ac_case(16, tmp_path, inject_bad=True)
+        cls = ACStateEstimator
+    elif kind == "dc":
+        ef, mf = _generate_dc_case(16, tmp_path, inject_bad=True)
+        cls = DCStateEstimator
+    else:
+        ef, mf = _generate_hybrid_case(12, 8, tmp_path, inject_bad=True)
+        cls = HybridStateEstimator
+
+    est = cls(e_file=ef, meas_file=mf, parameters=SE_PARAMS, flat_start=True)
+    se_res = est.run(result_mode="full", remove_bad_data=True, verbose=False)
+    assert est.estimate_result is not None and est.estimate_result.converged
+    assert len(est.removed_bad_data) >= 1
+    assert len(est.bad_items) == 0
+    assert isinstance(se_res, SEResult)
+    assert se_res.statistics.bad_data_count == 0
+
+
+def test_hybrid_selected_inversion_with_cholmod_backfill_matches_dense(tmp_path: Path):
+    """交直流混合网络稀疏选择逆（含 CHOLMOD 因子缓存与缺失对回代）应与稠密求逆机器精度一致。"""
+    from secore.se_math import CHOLMOD_CHOLESKY
+
+    ef, mf = _generate_hybrid_case(120, 80, tmp_path, inject_bad=True)
+    est = HybridStateEstimator(e_file=ef, meas_file=mf, parameters=SE_PARAMS, flat_start=True)
+    res = est.estimate(verbose=False, final_diagnostics=True)
+    assert res.converged and res.H is not None
+    H = res.H
+    _z, w = est._measurement_vectors(est.active_measurements)
+    G, _ = build_normal_equations(H, res.residual, w, dense_gain_limit=0)
+    factor = CHOLMOD_CHOLESKY(G.tocsc())
+
+    lev_sparse = measurement_leverage_for_bad_data(
+        H,
+        None,
+        dense_state_limit=5000,
+        sparse_threshold=10,
+        cholmod_factor=factor,
+    )
+    G_inv_dense = inverse_gain_for_bad_data(G, dense_state_limit=5000)
+    lev_dense = measurement_leverage(H, G_inv_dense)
+
+    assert lev_sparse is not None
+    assert np.allclose(lev_sparse, lev_dense, rtol=1e-10, atol=1e-11)
+

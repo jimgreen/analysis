@@ -4811,40 +4811,61 @@ class ACStateEstimator:
                 self._refresh_active_measurement_indexes()
         return selected_count
 
-    def _observability_pseudo_candidate_measurements(self) -> Sequence[Measurement]:
-        """Build low-weight candidate pseudo rows for weak-direction observability repair."""
-        existing_keys = self._active_measurement_keys_ref()
+    def _observability_pseudo_candidate_measurements(
+        self,
+        allowed_device_type_codes: Optional[Sequence[int]] = None,
+        allowed_meas_types_by_device: Optional[Dict[int, Sequence[int]]] = None,
+    ) -> Sequence[Measurement]:
+        """构建低权重可观性修补候选伪量测；支持按设备类型码与量测类型码过滤跳过无关候选。"""
+        allowed_meas_map = (
+            {int(k): frozenset(int(m) for m in v) for k, v in allowed_meas_types_by_device.items()}
+            if allowed_meas_types_by_device is not None
+            else None
+        )
+        if allowed_device_type_codes is not None:
+            allowed_set = frozenset(int(c) for c in allowed_device_type_codes)
+        elif allowed_meas_map is not None:
+            allowed_set = frozenset(allowed_meas_map.keys())
+        else:
+            allowed_set = None
+        # 直接提取底层 Python set 引用与电压覆盖掩码，避免在万级循环中反复穿透视图包装方法
+        existing_keys = self._active_measurement_key_set_ref()
+        covered_v_mask = self._real_voltage_observed_solver_pos_mask()
+        covered_v_size = int(covered_v_mask.size)
         candidate_keys = set()
         ppc = self._ac_ppc_dict()
         topology = ppc.get("_topology_arrays")
         if topology is None:
             self._warn_required_runtime_missing("PPC topology arrays", "observability pseudo candidate build")
         store_strings = False
-        candidate_rows = _PseudoMeasurementBuffer(
-            int(np.asarray(ppc.get("bus", np.zeros((0, len(BUS_COLS)))), dtype=np.float64).shape[0])
-            + 3 * int(np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64).shape[0])
-            + 3 * int(np.asarray(ppc.get("gen", np.zeros((0, len(GEN_COLS)))), dtype=np.float64).shape[0])
-            + 4 * int(np.asarray(ppc.get("branch", np.zeros((0, len(BRANCH_COLS)))), dtype=np.float64).shape[0])
-            + 4
-            * int(
+        need_bus = allowed_set is None or DEVICE_TYPE_ACNode in allowed_set
+        need_load = allowed_set is None or DEVICE_TYPE_ACLoad in allowed_set
+        need_gen = allowed_set is None or DEVICE_TYPE_ACGenerator in allowed_set
+        need_branch = allowed_set is None or DEVICE_TYPE_ACBranch in allowed_set
+        need_trans = allowed_set is None or DEVICE_TYPE_ACTransformer in allowed_set
+        need_3w = allowed_set is None or DEVICE_TYPE_ACThreeWindingTransformer in allowed_set
+        need_acac = allowed_set is None or DEVICE_TYPE_ACACConverter in allowed_set
+        cap = 0
+        if need_bus:
+            cap += int(np.asarray(ppc.get("bus", np.zeros((0, len(BUS_COLS)))), dtype=np.float64).shape[0])
+        if need_load:
+            cap += 3 * int(np.asarray(ppc.get("load", np.zeros((0, len(LOAD_COLS)))), dtype=np.float64).shape[0])
+        if need_gen:
+            cap += 3 * int(np.asarray(ppc.get("gen", np.zeros((0, len(GEN_COLS)))), dtype=np.float64).shape[0])
+        if need_branch:
+            cap += 4 * int(np.asarray(ppc.get("branch", np.zeros((0, len(BRANCH_COLS)))), dtype=np.float64).shape[0])
+        if need_trans:
+            cap += 4 * int(np.asarray(ppc.get("transformer", np.zeros((0, len(TRANSFORMER_COLS)))), dtype=np.float64).shape[0])
+        if need_3w:
+            cap += 6 * int(
                 np.asarray(
-                    ppc.get("transformer", np.zeros((0, len(TRANSFORMER_COLS)))),
+                    ppc.get("three_winding_transformer", np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS)))),
                     dtype=np.float64,
                 ).shape[0]
             )
-            + 6
-            * int(
-                np.asarray(
-                    ppc.get(
-                        "three_winding_transformer",
-                        np.zeros((0, len(THREE_WINDING_TRANSFORMER_COLS))),
-                    ),
-                    dtype=np.float64,
-                ).shape[0]
-            )
-            + 6 * int(getattr(self, "n_acac_power", 0)),
-            store_strings=store_strings,
-        )
+        if need_acac:
+            cap += 6 * int(getattr(self, "n_acac_power", 0))
+        candidate_rows = _PseudoMeasurementBuffer(cap, store_strings=store_strings)
 
         def add(
             device_type_code: int,
@@ -4857,15 +4878,19 @@ class ACStateEstimator:
         ) -> None:
             if int(device_pos) < 0:
                 return
-            key = self._active_measurement_key(device_type_code, int(device_pos), meas_type_code)
-            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}" if store_strings else ""
-            if (
-                int(meas_type_code) in _VOLTAGE_MEASUREMENT_TYPES
-                and self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code)
-            ):
-                return
+            mt_int = int(meas_type_code)
+            if allowed_meas_map is not None:
+                allowed_mts = allowed_meas_map.get(int(device_type_code))
+                if allowed_mts is None or mt_int not in allowed_mts:
+                    return
+            key = self._active_measurement_key(device_type_code, int(device_pos), mt_int)
             if key in existing_keys or key in candidate_keys:
                 return
+            if mt_int in _VOLTAGE_MEASUREMENT_TYPES:
+                node_pos = self._voltage_measurement_node_pos_from_code(device_type_code, device_pos, mt_int)
+                if 0 <= node_pos < covered_v_size and covered_v_mask[node_pos]:
+                    return
+            pseudo_name = f"pseudo_obs_{meas_type.lower()}_{device_name}" if store_strings else ""
             candidate_rows.add(
                 pseudo_name,
                 device_type,
@@ -4879,29 +4904,30 @@ class ACStateEstimator:
             candidate_keys.add(key)
 
         bus = np.asarray(ppc["bus"], dtype=np.float64)
-        node_solver_pos = getattr(self, "_ac_node_solver_pos_by_ppc_row", None)
-        if node_solver_pos is None:
-            self._build_ppc_state_index_arrays()
-            node_solver_pos = getattr(self, "_ac_node_solver_pos_by_ppc_row", np.asarray([], dtype=np.int32))
-        node_rows = np.flatnonzero(np.asarray(node_solver_pos, dtype=np.int32) >= 0).astype(np.int64, copy=False)
-        if node_rows.size > 1:
-            node_rows = node_rows[np.argsort(bus[node_rows.astype(np.intp, copy=False), BUS_COLS["idx"]], kind="stable")]
-        node_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_ACNode, node_rows, bus.shape[0])
-        node_names = (
-            self._ppc_names_for_rows(ppc["bus_name"], node_rows)
-            if store_strings
-            else repeat("", int(node_rows.size))
-        )
-        for row, pos, name in zip(node_rows, node_plan_pos, node_names):
-            add(
-                DEVICE_TYPE_ACNode,
-                "ACNode",
-                str(name) if store_strings else "",
-                int(pos),
-                MEAS_TYPE_V,
-                "V",
-                float(bus[int(row), BUS_COLS["voltage"]] or 1.0),
+        if need_bus:
+            node_solver_pos = getattr(self, "_ac_node_solver_pos_by_ppc_row", None)
+            if node_solver_pos is None:
+                self._build_ppc_state_index_arrays()
+                node_solver_pos = getattr(self, "_ac_node_solver_pos_by_ppc_row", np.asarray([], dtype=np.int32))
+            node_rows = np.flatnonzero(np.asarray(node_solver_pos, dtype=np.int32) >= 0).astype(np.int64, copy=False)
+            if node_rows.size > 1:
+                node_rows = node_rows[np.argsort(bus[node_rows.astype(np.intp, copy=False), BUS_COLS["idx"]], kind="stable")]
+            node_plan_pos = self._plan_pos_for_ppc_rows(DEVICE_TYPE_ACNode, node_rows, bus.shape[0])
+            node_names = (
+                self._ppc_names_for_rows(ppc["bus_name"], node_rows)
+                if store_strings
+                else repeat("", int(node_rows.size))
             )
+            for row, pos, name in zip(node_rows, node_plan_pos, node_names):
+                add(
+                    DEVICE_TYPE_ACNode,
+                    "ACNode",
+                    str(name) if store_strings else "",
+                    int(pos),
+                    MEAS_TYPE_V,
+                    "V",
+                    float(bus[int(row), BUS_COLS["voltage"]] or 1.0),
+                )
 
         def node_voltage_for_rows(device_topology, rows: np.ndarray) -> np.ndarray:
             if rows.size == 0:
@@ -5018,8 +5044,10 @@ class ACStateEstimator:
                 add(device_type_code, device_type, device_name, int(pos), MEAS_TYPE_P_TO, "P_TO", float(values[cols["j_p"]] or 0.0))
                 add(device_type_code, device_type, device_name, int(pos), MEAS_TYPE_Q_TO, "Q_TO", float(values[cols["j_q"]] or 0.0))
 
-        add_terminal_candidates(DEVICE_TYPE_ACBranch, "ACBranch", "branch", "branch_name", "branch", BRANCH_COLS)
-        add_terminal_candidates(DEVICE_TYPE_ACTransformer, "ACTransformer", "transformer", "transformer_name", "transformer", TRANSFORMER_COLS)
+        if need_branch:
+            add_terminal_candidates(DEVICE_TYPE_ACBranch, "ACBranch", "branch", "branch_name", "branch", BRANCH_COLS)
+        if need_trans:
+            add_terminal_candidates(DEVICE_TYPE_ACTransformer, "ACTransformer", "transformer", "transformer_name", "transformer", TRANSFORMER_COLS)
 
         def add_three_terminal_candidates() -> None:
             table = np.asarray(
@@ -5080,9 +5108,10 @@ class ACStateEstimator:
                         float(values[cols[f"{terminal}_q"]] or 0.0),
                     )
 
-        add_three_terminal_candidates()
+        if need_3w:
+            add_three_terminal_candidates()
 
-        acac_rows = np.asarray(getattr(self, "_ac_acac_power_rows", ()), dtype=np.int64)
+        acac_rows = np.asarray(getattr(self, "_ac_acac_power_rows", ()), dtype=np.int64) if need_acac else np.empty(0, dtype=np.int64)
         if acac_rows.size:
             acac_plan_pos = np.arange(acac_rows.size, dtype=np.int64)
             acac_names = (
@@ -9458,6 +9487,11 @@ class ACStateEstimator:
         """Assemble the WLS measurement Jacobian directly as sparse CSR triplets."""
         return self._assemble_jacobian(x, measurements, sparse=True)
 
+    def jacobian(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
+        """返回稠密量测雅可比矩阵（与 DC/Hybrid SE 接口保持一致）。"""
+        H = self.jacobian_sparse(x, measurements)
+        return H.toarray() if hasattr(H, "toarray") else np.asarray(H, dtype=np.float64)
+
     def observability_analysis(
         self,
         x: Optional[np.ndarray] = None,
@@ -9947,7 +9981,7 @@ class ACStateEstimator:
             self._record_profile_time("solve.total", time.perf_counter() - solve_profile_start)
         result_table = self._common_measurement_plan_table(measurement_plan_tables).table
         result_measurements = []
-        return EstimateResult(
+        estimate_result = EstimateResult(
             converged=converged,
             iterations=iteration,
             objective=objective,
@@ -9963,9 +9997,18 @@ class ACStateEstimator:
             measurement_plan_tables=measurement_plan_tables,
             measurement_table=result_table,
         )
+        # 缓存收敛步的 CHOLMOD 因子，供后续 identify_bad_data 复用避免重复分解
+        cached_factor = (
+            aat_solver.last_cholmod_factor
+            if (final_diagnostics and final_quantities_current and aat_solver is not None and gain is None)
+            else None
+        )
+        self._last_estimate_cholmod_factor = (id(estimate_result), cached_factor) if cached_factor is not None else None
+        return estimate_result
 
     def identify_bad_data(self, result: EstimateResult, threshold: Optional[float] = None) -> Tuple[List[BadDataItem], np.ndarray]:
         """Return measurements whose normalized residual exceeds the bad-data threshold."""
+        profile_start = time.perf_counter() if self.profile_enabled else None
         plan_tables = getattr(result, "measurement_plan_tables", None)
         if plan_tables is None:
             self._warn_required_runtime_missing(
@@ -9980,20 +10023,46 @@ class ACStateEstimator:
                 "bad-data identification",
             )
         threshold = self.params.bad_threshold if threshold is None else threshold
+        if result.residual.size and threshold > 0.0:
+            normalized_upper_bound = np.abs(result.residual) / np.sqrt(1e-12)
+            if float(normalized_upper_bound.max()) <= float(threshold):
+                self._record_profile_time("bad_data.fast_residual_bound", 0.0)
+                if profile_start is not None:
+                    self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
+                return [], normalized_upper_bound
         weights = np.asarray(measurement_table.weight, dtype=np.float64)
         R_diag = 1.0 / weights
-        if self.n_state > 5000 and (result.H is None or result.gain is None):
+        cached_pair = getattr(self, "_last_estimate_cholmod_factor", None)
+        cached_factor = (
+            cached_pair[1]
+            if (isinstance(cached_pair, tuple) and len(cached_pair) == 2 and cached_pair[0] == id(result))
+            else None
+        )
+        if self.n_state > 5000 and (result.H is None or (result.gain is None and cached_factor is None)):
             leverage = None
         else:
-            if result.H is None or result.gain is None:
+            if result.H is None:
                 result.H = self.jacobian_sparse(result.x, plan_tables)
+                cached_factor = None
+            if result.gain is None and cached_factor is None:
                 result.gain, _ = build_normal_equations(
                     result.H,
                     result.residual,
                     weights,
                 )
             gain_inverse_start = time.perf_counter() if self.profile_enabled else None
-            leverage = measurement_leverage_for_bad_data(result.H, result.gain)
+            leverage = measurement_leverage_for_bad_data(
+                result.H,
+                result.gain,
+                cholmod_factor=cached_factor,
+            )
+            if leverage is None and result.gain is None and self.n_state <= 5000:
+                result.gain, _ = build_normal_equations(
+                    result.H,
+                    result.residual,
+                    weights,
+                )
+                leverage = measurement_leverage_for_bad_data(result.H, result.gain)
             if gain_inverse_start is not None:
                 self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
         if leverage is None:
@@ -10016,6 +10085,8 @@ class ACStateEstimator:
                 )
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
+        if profile_start is not None:
+            self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
         return bad_items, normalized
 
     def build_se_result(

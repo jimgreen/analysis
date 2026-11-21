@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,13 +79,13 @@ except ImportError:  # pragma: no cover - direct script import path
     from steam_lf import SteamPowerFlowCalc
 from scipy.sparse import block_diag
 try:
-    from _sparse_pattern import (
+    from ._sparse_pattern import (
         apply_raw_sum_plan,
         build_compressed_pattern_from_raw_coords,
         build_raw_sum_plan,
     )
-except ImportError:  # pragma: no cover - package import path
-    from ._sparse_pattern import (
+except ImportError:  # pragma: no cover - direct script import path
+    from _sparse_pattern import (
         apply_raw_sum_plan,
         build_compressed_pattern_from_raw_coords,
         build_raw_sum_plan,
@@ -144,6 +144,7 @@ from hybrid_array_model import (
     DCAC_DC_CONTROL_CODE,
     DCAC_DC_CONTROL_LABEL,
     DCAC_DEVICE_TYPE_LABEL,
+    build_hybrid_ppc_only_from_efile_rows,
     sanitize_dcac_voltage_setpoints,
     validate_dcac_control_types,
 )
@@ -813,10 +814,11 @@ def _build_lf_network_from_single_dc_file(file_name, rows=None) -> _LightweightH
 
 
 def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNetwork:
-    ppc = build_hybrid_ppc_with_topology_from_efile_rows(file_name, rows)
+    ppc = build_hybrid_ppc_only_from_efile_rows(file_name, rows)
     apply_lf_closed_status_boundaries(ppc["ac"], AC_SWITCH_COLS)
     apply_lf_closed_status_boundaries(ppc["dc"], DC_SWITCH_COLS)
     ensure_hybrid_ppc_topology(ppc)
+    ppc["_fresh_hybrid_topology"] = True
     ac_network = _lightweight_ac_network(ppc["ac"])
     dc_network = _lightweight_dc_network(ppc["dc"])
     network = _LightweightHybridNetwork(
@@ -1017,6 +1019,7 @@ class HybridPowerFlowCalc:
     ):
         self.network = network
         self.island = island
+        self.target_island = island
         self.params = (parameters or load_lf_parameters(parameter_file)).with_overrides(
             tol=tol,
             max_iter=max_iter,
@@ -1025,12 +1028,17 @@ class HybridPowerFlowCalc:
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
-        self.verbose = verbose
+        self.verbose = bool(verbose)
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
+        self._topology_verified_in_init = False
         hybrid_ppc = getattr(network, "ppc", None)
         if isinstance(hybrid_ppc, dict) and ("ac" in hybrid_ppc or "dc" in hybrid_ppc):
-            ensure_hybrid_ppc_topology(hybrid_ppc)
+            if hybrid_ppc.pop("_fresh_hybrid_topology", False):
+                self._topology_verified_in_init = True
+            else:
+                ensure_hybrid_ppc_topology(hybrid_ppc)
+                self._topology_verified_in_init = True
         elif not getattr(network, "_lf_lightweight", False):
             topo = getattr(network, "topo", None)
             if callable(topo):
@@ -2552,27 +2560,35 @@ class HybridPowerFlowCalc:
         """
         self._sync_sub_result_modes()
         if self._converter_ppc_mode:
-            if self.network.ppc.get("ac") is not None:
-                apply_lf_closed_status_boundaries(
-                    self.network.ppc["ac"],
-                    AC_SWITCH_COLS,
-                )
-            if self.network.ppc.get("dc") is not None:
-                apply_lf_closed_status_boundaries(
-                    self.network.ppc["dc"],
-                    DC_SWITCH_COLS,
-                )
-            ensure_hybrid_ppc_topology(self.network.ppc)
+            if not self._topology_verified_in_init:
+                if self.network.ppc.get("ac") is not None:
+                    apply_lf_closed_status_boundaries(
+                        self.network.ppc["ac"],
+                        AC_SWITCH_COLS,
+                    )
+                if self.network.ppc.get("dc") is not None:
+                    apply_lf_closed_status_boundaries(
+                        self.network.ppc["dc"],
+                        DC_SWITCH_COLS,
+                    )
+                ensure_hybrid_ppc_topology(self.network.ppc)
+            else:
+                # 消费一次性初始化校验标记，避免重复全表哈希；后续再次 prepare 将重新校验
+                self._topology_verified_in_init = False
             sanitize_dcac_voltage_setpoints(self.network.ppc)
         self._install_ac_converter_voltage_control_nodes()
         parts = []
         if self.ac_calc is not None:
+            if self._converter_ppc_mode and self.ac_calc.ppc.get("_topology_arrays") is not None:
+                self.ac_calc.ppc["_topology_preverified"] = True
             self.ac_calc.verbose = self.verbose
             self.ac_calc.prepare()
             self.ac_size = self.ac_calc.total_vars
             self.ac_eq = self.ac_calc.total_eq
             parts.append(self.ac_calc.x.copy())
         if self.dc_calc is not None:
+            if self._converter_ppc_mode and self.dc_calc.ppc.get("_topology_arrays") is not None:
+                self.dc_calc.ppc["_topology_preverified"] = True
             self.dc_calc.prepare()
             self.dc_G = self.dc_calc.G
             dc_x = self.dc_calc.x
@@ -2945,6 +2961,8 @@ class HybridPowerFlowCalc:
 
     def _clear_global_jacobian_pattern(self):
         self.global_jac_raw_data = np.array([], dtype=np.float64)
+        self._global_jac_raw_rows = np.array([], dtype=np.int32)
+        self._global_jac_raw_cols = np.array([], dtype=np.int32)
         self.global_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.global_jac_csr_indices = np.array([], dtype=np.int32)
         self.global_jac_csr_indptr = np.array([], dtype=np.int32)
@@ -2954,6 +2972,7 @@ class HybridPowerFlowCalc:
         self.global_jac_csc_indices = np.array([], dtype=np.int32)
         self.global_jac_csc_indptr = np.array([], dtype=np.int32)
         self.global_jac_csc_data = np.array([], dtype=np.float64)
+        self._global_jac_csc_matrix = None
         self.global_jac_csc_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csc_pos, 0)
         self._dcac_loss_work = np.array([], dtype=np.float64)
         self.global_jac_ac_slice = slice(0, 0)
@@ -3237,20 +3256,46 @@ class HybridPowerFlowCalc:
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        (
-            self.global_jac_csr_indices,
-            self.global_jac_csr_indptr,
-            self.global_jac_raw_to_csr_pos,
-        ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.electric_eq)
+        self._global_jac_raw_rows = raw_rows
+        self._global_jac_raw_cols = raw_cols
+        # 预填 DCAC 静态常数段，迭代时仅更新损耗方程动态偏导
+        if self.N_dcac:
+            for part_slice in (
+                self.global_jac_dcac_ac_p_slice,
+                self.global_jac_dcac_ac_q_slice,
+                self.global_jac_dcac_dc_eq_slice,
+            ):
+                if self._slice_len(part_slice):
+                    self.global_jac_raw_data[part_slice] = 1.0
+            if self._slice_len(self.global_jac_dcac_ctrl_slice):
+                self.global_jac_raw_data[self.global_jac_dcac_ctrl_slice] = self.dcac_ctrl_data
+        # 仅预构建 NR 求解所需的 CSC 模式；CSR 模式在 get_jacobi(x) 首次需要时懒构建
         (
             self.global_jac_csc_indices,
             self.global_jac_csc_indptr,
             self.global_jac_raw_to_csc_pos,
         ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.electric_vars)
-        self.global_jac_csr_data = np.empty(self.global_jac_csr_indices.size, dtype=np.float64)
         self.global_jac_csc_data = np.empty(self.global_jac_csc_indices.size, dtype=np.float64)
-        self.global_jac_csr_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csr_pos, self.global_jac_csr_data.size)
         self.global_jac_csc_sum_plan = build_raw_sum_plan(self.global_jac_raw_to_csc_pos, self.global_jac_csc_data.size)
+
+    def _ensure_global_csr_pattern(self):
+        """按需懒构建全局混联雅可比的 CSR 压缩模式并缓存。"""
+        if self.global_jac_raw_to_csr_pos.size or not self._global_jac_raw_rows.size:
+            return
+        (
+            self.global_jac_csr_indices,
+            self.global_jac_csr_indptr,
+            self.global_jac_raw_to_csr_pos,
+        ) = build_compressed_pattern_from_raw_coords(
+            self._global_jac_raw_rows,
+            self._global_jac_raw_cols,
+            self.electric_eq,
+        )
+        self.global_jac_csr_data = np.empty(self.global_jac_csr_indices.size, dtype=np.float64)
+        self.global_jac_csr_sum_plan = build_raw_sum_plan(
+            self.global_jac_raw_to_csr_pos,
+            self.global_jac_csr_data.size,
+        )
 
     def _initial_dcac_x(self):
         if self.N_dcac == 0:
@@ -3431,18 +3476,6 @@ class HybridPowerFlowCalc:
         ac_p = dcac[:, 1]
         ac_q = dcac[:, 2]
 
-        for part_slice in (
-            self.global_jac_dcac_ac_p_slice,
-            self.global_jac_dcac_ac_q_slice,
-            self.global_jac_dcac_dc_eq_slice,
-            self.global_jac_dcac_ctrl_slice,
-        ):
-            if self._slice_len(part_slice):
-                if part_slice == self.global_jac_dcac_ctrl_slice:
-                    raw[part_slice] = self.dcac_ctrl_data
-                else:
-                    raw[part_slice] = 1.0
-
         va = ac_V[self.dcac_ac_pos]
         vd = dc_V[self.dcac_dc_pos]
         va2 = va * va
@@ -3493,12 +3526,15 @@ class HybridPowerFlowCalc:
 
         if matrix_format == "csc":
             apply_raw_sum_plan(self.global_jac_csc_data, raw, self.global_jac_csc_sum_plan)
-            jac = csc_matrix(
-                (self.global_jac_csc_data, self.global_jac_csc_indices, self.global_jac_csc_indptr),
-                shape=(self.electric_eq, self.electric_vars),
-                copy=False,
-            )
+            if self._global_jac_csc_matrix is None:
+                self._global_jac_csc_matrix = csc_matrix(
+                    (self.global_jac_csc_data, self.global_jac_csc_indices, self.global_jac_csc_indptr),
+                    shape=(self.electric_eq, self.electric_vars),
+                    copy=False,
+                )
+            jac = self._global_jac_csc_matrix
         else:
+            self._ensure_global_csr_pattern()
             apply_raw_sum_plan(self.global_jac_csr_data, raw, self.global_jac_csr_sum_plan)
             jac = csr_matrix(
                 (self.global_jac_csr_data, self.global_jac_csr_indices, self.global_jac_csr_indptr),
@@ -4408,6 +4444,27 @@ class HybridPowerFlowCalc:
         n_vars = int(x.size)
         cached_fluid_f = None
 
+        def sync_sub_norms(residual_vec):
+            ac_f = residual_vec[:self.ac_eq]
+            dc_f = residual_vec[self.ac_eq:self.ac_eq + self.dc_eq]
+            ac_norm = float(np.linalg.norm(ac_f, np.inf)) if ac_f.size else 0.0
+            dc_norm = float(np.linalg.norm(dc_f, np.inf)) if dc_f.size else 0.0
+            if self.ac_calc is not None:
+                self.ac_calc.iterations = self.iterations
+                self.ac_calc.normF = ac_norm
+            if self.dc_calc is not None:
+                self.dc_calc.iterations = self.iterations
+                self.dc_calc.normF = dc_norm
+            fluid_norms = {}
+            for name, calc in self.fluid_calcs.items():
+                fluid_f = residual_vec[self.fluid_eq_slices[name]]
+                fluid_norm = float(np.linalg.norm(fluid_f, np.inf)) if fluid_f.size else 0.0
+                fluid_norms[name] = fluid_norm
+                calc.iterations = self.iterations
+                calc.normF = fluid_norm
+            return ac_norm, dc_norm, fluid_norms
+
+        F = np.empty(0, dtype=np.float64)
         for it in range(self.max_iter):
             if it == 0:
                 F, J = self._build_newton_system(x)
@@ -4427,33 +4484,17 @@ class HybridPowerFlowCalc:
                     F, J = self._build_newton_system(x, return_jacobian=False)
                     self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
 
-            merit_norm = float(np.linalg.norm(F))
+            merit_norm = float(np.linalg.norm(F)) if self.fluid_calcs else 0.0
 
             if it == 0 and not self._validate_initial_jacobian_columns(J):
+                sync_sub_norms(F)
                 self.x = x
                 if self.verbose:
                     print(self.failure_reason)
                 return -1
 
-            ac_f = F[:self.ac_eq]
-            dc_f = F[self.ac_eq:self.ac_eq + self.dc_eq]
-            ac_norm = np.linalg.norm(ac_f, np.inf) if ac_f.size else 0.0
-            dc_norm = np.linalg.norm(dc_f, np.inf) if dc_f.size else 0.0
-            if self.ac_calc is not None:
-                self.ac_calc.iterations = self.iterations
-                self.ac_calc.normF = ac_norm
-            if self.dc_calc is not None:
-                self.dc_calc.iterations = self.iterations
-                self.dc_calc.normF = dc_norm
-            fluid_norms = {}
-            for name, calc in self.fluid_calcs.items():
-                fluid_f = F[self.fluid_eq_slices[name]]
-                fluid_norm = np.linalg.norm(fluid_f, np.inf) if fluid_f.size else 0.0
-                fluid_norms[name] = fluid_norm
-                calc.iterations = self.iterations
-                calc.normF = fluid_norm
-
             if self.verbose:
+                ac_norm, dc_norm, fluid_norms = sync_sub_norms(F)
                 print(
                     f"Iter {it + 1}: |F| = {self.normF:.2e}, "
                     f"|F_ac| = {ac_norm:.2e}, "
@@ -4465,12 +4506,23 @@ class HybridPowerFlowCalc:
                 )
 
             if self.normF < self.tol:
+                sync_sub_norms(F)
                 if self.verbose:
                     print(f"收敛于第 {it + 1} 次迭代")
                 self.converged = True
                 self.x = x
                 self._write_back()
                 return 0
+
+            # 发散 / 非有限残差提前终止，避免空跑后续迭代
+            if not np.isfinite(self.normF) or self.normF > self.params.divergence_threshold:
+                sync_sub_norms(F)
+                self.failure_reason = f"第 {it + 1} 次迭代残差发散 (|F|={self.normF:.2e})"
+                if self.verbose:
+                    print(self.failure_reason)
+                self.x = x
+                self._write_back()
+                return -1
 
             if adaptive_factor is not None and adaptive_factor.can_reuse(self.normF, n_vars):
                 try:
@@ -4543,6 +4595,8 @@ class HybridPowerFlowCalc:
                 self._write_back()
                 return -1
 
+        sync_sub_norms(F)
+        self.failure_reason = f"未在最大迭代次数 {self.max_iter} 内收敛 (|F|={self.normF:.2e})"
         if self.verbose:
             print(f"达到最大迭代次数 {self.max_iter}，未收敛")
         self.x = x
@@ -4643,10 +4697,12 @@ class HybridPowerFlowCalc:
             self.dc_calc.iterations = self.iterations
             self.dc_calc._write_summary_result()
             dc_result = self.dc_calc.result
+        summary = self._hybrid_summary()
         self.result = {
             "ac": ac_result,
             "dc": dc_result,
-            "hybrid": self._hybrid_summary(),
+            "hybrid": summary,
+            "summary": summary,
         }
         self.lf_result = None
 
@@ -4700,6 +4756,15 @@ class HybridPowerFlowCalc:
 
     def _write_back(self):
         """Write final global state back into AC, DC and converter model objects."""
+        # 纯电气混联的 none/summary 模式跳过昂贵的子网全表数组回写
+        if not self.fluid_calcs:
+            if self.result_mode == "none":
+                self.result = {}
+                self.lf_result = None
+                return
+            if self.result_mode == "summary":
+                self._write_summary_result()
+                return
         x = self.x
         ac_x, dc_x, dcac_x = self._split_x(x)
         ac_result = self._skipped_ac_result
@@ -4778,10 +4843,12 @@ class HybridPowerFlowCalc:
             self.lf_result = None
             return
         if self.result_mode == "summary":
+            summary = self._hybrid_summary()
             self.result = {
                 "ac": self._ac_array_summary(ac_result),
                 "dc": self._dc_array_summary(dc_result),
-                "hybrid": self._hybrid_summary(),
+                "hybrid": summary,
+                "summary": summary,
             }
             self.lf_result = None
             return

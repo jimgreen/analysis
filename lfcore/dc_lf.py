@@ -294,7 +294,8 @@ class DCPowerFlowCalc:
         self._instance_solver_blacklist = set()
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
-        self._cache_csr_jacobian_pattern = self.result_mode == "full"
+        # NR 主循环仅使用 CSC 格式；CSR 模式在 get_jacobi(x) 首次需要时懒构建
+        self._cache_csr_jacobian_pattern = False
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
@@ -303,7 +304,13 @@ class DCPowerFlowCalc:
         self.result: Dict = {}
         self.lf_result = None
         self.G = None
+        self.total_vars = 0
+        self.total_eq = 0
         self.x = np.array([], dtype=np.float64)
+        self._residual_work = np.array([], dtype=np.float64)
+        self._dc_jac_csc_matrix = None
+        self._dc_jac_raw_rows = np.array([], dtype=np.int32)
+        self._dc_jac_raw_cols = np.array([], dtype=np.int32)
         self._external_dc_p_injection = None
 
     @classmethod
@@ -635,7 +642,8 @@ class DCPowerFlowCalc:
     def _prepare_from_ppc(self):
         """Prepare a Newton system from an already arrayized DC ppc dictionary."""
         apply_lf_closed_status_boundaries(self.ppc, DC_SWITCH_COLS)
-        ensure_dc_ppc_topology(self.ppc)
+        if not (self.ppc.pop("_topology_preverified", False) and self.ppc.get("_topology_arrays") is not None):
+            ensure_dc_ppc_topology(self.ppc)
         sanitize_dc_voltage_setpoints(self.ppc)
         self._prepare_direct_ppc_topology()
 
@@ -1336,6 +1344,8 @@ class DCPowerFlowCalc:
         self._dc_jac_unknown_col_nodes = np.asarray(unknown_col_nodes, dtype=np.int32)
         self._dc_jac_unknown_g_data = np.asarray(unknown_g_data, dtype=np.float64)
         self._dc_jac_unknown_diag_mask = self._dc_jac_unknown_row_nodes == self._dc_jac_unknown_col_nodes
+        self._dc_jac_unknown_diag_idx = np.flatnonzero(self._dc_jac_unknown_diag_mask).astype(np.intp, copy=False)
+        self._dc_jac_unknown_diag_nodes = self._dc_jac_unknown_row_nodes[self._dc_jac_unknown_diag_idx]
         add_part("unknown", unknown_rows, unknown_cols)
 
         add_part("zero_i", self.zero_i_rows_jac, self.zero_i_cols_jac)
@@ -1358,7 +1368,11 @@ class DCPowerFlowCalc:
         add_part("dcdc_loss", self.dcdc_loss_rows_jac if self.N_dcdc else [], self.dcdc_loss_cols_jac if self.N_dcdc else [])
 
         self._dc_jac_raw_data = np.empty(raw_count, dtype=np.float64)
+        self._dc_jac_csc_matrix = None
+        self._residual_work = np.zeros(self.total_eq, dtype=np.float64)
         if raw_count == 0:
+            self._dc_jac_raw_rows = np.array([], dtype=np.int32)
+            self._dc_jac_raw_cols = np.array([], dtype=np.int32)
             self._dc_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
             self._dc_jac_csr_indices = np.array([], dtype=np.int32)
             self._dc_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
@@ -1371,36 +1385,57 @@ class DCPowerFlowCalc:
             self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, 0)
             return
 
+        # 预填静态雅可比段一次，迭代时跳过无谓拷贝
+        raw = self._dc_jac_raw_data
+        if self._slice_len(self._dc_jac_dcdc_i_slice):
+            raw[self._dc_jac_dcdc_i_slice] = self.dcdc_i_eq_data_jac
+        if self._slice_len(self._dc_jac_dcdc_j_slice) and not getattr(self, "dcdc_eliminate_pj", False):
+            raw[self._dc_jac_dcdc_j_slice] = self.dcdc_j_eq_data_jac
+        if self._slice_len(self._dc_jac_known_slice):
+            raw[self._dc_jac_known_slice] = self.known_data_jac
+        if self._slice_len(self._dc_jac_zero_con_slice):
+            raw[self._dc_jac_zero_con_slice] = self.zero_con_data_jac
+        if self._slice_len(self._dc_jac_phi_fix_slice):
+            raw[self._dc_jac_phi_fix_slice] = self.phi_fix_data_jac
+        if self.N_dcdc and self._slice_len(self._dc_jac_dcdc_ctrl_static_slice):
+            raw[self._dc_jac_dcdc_ctrl_static_slice] = self.dcdc_ctrl_static_data_jac
+
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        if self._cache_csr_jacobian_pattern:
-            (
-                self._dc_jac_csr_indices,
-                self._dc_jac_csr_indptr,
-                self._dc_jac_raw_to_csr_pos,
-            ) = build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
-        else:
-            self._dc_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
-            self._dc_jac_csr_indices = np.array([], dtype=np.int32)
-            self._dc_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
-            self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, 0)
+        self._dc_jac_raw_rows = raw_rows
+        self._dc_jac_raw_cols = raw_cols
+        # 仅预构建 NR 求解所需的 CSC 模式；CSR 模式在 get_jacobi(x) 首次需要时懒构建
+        self._dc_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
+        self._dc_jac_csr_indices = np.array([], dtype=np.int32)
+        self._dc_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
+        self._dc_jac_csr_data = np.array([], dtype=np.float64)
+        self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, 0)
         (
             self._dc_jac_csc_indices,
             self._dc_jac_csc_indptr,
             self._dc_jac_raw_to_csc_pos,
         ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
-        self._dc_jac_csr_data = np.empty(self._dc_jac_csr_indices.size, dtype=np.float64)
         self._dc_jac_csc_data = np.empty(self._dc_jac_csc_indices.size, dtype=np.float64)
-        if self._cache_csr_jacobian_pattern:
-            self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, self._dc_jac_csr_data.size)
         self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, self._dc_jac_csc_data.size)
+
+    def _ensure_dc_csr_pattern(self):
+        """按需懒构建 DC 雅可比的 CSR 压缩模式并缓存。"""
+        if self._dc_jac_raw_to_csr_pos.size or not self._dc_jac_raw_rows.size:
+            return
+        (
+            self._dc_jac_csr_indices,
+            self._dc_jac_csr_indptr,
+            self._dc_jac_raw_to_csr_pos,
+        ) = build_compressed_pattern_from_raw_coords(self._dc_jac_raw_rows, self._dc_jac_raw_cols, self.total_eq)
+        self._dc_jac_csr_data = np.empty(self._dc_jac_csr_indices.size, dtype=np.float64)
+        self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, self._dc_jac_csr_data.size)
 
     @staticmethod
     def _slice_len(part_slice):
         return int(part_slice.stop - part_slice.start)
 
     def _fill_jacobian_raw_data(self, terms):
-        """Refresh raw Jacobian entry data in the precomputed insertion order."""
+        """刷新预计算坐标顺序下的动态 DC 雅可比原始数据（静态块已在 prepare 预填）。"""
         raw = self._dc_jac_raw_data
         V = terms["V"]
         GV = terms["GV"]
@@ -1408,12 +1443,11 @@ class DCPowerFlowCalc:
         part_slice = self._dc_jac_unknown_slice
         if self._slice_len(part_slice):
             data = raw[part_slice]
-            row_nodes = self._dc_jac_unknown_row_nodes
-            data[:] = V[row_nodes] * self._dc_jac_unknown_g_data
-            diag_mask = self._dc_jac_unknown_diag_mask
-            if np.any(diag_mask):
-                diag_nodes = row_nodes[diag_mask]
-                data[diag_mask] += GV[diag_nodes] + self.I_shunt[diag_nodes]
+            np.multiply(V[self._dc_jac_unknown_row_nodes], self._dc_jac_unknown_g_data, out=data)
+            diag_idx = self._dc_jac_unknown_diag_idx
+            if diag_idx.size:
+                diag_nodes = self._dc_jac_unknown_diag_nodes
+                data[diag_idx] += GV[diag_nodes] + self.I_shunt[diag_nodes]
 
         if self.zero_i.size:
             current = terms["zero_current"]
@@ -1421,44 +1455,27 @@ class DCPowerFlowCalc:
             if self.zero_i_unknown_count:
                 data = raw[part_slice]
                 mask = self.zero_i_unknown_mask
-                data[0::3] = V[self.zero_i[mask]]
-                data[1::3] = -V[self.zero_i[mask]]
+                vi = V[self.zero_i[mask]]
+                data[0::3] = vi
+                data[1::3] = -vi
                 data[2::3] = current[mask]
             part_slice = self._dc_jac_zero_j_slice
             if self.zero_j_unknown_count:
                 data = raw[part_slice]
                 mask = self.zero_j_unknown_mask
-                data[0::3] = -V[self.zero_j[mask]]
-                data[1::3] = V[self.zero_j[mask]]
+                vj = V[self.zero_j[mask]]
+                data[0::3] = -vj
+                data[1::3] = vj
                 data[2::3] = -current[mask]
 
-        part_slice = self._dc_jac_dcdc_i_slice
-        if self._slice_len(part_slice):
-            raw[part_slice] = self.dcdc_i_eq_data_jac
-        part_slice = self._dc_jac_dcdc_j_slice
-        if self._slice_len(part_slice):
-            if getattr(self, "dcdc_eliminate_pj", False):
+        if self.N_dcdc:
+            part_slice = self._dc_jac_dcdc_j_slice
+            if self._slice_len(part_slice) and getattr(self, "dcdc_eliminate_pj", False):
                 idx = self.dcdc_j_unknown_idx
                 data = raw[part_slice]
                 data[0::3] = terms["dcdc_dpj_dpi"][idx]
                 data[1::3] = terms["dcdc_dpj_dvi"][idx]
                 data[2::3] = terms["dcdc_dpj_dvj"][idx]
-            else:
-                raw[part_slice] = self.dcdc_j_eq_data_jac
-        part_slice = self._dc_jac_known_slice
-        if self._slice_len(part_slice):
-            raw[part_slice] = self.known_data_jac
-        part_slice = self._dc_jac_zero_con_slice
-        if self._slice_len(part_slice):
-            raw[part_slice] = self.zero_con_data_jac
-        part_slice = self._dc_jac_phi_fix_slice
-        if self._slice_len(part_slice):
-            raw[part_slice] = self.phi_fix_data_jac
-
-        if self.N_dcdc:
-            part_slice = self._dc_jac_dcdc_ctrl_static_slice
-            if self._slice_len(part_slice):
-                raw[part_slice] = self.dcdc_ctrl_static_data_jac
             part_slice = self._dc_jac_dcdc_ctrl_j_dynamic_slice
             if self._slice_len(part_slice):
                 idx = self.dcdc_ctrl_j_dynamic_idx
@@ -1499,11 +1516,15 @@ class DCPowerFlowCalc:
             apply_raw_sum_plan(self._dc_jac_csc_data, self._dc_jac_raw_data, self._dc_jac_csc_sum_plan)
             if not build_matrix:
                 return self._dc_jac_csc_data
-            return csc_matrix(
-                (self._dc_jac_csc_data, self._dc_jac_csc_indices, self._dc_jac_csc_indptr),
-                shape=(self.total_eq, self.total_vars),
-                copy=False,
-            )
+            if self._dc_jac_csc_matrix is None:
+                self._dc_jac_csc_matrix = csc_matrix(
+                    (self._dc_jac_csc_data, self._dc_jac_csc_indices, self._dc_jac_csc_indptr),
+                    shape=(self.total_eq, self.total_vars),
+                    copy=False,
+                )
+            return self._dc_jac_csc_matrix
+
+        self._ensure_dc_csr_pattern()
         if not self._dc_jac_raw_to_csr_pos.size:
             return None
 
@@ -1715,7 +1736,11 @@ class DCPowerFlowCalc:
             P_inj += np.bincount(self.dcdc_i, weights=terms["dcdc_pi"], minlength=P_inj.size)
             P_inj += np.bincount(self.dcdc_j, weights=terms["dcdc_pj"], minlength=P_inj.size)
 
-        F = np.zeros(self.total_eq, dtype=np.float64)
+        if self._residual_work.size != self.total_eq:
+            self._residual_work = np.zeros(self.total_eq, dtype=np.float64)
+        else:
+            self._residual_work.fill(0.0)
+        F = self._residual_work
 
         if self.n_unknown:
             F[self.eq_unknown_start:self.eq_known_start] = P_inj[self.unknown_nodes]
@@ -1833,20 +1858,27 @@ class DCPowerFlowCalc:
             switch[:, [DC_SWITCH_COLS["p"], DC_SWITCH_COLS["current"]]] = 0.0
         if breaker.size:
             breaker[:, [DC_BREAK_COLS["p"], DC_BREAK_COLS["current"]]] = 0.0
-        for tp, dev_idx, i_node, j_node, phi_a, phi_b in self.zero_branch_info:
-            current = phi_final[phi_a] - phi_final[phi_b]
-            p_from = V_final[i_node] * current
-            if tp == 'Z':
-                zero_branch[int(dev_idx), DC_ZERO_BRANCH_COLS["p"]] = p_from
-                zero_branch[int(dev_idx), DC_ZERO_BRANCH_COLS["current"]] = current
-            elif tp == 'S':
-                switch[int(dev_idx), DC_SWITCH_COLS["p"]] = p_from
-                switch[int(dev_idx), DC_SWITCH_COLS["current"]] = current
-            elif tp == 'B':
-                breaker[int(dev_idx), DC_BREAK_COLS["p"]] = p_from
-                breaker[int(dev_idx), DC_BREAK_COLS["current"]] = current
-            P_inj[i_node] += p_from
-            P_inj[j_node] -= V_final[j_node] * current
+        if self.zero_branch_info:
+            z_types = [row[0] for row in self.zero_branch_info]
+            z_dev = np.fromiter((int(row[1]) for row in self.zero_branch_info), dtype=np.intp, count=len(self.zero_branch_info))
+            z_i = self.zero_i
+            z_j = self.zero_j
+            z_cur = phi_final[self.zero_phi_a] - phi_final[self.zero_phi_b]
+            z_p_from = V_final[z_i] * z_cur
+            z_p_to = -V_final[z_j] * z_cur
+            P_inj += np.bincount(z_i, weights=z_p_from, minlength=P_inj.size)
+            P_inj += np.bincount(z_j, weights=z_p_to, minlength=P_inj.size)
+            z_type_arr = np.asarray(z_types)
+            for code, table, cols in (
+                ('Z', zero_branch, DC_ZERO_BRANCH_COLS),
+                ('S', switch, DC_SWITCH_COLS),
+                ('B', breaker, DC_BREAK_COLS),
+            ):
+                mask = z_type_arr == code
+                if np.any(mask):
+                    dev_rows = z_dev[mask]
+                    table[dev_rows, cols["p"]] = z_p_from[mask]
+                    table[dev_rows, cols["current"]] = z_cur[mask]
 
         if load.size:
             load[:, [DC_LOAD_COLS["p"], DC_LOAD_COLS["current"]]] = 0.0
@@ -2285,7 +2317,7 @@ class DCPowerFlowCalc:
         """执行直流 Newton 迭代并在收敛后回填结果。"""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
-            self._cache_csr_jacobian_pattern = self.result_mode == "full"
+            self._cache_csr_jacobian_pattern = False
             self.keep_node_objects = False
             self.alive_nodes = []
         if self.x.size == 0 or self.G is None:
@@ -2333,6 +2365,15 @@ class DCPowerFlowCalc:
                 self.x = x
                 self._write_back()
                 return 0
+
+            # 发散 / 非有限残差提前终止，避免空跑后续迭代
+            if not np.isfinite(self.normF) or self.normF > self.params.divergence_threshold:
+                self.failure_reason = f"第 {it + 1} 次迭代残差发散 (|F|={self.normF:.2e})"
+                if self.verbose:
+                    print(self.failure_reason)
+                self.x = x
+                self._write_back()
+                return -1
 
             if adaptive_factor.can_reuse(self.normF, n_vars):
                 try:

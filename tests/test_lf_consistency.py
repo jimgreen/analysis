@@ -271,3 +271,89 @@ def test_efile_flat_rows_mutation_and_fallback(tmp_path: Path):
     )
     q_tables = _read_efile_rows(ef_q)
     assert q_tables["ACNode"]["rows"][0][1] == "'bus one'"
+
+
+@pytest.mark.parametrize("kind", ["ac", "dc", "hybrid"])
+def test_lf_init_attrs_failure_reason_summary_and_lazy_csr(tmp_path: Path, kind: str):
+    """验证三套求解器初始化属性、未收敛/发散原因、summary 键与懒构建 CSR 雅可比一致性。"""
+    if kind == "ac":
+        ef = _gen_ac_e(30, tmp_path)
+        cls = ACPowerFlowCalc
+    elif kind == "dc":
+        ef = _gen_dc_e(30, tmp_path)
+        cls = DCPowerFlowCalc
+    else:
+        ef = _gen_hybrid_e(20, 12, tmp_path)
+        cls = HybridPowerFlowCalc
+
+    # 1. 初始化后即具备统一核心公共属性
+    calc = cls.from_file_fast(ef, parameters=LF_PARAMS, result_mode="array", verbose=False)
+    for attr in (
+        "converged",
+        "iterations",
+        "normF",
+        "failure_reason",
+        "x",
+        "result",
+        "lf_result",
+        "total_vars",
+        "total_eq",
+        "target_island",
+        "tol",
+        "max_iter",
+        "min_voltage",
+        "linear_solver",
+        "result_mode",
+        "verbose",
+    ):
+        assert hasattr(calc, attr), f"{cls.__name__} 初始化后缺少属性 {attr}"
+    assert calc.lf_result is None
+    assert calc.total_vars == 0 and calc.total_eq == 0
+
+    # 2. array 模式下调用 get_jacobi(x) 懒构建 CSR 稀疏矩阵，且与数值中心差分一致
+    calc.prepare()
+    x0 = calc.x.copy()
+    f0 = calc.get_f(x0).copy()
+    j_csr = calc.get_jacobi(x0)
+    assert j_csr.format == "csr"
+    assert j_csr.shape == (calc.total_eq, calc.total_vars)
+    # 抽样校验若干列的解析雅可比与中心差分一致性
+    eps = 1e-7
+    j_dense = j_csr.toarray()
+    sample_cols = np.linspace(0, calc.total_vars - 1, min(8, calc.total_vars), dtype=int)
+    for col in sample_cols:
+        xp = x0.copy()
+        xm = x0.copy()
+        xp[col] += eps
+        xm[col] -= eps
+        fp = calc.get_f(xp).copy()
+        fm = calc.get_f(xm).copy()
+        fd_col = (fp - fm) / (2.0 * eps)
+        assert np.allclose(j_dense[:, col], fd_col, atol=1e-5, rtol=1e-5)
+
+    # 3. summary 模式下均提供顶层 "summary" 键
+    rc = calc.run(result_mode="summary")
+    assert rc == 0 and calc.converged
+    assert "summary" in calc.result
+    assert set(calc.result["summary"].keys()) >= {"converged", "iterations", "normF"}
+
+    # 4. 达到 max_iter 未收敛时均填写非空 failure_reason
+    p_nonconv = algorithm_parameters.PowerFlowParameters(
+        tol=1e-12, max_iter=1, min_voltage=0.1, divergence_threshold=1e6
+    )
+    calc_nc = cls.from_file_fast(ef, parameters=p_nonconv, result_mode="array", verbose=False)
+    calc_nc.prepare()
+    assert calc_nc.run() == -1
+    assert not calc_nc.converged
+    assert "未在最大迭代次数" in calc_nc.failure_reason
+
+    # 5. 残差超过 divergence_threshold 时提前终止并填写发散原因
+    p_div = algorithm_parameters.PowerFlowParameters(
+        tol=1e-12, max_iter=20, min_voltage=0.1, divergence_threshold=1e-6
+    )
+    calc_div = cls.from_file_fast(ef, parameters=p_div, result_mode="array", verbose=False)
+    calc_div.prepare()
+    assert calc_div.run() == -1
+    assert not calc_div.converged
+    assert calc_div.iterations == 1
+    assert "发散" in calc_div.failure_reason

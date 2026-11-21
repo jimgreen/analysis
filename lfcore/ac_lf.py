@@ -480,7 +480,8 @@ class ACPowerFlowCalc:
             raise ValueError("ACPowerFlowCalc requires ac_ppc_v1 or ACPowerNetwork input")
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
-        self._cache_csr_jacobian_pattern = self.result_mode == "full"
+        # NR 主循环仅使用 CSC 格式；CSR 模式改为在 get_jacobi(x) 首次需要时懒构建
+        self._cache_csr_jacobian_pattern = False
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
         self.min_voltage = self.params.min_voltage
@@ -500,6 +501,7 @@ class ACPowerFlowCalc:
         self.iterations: int = 0
         self.normF: float = np.inf
         self.failure_reason: str = ""
+        self.lf_result = None
 
         # 核心变量初始化（精简合并）
         self.N: int = 0
@@ -639,8 +641,11 @@ class ACPowerFlowCalc:
         self.standard_jac_csc_indices = np.array([], dtype=np.int32)
         self.standard_jac_csc_indptr = np.array([], dtype=np.int32)
         self.standard_jac_csc_data = np.array([], dtype=np.float64)
+        self._standard_jac_csc_matrix = None
         self.standard_jac_csc_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csc_pos, 0)
         self.full_jac_raw_data = np.array([], dtype=np.float64)
+        self._full_jac_raw_rows = np.array([], dtype=np.int32)
+        self._full_jac_raw_cols = np.array([], dtype=np.int32)
         self.full_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.full_jac_csr_indices = np.array([], dtype=np.int32)
         self.full_jac_csr_indptr = np.array([], dtype=np.int32)
@@ -661,13 +666,14 @@ class ACPowerFlowCalc:
         self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_p_pos = np.array([], dtype=np.intp)
         self.std_jac_load_q_pos = np.array([], dtype=np.intp)
-        self._jac_delta = np.array([], dtype=np.float64)
-        self._jac_cos_delta = np.array([], dtype=np.float64)
-        self._jac_sin_delta = np.array([], dtype=np.float64)
-        self._jac_vivj = np.array([], dtype=np.float64)
-        self._jac_common_p = np.array([], dtype=np.float64)
-        self._jac_common_q = np.array([], dtype=np.float64)
+        self._jac_w_work = np.array([], dtype=np.complex128)
         self._jac_tmp = np.array([], dtype=np.float64)
+        self._state_cos = np.array([], dtype=np.float64)
+        self._state_sin = np.array([], dtype=np.float64)
+        self._state_u_conj = np.array([], dtype=np.complex128)
+        self._has_voltage_dependent_load = False
+        self._const_p_load = np.array([], dtype=np.float64)
+        self._const_q_load = np.array([], dtype=np.float64)
         self.live_gens: List = []
         self.live_loads: List = []
         self.live_shunts: List = []
@@ -787,36 +793,33 @@ class ACPowerFlowCalc:
         """将扁平 Newton 向量还原为 theta、V 和零阻抗支路的 phi 变量。"""
         theta = self._state_theta
         V = self._state_voltage
-        theta.fill(0.0)
-        V.fill(1.0)
 
-        # 填充未知变量
+        # 已知节点（Slack/PV）的设定值已在 prepare 阶段预填，此处仅更新未知节点切片
         theta[self.theta_unknown] = x[:self.n_theta]
         V[self.V_unknown] = x[self.n_theta:self.n_theta + self.n_V]
 
-        # 填充已知变量（精简判断逻辑）
-        theta[self._slack_mask] = self.theta_spec[self._slack_mask]
-        V[self._fixed_voltage_mask] = self.V_spec[self._fixed_voltage_mask]
-
-        # 提取phi变量（精简条件判断）
-        phi_slice = slice(self.base_phi_re, self.base_phi_re + self.N_phi)
-        phi_re = x[phi_slice] if self.N_phi > 0 else self._empty_phi
+        # 提取 phi 变量
+        phi_re = x[self.base_phi_re:self.base_phi_re + self.N_phi] if self.N_phi > 0 else self._empty_phi
         phi_im = x[self.base_phi_im:self.base_phi_im + self.N_phi] if self.N_phi > 0 else self._empty_phi
 
-        # 更新缓存
+        # 更新缓存（原地复用预分配三角函数和复电压缓冲区）
         if update_cache:
-            cos_theta = np.cos(theta)
-            sin_theta = np.sin(theta)
+            cos_theta = self._state_cos
+            sin_theta = self._state_sin
+            np.cos(theta, out=cos_theta)
+            np.sin(theta, out=sin_theta)
             Vc = self._state_vc
             np.multiply(V, cos_theta, out=Vc.real)
             np.multiply(V, sin_theta, out=Vc.imag)
-            self._cache.update({
-                'theta': theta,
-                'V': V,
-                'cos_theta': cos_theta,
-                'sin_theta': sin_theta,
-                'Vc': Vc
-            })
+            u_conj = self._state_u_conj
+            u_conj.real = cos_theta
+            np.negative(sin_theta, out=u_conj.imag)
+            cache = self._cache
+            cache['theta'] = theta
+            cache['V'] = V
+            cache['cos_theta'] = cos_theta
+            cache['sin_theta'] = sin_theta
+            cache['Vc'] = Vc
             self._state_x_obj = x
             self._power_x_obj = None
             self._last_Ibus = None
@@ -838,21 +841,22 @@ class ACPowerFlowCalc:
         self._last_Ibus = I_y
         self._last_Sbus = S_y
 
-        # 负荷功率（首次计算时缓存）
+        # 负荷功率
         P_load, Q_load = self._calc_load_power(V)
-        cache.update(P_load=P_load, Q_load=Q_load)
+        cache['P_load'] = P_load
+        cache['Q_load'] = Q_load
 
-        # 零阻抗支路功率贡献（精简向量化逻辑）
-        P_zero, Q_zero = self._calc_zero_branch_power(Vc, phi_re, phi_im)
-
-        # 功率不平衡量
-        P_calc = S_y.real + P_zero
-        Q_calc = S_y.imag + Q_zero
-
-        return P_calc - (self.P_spec - P_load), Q_calc - (self.Q_spec - Q_load)
+        # 功率不平衡量（无零阻抗支路时跳过零数组分配与加法）
+        if self.N_phi > 0 and self.zero_a.size:
+            P_zero, Q_zero = self._calc_zero_branch_power(Vc, phi_re, phi_im)
+            return S_y.real + P_zero - self.P_spec + P_load, S_y.imag + Q_zero - self.Q_spec + Q_load
+        return S_y.real - self.P_spec + P_load, S_y.imag - self.Q_spec + Q_load
 
     def _calc_load_power(self, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """提取负荷功率计算逻辑（精简独立函数）"""
+        """计算各节点负荷功率，恒功率负荷直接复用预聚合常量数组。"""
+        if not self._has_voltage_dependent_load:
+            return self._const_p_load, self._const_q_load
+
         P_load = self._load_p_work
         Q_load = self._load_q_work
         P_load.fill(0.0)
@@ -988,7 +992,8 @@ class ACPowerFlowCalc:
                 )
             else:
                 self._ppc_node_row_by_id = {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
-        ensure_ac_ppc_topology(ppc)
+        if not (ppc.pop("_topology_preverified", False) and ppc.get("_topology_arrays") is not None):
+            ensure_ac_ppc_topology(ppc)
         sanitize_ac_voltage_setpoints(ppc)
         topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
@@ -1310,11 +1315,6 @@ class ACPowerFlowCalc:
             self.ppc_branch_rows = np.where(live)[0].astype(np.int32)
             self.branch_i = self.row_to_pos[i_rows[self.ppc_branch_rows]]
             self.branch_j = self.row_to_pos[j_rows[self.ppc_branch_rows]]
-            n_branch = self.ppc_branch_rows.size
-            self.branch_yff = np.empty(n_branch, dtype=np.complex128)
-            self.branch_yft = np.empty(n_branch, dtype=np.complex128)
-            self.branch_ytf = np.empty(n_branch, dtype=np.complex128)
-            self.branch_ytt = np.empty(n_branch, dtype=np.complex128)
             self.branch_yff, self.branch_yft, self.branch_ytf, self.branch_ytt = matpower_branch_stamp_vectorized(
                 branch[self.ppc_branch_rows, BRANCH_COLS["r"]],
                 branch[self.ppc_branch_rows, BRANCH_COLS["x"]],
@@ -1331,11 +1331,6 @@ class ACPowerFlowCalc:
             self.ppc_transformer_rows = np.where(live)[0].astype(np.int32)
             self.transformer_i = self.row_to_pos[i_rows[self.ppc_transformer_rows]]
             self.transformer_j = self.row_to_pos[j_rows[self.ppc_transformer_rows]]
-            n_transformer = self.ppc_transformer_rows.size
-            self.transformer_yff = np.empty(n_transformer, dtype=np.complex128)
-            self.transformer_yft = np.empty(n_transformer, dtype=np.complex128)
-            self.transformer_ytf = np.empty(n_transformer, dtype=np.complex128)
-            self.transformer_ytt = np.empty(n_transformer, dtype=np.complex128)
             (
                 self.transformer_yff,
                 self.transformer_yft,
@@ -1484,9 +1479,12 @@ class ACPowerFlowCalc:
         self.acac_eq_start = self.ac_core_eq
         self.x = np.zeros(self.total_vars, dtype=np.float64)
         self.x[self.n_theta:self.n_theta + self.n_V] = 1.0
-        self._state_theta = np.empty(self.N, dtype=np.float64)
-        self._state_voltage = np.empty(self.N, dtype=np.float64)
+        self._state_theta = np.zeros(self.N, dtype=np.float64)
+        self._state_voltage = np.ones(self.N, dtype=np.float64)
+        self._state_cos = np.empty(self.N, dtype=np.float64)
+        self._state_sin = np.empty(self.N, dtype=np.float64)
         self._state_vc = np.empty(self.N, dtype=np.complex128)
+        self._state_u_conj = np.empty(self.N, dtype=np.complex128)
         self._empty_phi = np.array([], dtype=np.float64)
         self._load_p_work = np.zeros(self.N, dtype=np.float64)
         self._load_q_work = np.zeros(self.N, dtype=np.float64)
@@ -1782,6 +1780,13 @@ class ACPowerFlowCalc:
     def _cache_static_numeric_arrays(self):
         """Cache numeric arrays used by Newton iterations without object-model access."""
         self._cache_node_type_masks()
+        # 预填已知节点的相角和电压幅值设定，迭代时无需重复清零与回填
+        self._state_theta.fill(0.0)
+        self._state_voltage.fill(1.0)
+        if np.any(self._slack_mask):
+            self._state_theta[self._slack_mask] = self.theta_spec[self._slack_mask]
+        if np.any(self._fixed_voltage_mask):
+            self._state_voltage[self._fixed_voltage_mask] = self.V_spec[self._fixed_voltage_mask]
         if len(self.load_info):
             load_data = np.asarray(self.load_info, dtype=np.float64)
             self.load_pos = load_data[:, 0].astype(np.int32)
@@ -1795,6 +1800,25 @@ class ACPowerFlowCalc:
             self.load_pos = np.array([], dtype=np.int32)
             self.load_pv0 = self.load_pv1 = self.load_pv2 = np.array([], dtype=np.float64)
             self.load_qv0 = self.load_qv1 = self.load_qv2 = np.array([], dtype=np.float64)
+        self._has_voltage_dependent_load = bool(
+            self.load_pos.size
+            and (
+                np.any(self.load_pv1 != 0.0)
+                or np.any(self.load_pv2 != 0.0)
+                or np.any(self.load_qv1 != 0.0)
+                or np.any(self.load_qv2 != 0.0)
+            )
+        )
+        if not self._has_voltage_dependent_load:
+            if self.load_pos.size:
+                self._const_p_load = np.bincount(self.load_pos, weights=self.load_pv0, minlength=self.N)
+                self._const_q_load = np.bincount(self.load_pos, weights=self.load_qv0, minlength=self.N)
+            else:
+                self._const_p_load = np.zeros(self.N, dtype=np.float64)
+                self._const_q_load = np.zeros(self.N, dtype=np.float64)
+        else:
+            self._const_p_load = np.array([], dtype=np.float64)
+            self._const_q_load = np.array([], dtype=np.float64)
         self._load_vm_work = np.empty(self.load_pos.size, dtype=np.float64)
         self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
         self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
@@ -1822,6 +1846,7 @@ class ACPowerFlowCalc:
         self.Y_jac_rows = np.repeat(np.arange(self.N, dtype=np.int32), np.diff(y_csr.indptr))
         self.Y_jac_cols = y_csr.indices.astype(np.int32, copy=True)
         self.Y_jac_data = y_csr.data.astype(np.complex128, copy=True)
+        self.Y_jac_conj = np.conj(self.Y_jac_data)
         self.Y_jac_g = self.Y_jac_data.real
         self.Y_jac_b = self.Y_jac_data.imag
         self.Y_jac_diag = y_csr.diagonal().astype(np.complex128, copy=False)
@@ -1855,6 +1880,7 @@ class ACPowerFlowCalc:
         self.standard_jac_csc_indices = np.array([], dtype=np.int32)
         self.standard_jac_csc_indptr = np.array([], dtype=np.int32)
         self.standard_jac_csc_data = np.array([], dtype=np.float64)
+        self._standard_jac_csc_matrix = None
         self.standard_jac_csc_sum_plan = build_raw_sum_plan(self.standard_jac_raw_to_csc_pos, 0)
         self.std_jac_load_nodes = np.array([], dtype=np.int32)
         self.std_jac_load_extra_nodes = np.array([], dtype=np.int32)
@@ -1924,16 +1950,13 @@ class ACPowerFlowCalc:
         self.standard_jac_rows = np.concatenate(rows_parts).astype(np.int32, copy=False)
         self.standard_jac_cols = np.concatenate(cols_parts).astype(np.int32, copy=False)
         self.standard_jac_data = np.empty(cursor, dtype=np.float64)
+        if self.std_jac_load_p_slice.stop > self.std_jac_load_p_slice.start:
+            self.standard_jac_data[self.std_jac_load_p_slice] = 0.0
+            self.standard_jac_data[self.std_jac_load_q_slice] = 0.0
         if cursor:
             n_dim = self.n_theta + self.n_V
             cache_standard_csc = self.N_phi == 0
-            if self._cache_csr_jacobian_pattern:
-                (
-                    self.standard_jac_csr_indices,
-                    self.standard_jac_csr_indptr,
-                    self.standard_jac_raw_to_csr_pos,
-                ) = build_compressed_pattern_from_raw_coords(self.standard_jac_rows, self.standard_jac_cols, n_dim)
-                self.standard_jac_csr_data = np.empty(self.standard_jac_csr_indices.size, dtype=np.float64)
+            # CSR 模式统一懒构建：仅在外部调用 get_jacobi(x) 需要 CSR 时构建并缓存
             if cache_standard_csc:
                 (
                     self.standard_jac_csc_indices,
@@ -1941,24 +1964,29 @@ class ACPowerFlowCalc:
                     self.standard_jac_raw_to_csc_pos,
                 ) = build_compressed_pattern_from_raw_coords(self.standard_jac_cols, self.standard_jac_rows, n_dim)
                 self.standard_jac_csc_data = np.empty(self.standard_jac_csc_indices.size, dtype=np.float64)
-            if self._cache_csr_jacobian_pattern:
-                self.standard_jac_csr_sum_plan = build_raw_sum_plan(
-                    self.standard_jac_raw_to_csr_pos,
-                    self.standard_jac_csr_data.size,
-                )
-            if cache_standard_csc:
                 self.standard_jac_csc_sum_plan = build_raw_sum_plan(
                     self.standard_jac_raw_to_csc_pos,
                     self.standard_jac_csc_data.size,
                 )
             y_nnz = self.Y_jac_rows.size
-            self._jac_delta = np.empty(y_nnz, dtype=np.float64)
-            self._jac_cos_delta = np.empty(y_nnz, dtype=np.float64)
-            self._jac_sin_delta = np.empty(y_nnz, dtype=np.float64)
-            self._jac_vivj = np.empty(y_nnz, dtype=np.float64)
-            self._jac_common_p = np.empty(y_nnz, dtype=np.float64)
-            self._jac_common_q = np.empty(y_nnz, dtype=np.float64)
+            self._jac_w_work = np.empty(y_nnz, dtype=np.complex128)
             self._jac_tmp = np.empty(y_nnz, dtype=np.float64)
+
+    def _ensure_standard_csr_pattern(self):
+        """按需懒构建标准 P/Q 雅可比的 CSR 压缩模式并缓存。"""
+        if self.standard_jac_raw_to_csr_pos.size or not self.standard_jac_rows.size:
+            return
+        n_dim = self.n_theta + self.n_V
+        (
+            self.standard_jac_csr_indices,
+            self.standard_jac_csr_indptr,
+            self.standard_jac_raw_to_csr_pos,
+        ) = build_compressed_pattern_from_raw_coords(self.standard_jac_rows, self.standard_jac_cols, n_dim)
+        self.standard_jac_csr_data = np.empty(self.standard_jac_csr_indices.size, dtype=np.float64)
+        self.standard_jac_csr_sum_plan = build_raw_sum_plan(
+            self.standard_jac_raw_to_csr_pos,
+            self.standard_jac_csr_data.size,
+        )
 
     @staticmethod
     def _group_indices_by_kind(kind, source_index, n_kind):
@@ -2198,23 +2226,28 @@ class ACPowerFlowCalc:
 
         raw_rows = np.concatenate(rows_parts)
         raw_cols = np.concatenate(cols_parts)
-        cache_csr = self._cache_csr_jacobian_pattern or self.N_acac > 0
-        if cache_csr:
-            (
-                self.full_jac_csr_indices,
-                self.full_jac_csr_indptr,
-                self.full_jac_raw_to_csr_pos,
-            ) = _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, self.total_eq)
+        self._full_jac_raw_rows = raw_rows
+        self._full_jac_raw_cols = raw_cols
+        # 仅在 prepare 阶段构建 NR 求解所需的 CSC 模式；CSR 模式在 get_jacobi(x) 时懒构建
         (
             self.full_jac_csc_indices,
             self.full_jac_csc_indptr,
             self.full_jac_raw_to_csc_pos,
         ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
-        self.full_jac_csr_data = np.empty(self.full_jac_csr_indices.size, dtype=np.float64)
         self.full_jac_csc_data = np.empty(self.full_jac_csc_indices.size, dtype=np.float64)
-        if cache_csr:
-            self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, self.full_jac_csr_data.size)
         self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, self.full_jac_csc_data.size)
+
+    def _ensure_full_csr_pattern(self):
+        """按需懒构建完整 AC 雅可比的 CSR 压缩模式并缓存。"""
+        if self.full_jac_raw_to_csr_pos.size or not self._full_jac_raw_rows.size:
+            return
+        (
+            self.full_jac_csr_indices,
+            self.full_jac_csr_indptr,
+            self.full_jac_raw_to_csr_pos,
+        ) = _build_csr_pattern_from_raw_coords(self._full_jac_raw_rows, self._full_jac_raw_cols, self.total_eq)
+        self.full_jac_csr_data = np.empty(self.full_jac_csr_indices.size, dtype=np.float64)
+        self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, self.full_jac_csr_data.size)
 
     # --------------------------------------------------------------------------
     # 预处理阶段（精简版）
@@ -2425,6 +2458,10 @@ class ACPowerFlowCalc:
     def _calc_load_power_derivatives(self, V: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         dP = self._load_dp_work
         dQ = self._load_dq_work
+        if not self._has_voltage_dependent_load:
+            dP.fill(0.0)
+            dQ.fill(0.0)
+            return dP, dQ
         dP.fill(0.0)
         dQ.fill(0.0)
         if self.load_pos.size:
@@ -2483,8 +2520,7 @@ class ACPowerFlowCalc:
         return jac if build_matrix else None
 
     def _fill_standard_jacobian_data(self, V: np.ndarray, Sbus=None):
-        """Refresh the standard P/Q Jacobian raw data in the cached coordinate order."""
-        theta = self._cache['theta']
+        """基于节点复电压无三角函数刷新标准 P/Q 雅可比原始数据。"""
         Vc = self._cache['Vc']
         if Sbus is not None:
             pass
@@ -2501,27 +2537,16 @@ class ACPowerFlowCalc:
 
         i = self.Y_jac_rows
         j = self.Y_jac_cols
-        G = self.Y_jac_g
-        B = self.Y_jac_b
-        Vi = V[i]
+        # 利用已缓存的 Vc 与单位共轭复电压 U_conj = cos(theta) - j*sin(theta)：
+        # W_ij = Vc[i] * conj(Y_ij) * U_conj[j] = Vi*(G*cos(d)+B*sin(d)) + j*Vi*(G*sin(d)-B*cos(d))
+        # 完全消除对全部 nnz(Y) 非零元的 cos/sin 超越函数调用，且无除零风险。
+        w = self._jac_w_work
+        np.multiply(self.Y_jac_conj, self._state_u_conj[j], out=w)
+        w *= Vc[i]
+        w_re = w.real
+        w_im = w.imag
         Vj = V[j]
-        delta = self._jac_delta
-        cos_delta = self._jac_cos_delta
-        sin_delta = self._jac_sin_delta
-        vivj = self._jac_vivj
-        common_p = self._jac_common_p
-        common_q = self._jac_common_q
         tmp = self._jac_tmp
-
-        np.subtract(theta[i], theta[j], out=delta)
-        np.cos(delta, out=cos_delta)
-        np.sin(delta, out=sin_delta)
-        np.multiply(Vi, Vj, out=vivj)
-
-        np.multiply(G, sin_delta, out=common_q)
-        common_q -= B * cos_delta
-        np.multiply(G, cos_delta, out=common_p)
-        common_p += B * sin_delta
 
         diag_idx = self.Y_jac_diag_idx
         if diag_idx.size:
@@ -2529,20 +2554,24 @@ class ACPowerFlowCalc:
             Gii = self.Y_jac_diag_g
             Bii = self.Y_jac_diag_b
             Vdiag = V[diag_nodes]
+            Vdiag2 = Vdiag * Vdiag
 
         data = self.standard_jac_data
-        np.multiply(vivj, common_q, out=tmp)
+        # dP/dtheta: 非对角 = Vj * Im(W_ij)，对角 = -Q_i - B_ii * V_i^2
+        np.multiply(Vj, w_im, out=tmp)
         if diag_idx.size:
-            tmp[diag_idx] = -Q[diag_nodes] - Bii * Vdiag * Vdiag
+            tmp[diag_idx] = -Q[diag_nodes] - Bii * Vdiag2
         data[self.std_jac_p_theta_slice] = tmp[self.std_jac_p_theta_idx]
 
-        np.multiply(vivj, common_p, out=tmp)
+        # dQ/dtheta: 非对角 = -Vj * Re(W_ij)，对角 = P_i - G_ii * V_i^2
+        np.multiply(Vj, w_re, out=tmp)
         tmp *= -1.0
         if diag_idx.size:
-            tmp[diag_idx] = P[diag_nodes] - Gii * Vdiag * Vdiag
+            tmp[diag_idx] = P[diag_nodes] - Gii * Vdiag2
         data[self.std_jac_q_theta_slice] = tmp[self.std_jac_q_theta_idx]
 
-        np.multiply(Vi, common_p, out=tmp)
+        # dP/dV: 非对角 = Re(W_ij)，对角 = P_i / V_i + G_ii * V_i
+        tmp[:] = w_re
         if diag_idx.size:
             tmp[diag_idx] = np.divide(
                 P[diag_nodes],
@@ -2552,7 +2581,8 @@ class ACPowerFlowCalc:
             ) + Gii * Vdiag
         data[self.std_jac_p_vm_slice] = tmp[self.std_jac_p_vm_idx]
 
-        np.multiply(Vi, common_q, out=tmp)
+        # dQ/dV: 非对角 = Im(W_ij)，对角 = Q_i / V_i - B_ii * V_i
+        tmp[:] = w_im
         if diag_idx.size:
             tmp[diag_idx] = np.divide(
                 Q[diag_nodes],
@@ -2562,7 +2592,7 @@ class ACPowerFlowCalc:
             ) - Bii * Vdiag
         data[self.std_jac_q_vm_slice] = tmp[self.std_jac_q_vm_idx]
 
-        if self.V_unknown.size:
+        if self.V_unknown.size and self._has_voltage_dependent_load:
             dPload_dV, dQload_dV = self._calc_load_power_derivatives(V)
             if self.std_jac_load_nodes.size:
                 data[self.std_jac_load_p_pos] += dPload_dV[self.std_jac_load_nodes]
@@ -2584,12 +2614,15 @@ class ACPowerFlowCalc:
                 return self.standard_jac_csc_data
             if not self.standard_jac_csc_indptr.size:
                 return csc_matrix(shape, dtype=np.float64)
-            return csc_matrix(
-                (self.standard_jac_csc_data, self.standard_jac_csc_indices, self.standard_jac_csc_indptr),
-                shape=shape,
-                copy=False,
-            )
+            if self._standard_jac_csc_matrix is None:
+                self._standard_jac_csc_matrix = csc_matrix(
+                    (self.standard_jac_csc_data, self.standard_jac_csc_indices, self.standard_jac_csc_indptr),
+                    shape=shape,
+                    copy=False,
+                )
+            return self._standard_jac_csc_matrix
 
+        self._ensure_standard_csr_pattern()
         if self.standard_jac_raw_to_csr_pos.size:
             apply_raw_sum_plan(self.standard_jac_csr_data, data, self.standard_jac_csr_sum_plan)
             if not build_matrix:
@@ -2849,6 +2882,7 @@ class ACPowerFlowCalc:
                     copy=False,
                 )
             return self._full_jac_csc_matrix
+        self._ensure_full_csr_pattern()
         if not self.full_jac_raw_to_csr_pos.size:
             return None
 
@@ -2958,7 +2992,7 @@ class ACPowerFlowCalc:
         """执行所选潮流算法。"""
         if result_mode is not None:
             self.result_mode = self._normalize_result_mode(result_mode)
-            self._cache_csr_jacobian_pattern = self.result_mode == "full"
+            self._cache_csr_jacobian_pattern = False
             self.keep_node_objects = False
             self.node_list = []
             self.node_pos = {}
@@ -3011,6 +3045,15 @@ class ACPowerFlowCalc:
                 self._write_back()
                 return 0
 
+            # 发散 / 非有限残差提前终止，避免空跑后续迭代
+            if not np.isfinite(self.normF) or self.normF > self.params.divergence_threshold:
+                self.failure_reason = f"第 {it + 1} 次迭代残差发散 (|F|={self.normF:.2e})"
+                if self.verbose:
+                    print(self.failure_reason)
+                self.x = x
+                self._write_back()
+                return -1
+
             if adaptive_factor.can_reuse(self.normF, n_vars):
                 try:
                     delta = adaptive_factor.solve_reused(F, x, self.normF)
@@ -3034,11 +3077,22 @@ class ACPowerFlowCalc:
             try:
                 if reusable_factorizer is None:
                     reusable_factorizer = _make_reusable_factorizer(J, resolved_name)
-                factor = (
-                    reusable_factorizer.factor(J)
-                    if reusable_factorizer is not None
-                    else _factor_jacobian(J, resolved_name, solver_fn)
-                )
+                if reusable_factorizer is not None:
+                    factor = reusable_factorizer.factor(J)
+                else:
+                    # 纯/近似对称 AC 雅可比在中高密度网格上使用 MMD_AT_PLUS_A 可大幅降低 SuperLU 填充元
+                    ac_permc = (
+                        "MMD_AT_PLUS_A"
+                        if (
+                            resolved_name in {"scipy", "superlu", "default"}
+                            and self.N_acac == 0
+                            and J.shape[0] >= 512
+                            and J.nnz >= 8 * J.shape[0]
+                            and 2 * self.N_phi <= max(64, int(0.05 * J.shape[0]))
+                        )
+                        else None
+                    )
+                    factor = _factor_jacobian(J, resolved_name, solver_fn, permc_spec=ac_permc)
                 delta = factor.solve(F)
                 adaptive_factor.update_factor(factor, self.normF)
             except (RuntimeError, ValueError, ArithmeticError) as exc:
@@ -3095,7 +3149,8 @@ class ACPowerFlowCalc:
         if self.result_mode == "summary":
             self._write_summary_result()
             return
-        self._write_ppc_result_to_network()
+        if self.result_mode != "array":
+            self._write_ppc_result_to_network()
         if self.result_mode != "array" and not getattr(self, "skip_lf_result", False):
             self.lf_result = self._build_lf_result()
         else:
@@ -3472,14 +3527,26 @@ class ACPowerFlowCalc:
         if self.result_mode in {"summary", "none"}:
             self.result = {}
             return
-        theta, V, phi_re, phi_im = self._extract_state_vars(self.x)
-        Vc = self._cache['Vc']
-        P_load, Q_load = self._cache['P_load'], self._cache['Q_load']
-        if P_load is None or Q_load is None:
+        if (
+            self._state_x_obj is self.x
+            and self._power_x_obj is self.x
+            and self._last_Sbus is not None
+        ):
+            theta = self._cache['theta']
+            V = self._cache['V']
+            Vc = self._cache['Vc']
+            phi_re = self.x[self.base_phi_re:self.base_phi_re + self.N_phi] if self.N_phi > 0 else self._empty_phi
+            phi_im = self.x[self.base_phi_im:self.base_phi_im + self.N_phi] if self.N_phi > 0 else self._empty_phi
+            S_y = self._last_Sbus
+            P_load, Q_load = self._cache['P_load'], self._cache['Q_load']
+            if P_load is None or Q_load is None:
+                P_load, Q_load = self._calc_load_power(V)
+        else:
+            theta, V, phi_re, phi_im = self._extract_state_vars(self.x)
+            Vc = self._cache['Vc']
             P_load, Q_load = self._calc_load_power(V)
-
-        I_y = self.Y.dot(Vc)
-        S_y = Vc * np.conj(I_y)
+            I_y = self.Y.dot(Vc)
+            S_y = Vc * np.conj(I_y)
         if self.N_phi > 0 and self.zero_a.size:
             I_ab = (phi_re[self.zero_phi_a] - phi_re[self.zero_phi_b]) + 1j * (
                 phi_im[self.zero_phi_a] - phi_im[self.zero_phi_b]
@@ -3749,20 +3816,20 @@ class ACPowerFlowCalc:
             switch[:, [SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]]] = 0.0
         if breaker.size:
             breaker[:, [SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]]] = 0.0
-        for dev_idx, edge_type, a, current in zip(self.zero_idx, self.zero_type, self.zero_a, I_ab):
-            s_from = Vc[a] * np.conj(current)
-            if edge_type == 0:
-                zero_branch[dev_idx, ZERO_BRANCH_COLS["p"]] = s_from.real
-                zero_branch[dev_idx, ZERO_BRANCH_COLS["q"]] = s_from.imag
-                zero_branch[dev_idx, ZERO_BRANCH_COLS["current"]] = abs(current)
-            elif edge_type == 2:
-                breaker[dev_idx, SWITCH_COLS["p"]] = s_from.real
-                breaker[dev_idx, SWITCH_COLS["q"]] = s_from.imag
-                breaker[dev_idx, SWITCH_COLS["current"]] = abs(current)
-            else:
-                switch[dev_idx, SWITCH_COLS["p"]] = s_from.real
-                switch[dev_idx, SWITCH_COLS["q"]] = s_from.imag
-                switch[dev_idx, SWITCH_COLS["current"]] = abs(current)
+        if self.zero_idx.size and I_ab.size:
+            s_from = Vc[self.zero_a] * np.conj(I_ab)
+            i_abs = np.abs(I_ab)
+            for edge_code, table, p_col, q_col, c_col in (
+                (0, zero_branch, ZERO_BRANCH_COLS["p"], ZERO_BRANCH_COLS["q"], ZERO_BRANCH_COLS["current"]),
+                (2, breaker, SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]),
+                (1, switch, SWITCH_COLS["p"], SWITCH_COLS["q"], SWITCH_COLS["current"]),
+            ):
+                mask = self.zero_type == edge_code
+                if np.any(mask):
+                    dev_rows = self.zero_idx[mask]
+                    table[dev_rows, p_col] = s_from.real[mask]
+                    table[dev_rows, q_col] = s_from.imag[mask]
+                    table[dev_rows, c_col] = i_abs[mask]
 
         acac = self.ppc.get("acac", np.zeros((0, len(ACAC_COLS)), dtype=np.float64)).copy()
         result_columns = [

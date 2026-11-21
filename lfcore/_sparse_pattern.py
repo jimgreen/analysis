@@ -81,10 +81,11 @@ def build_raw_sum_plan(raw_to_pos, n_pos: int):
     order = np.argsort(raw_to_pos[duplicate_raw], kind="stable")
     duplicate_raw = duplicate_raw[order].astype(np.intp, copy=False)
     duplicate_pos_sorted = raw_to_pos[duplicate_raw]
-    duplicate_starts = np.empty(np.count_nonzero(np.r_[True, duplicate_pos_sorted[1:] != duplicate_pos_sorted[:-1]]), dtype=np.intp)
+    diff_idx = np.flatnonzero(duplicate_pos_sorted[1:] != duplicate_pos_sorted[:-1])
+    duplicate_starts = np.empty(diff_idx.size + 1, dtype=np.intp)
     duplicate_starts[0] = 0
-    if duplicate_starts.size > 1:
-        duplicate_starts[1:] = np.flatnonzero(duplicate_pos_sorted[1:] != duplicate_pos_sorted[:-1]) + 1
+    if diff_idx.size:
+        duplicate_starts[1:] = diff_idx + 1
     duplicate_pos = duplicate_pos_sorted[duplicate_starts].astype(np.intp, copy=False)
     return direct_pos, direct_raw, duplicate_pos, duplicate_raw, duplicate_starts
 

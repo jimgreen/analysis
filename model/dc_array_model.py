@@ -25,6 +25,7 @@ from model.array_common import (
     _assign_current_if_present,
     _assign_power_if_present,
     _base_from_rows,
+    _build_node_float_lookup,
     _cell,
     _code_column,
     _code_value,
@@ -370,10 +371,11 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         bus[:, BUS_COLS["isl"]] = _float_column(table_rows, columns, "isl", 0.0)
         bus[:, BUS_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
     bus_names = _names_from_rows(table_rows, columns, "bus", bus[:, BUS_COLS["idx"]])
-    raw_vbase_by_idx = {
-        int(idx): float(vbase)
-        for idx, vbase in zip(bus[:, BUS_COLS["idx"]], raw_vbase if table_rows else [])
-    }
+    raw_vbase_by_idx = _build_node_float_lookup(
+        bus[:, BUS_COLS["idx"]],
+        raw_vbase if table_rows else np.empty(0, dtype=np.float64),
+        0.0,
+    )
     current_scale_by_node = None
 
     def get_current_scale_by_node():

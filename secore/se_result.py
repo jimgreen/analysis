@@ -613,6 +613,7 @@ def _measurement_rows_from_table(
     def missing_device_name(p):
         return f"pos:{int(device_pos[p])}" if device_pos is not None and len(device_pos) > p and int(device_pos[p]) >= 0 else ""
 
+    rows_out = []
     for start in range(0, rows.size, 8192):
         positions = rows[start:start + 8192]
         ids = table.idx[positions].astype(np.int64).tolist()
@@ -631,24 +632,27 @@ def _measurement_rows_from_table(
         residuals = optional_column(residual, positions)
         normalized_values = optional_column(normalized, positions)
         reason_values = repeat("", len(positions)) if reasons is None else reasons[start:start + 8192]
-        yield from starmap(
-            row_type,
-            zip(
-                ids,
-                names,
-                device_types,
-                device_names,
-                meas_types,
-                weights,
-                valid,
-                values,
-                estimates,
-                residuals,
-                normalized_values,
-                reason_values,
-                repeat(source, len(positions)),
-            ),
+        rows_out.extend(
+            starmap(
+                row_type,
+                zip(
+                    ids,
+                    names,
+                    device_types,
+                    device_names,
+                    meas_types,
+                    weights,
+                    valid,
+                    values,
+                    estimates,
+                    residuals,
+                    normalized_values,
+                    reason_values,
+                    repeat(source, len(positions)),
+                ),
+            )
         )
+    return rows_out
 
 
 def build_seresult_full_from_table(

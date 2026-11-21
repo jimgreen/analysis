@@ -1080,8 +1080,67 @@ class HybridStateEstimator:
         self.multi_energy_estimate_result: Optional[EstimateResult] = None
         self.multi_energy_observability_result: Optional[ObservabilityResult] = None
         self._multi_energy_se_layout_ready = False
+        self._state_labels_cache: Sequence[str] = []
+        self._state_meta_cache: Sequence[StateMeta] = []
+        self._last_estimate_cholmod_factor = None
+        self._compatibility_device_views_ready = False
         if auto_prepare:
             self.prepare()
+
+    _COMPAT_VIEW_ATTRS = frozenset(
+        {
+            "ac_nodes",
+            "dc_nodes",
+            "ac_node_by_name",
+            "ac_node_by_idx",
+            "dc_node_by_name",
+            "dc_node_by_idx",
+            "ac_branches",
+            "ac_transformers",
+            "ac_zero_branches",
+            "ac_breakers",
+            "ac_generators",
+            "ac_loads",
+            "dc_branches",
+            "dc_zero_branches",
+            "dc_breakers",
+            "dc_generators",
+            "dc_loads",
+            "ac_reference_nodes",
+            "dc_reference_nodes",
+            "ac_branch_by_name",
+            "ac_zero_branch_by_name",
+            "ac_generator_by_name",
+            "ac_load_by_name",
+            "dc_zero_branch_by_name",
+            "dc_generator_by_name",
+            "dc_load_by_name",
+            "dcac_by_name",
+        }
+    )
+
+    def __getattr__(self, name: str):
+        # 兼容视图属性改为按需懒加载，避免在 prepare() 阶段无谓构造全网 SimpleNamespace 对象
+        if name in self._COMPAT_VIEW_ATTRS:
+            self._install_compatibility_device_views()
+            return self.__dict__[name]
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    @property
+    def state_labels(self):
+        return getattr(self, "_state_labels_cache", [])
+
+    @state_labels.setter
+    def state_labels(self, value) -> None:
+        self._state_labels_cache = value
+
+    @property
+    def state_meta(self):
+        return getattr(self, "_state_meta_cache", [])
+
+    @state_meta.setter
+    def state_meta(self, value) -> None:
+        self._state_meta_cache = value
 
     def prepare(
         self,
@@ -3756,7 +3815,7 @@ class HybridStateEstimator:
         verbose: bool,
         observability: Optional[ObservabilityResult] = None,
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
-        remove_limit = self.params.bad_max_remove if max_remove is None else int(max_remove)
+        remove_limit = self.params.max_remove if max_remove is None else int(max_remove)
         rows = np.arange(self.multi_energy_measurement_count, dtype=np.int64)
         x0 = None
         result = None
@@ -4029,7 +4088,61 @@ class HybridStateEstimator:
             key=lambda item: item.idx,
         )
         if install_views:
-            self._install_compatibility_device_views()
+            self._link_converter_endpoint_nodes()
+
+    def _link_converter_endpoint_nodes(self) -> None:
+        """仅为交直流换流器端点挂载轻量节点视图，避免急切构建全网兼容设备列表。"""
+        if not self.dcac_converters:
+            return
+        if getattr(self, "_compatibility_device_views_ready", False):
+            ac_map = self.ac_node_by_idx
+            dc_map = self.dc_node_by_idx
+            for conv in self.dcac_converters:
+                conv.ac_node_obj = ac_map.get(int(conv.ac_node))
+                conv.dc_node_obj = dc_map.get(int(conv.dc_node))
+            return
+        net = getattr(self, "network", None)
+        ac_ppc = getattr(net, "_ac_ppc", None)
+        dc_ppc = getattr(net, "_dc_ppc", None)
+
+        def _build_selected_nodes(ppc, cols, wanted_ids, ac_side: bool) -> Dict[int, SimpleNamespace]:
+            if not isinstance(ppc, dict) or not wanted_ids:
+                return {}
+            table = np.asarray(ppc.get("bus", np.zeros((0, len(cols)))), dtype=np.float64)
+            if table.ndim != 2 or table.shape[0] == 0:
+                return {}
+            bus_ids = table[:, cols["idx"]].astype(np.int64, copy=False)
+            wanted = set(wanted_ids)
+            matches = np.flatnonzero(np.isin(bus_ids, list(wanted)))
+            if matches.size == 0:
+                return {}
+            raw_names = ppc.get("bus_name", ())
+            has_names = len(raw_names) == int(table.shape[0])
+            result: Dict[int, SimpleNamespace] = {}
+            for pos in matches.tolist():
+                idx_val = int(bus_ids[pos])
+                name_val = str(raw_names[pos]) if has_names and raw_names[pos] is not None else f"bus_{idx_val}"
+                status_val = int(table[pos, cols["run_stat"]])
+                ns_kwargs = {
+                    "idx": idx_val,
+                    "name": name_val,
+                    "vbase": float(table[pos, cols["vbase"]]),
+                    "voltage": float(table[pos, cols["voltage"]]),
+                    "run_stat": status_val,
+                    "is_alive": status_val == 1,
+                }
+                if ac_side:
+                    ns_kwargs["angle"] = float(table[pos, cols["angle"]])
+                result[idx_val] = SimpleNamespace(**ns_kwargs)
+            return result
+
+        ac_wanted = [int(conv.ac_node) for conv in self.dcac_converters]
+        dc_wanted = [int(conv.dc_node) for conv in self.dcac_converters]
+        ac_map = _build_selected_nodes(ac_ppc, AC_BUS_COLS, ac_wanted, ac_side=True)
+        dc_map = _build_selected_nodes(dc_ppc, DC_BUS_COLS, dc_wanted, ac_side=False)
+        for conv in self.dcac_converters:
+            conv.ac_node_obj = ac_map.get(int(conv.ac_node))
+            conv.dc_node_obj = dc_map.get(int(conv.dc_node))
 
     @staticmethod
     def _compat_names(ppc: Dict, name_key: str, table: np.ndarray, prefix: str) -> np.ndarray:
@@ -4346,7 +4459,7 @@ class HybridStateEstimator:
             self.ac_state_slice = slice(0, 0)
             self.dc_state_slice = slice(0, self.n_state)
             self.hybrid_state_slice = slice(self.n_state, self.n_state)
-        self._install_compatibility_device_views()
+        self._link_converter_endpoint_nodes()
 
     def _adopt_delegate_active_partition(self, side: str) -> None:
         count = len(self.active_measurements)
@@ -6217,7 +6330,7 @@ class HybridStateEstimator:
         self.voltage_cols = np.concatenate(voltage_col_parts) if voltage_col_parts else np.array([], dtype=np.int32)
         self._build_hybrid_converter_array_cache()
         self._partition_state_variables()
-        self._install_compatibility_device_views()
+        self._link_converter_endpoint_nodes()
 
     def _build_hybrid_converter_array_cache(self) -> None:
         self._ensure_hybrid_converter_node_cache()
@@ -7692,11 +7805,16 @@ class HybridStateEstimator:
         pack_key = self._packed_measurement_key
         voltage_covered = self._voltage_pseudo_is_covered_by_code
 
+        allowed_device_type_codes = frozenset(allowed_codes_by_device.keys())
+
         def append_from_side_estimator(side: str, estimator) -> None:
             nonlocal next_idx
             if estimator is None:
                 return
-            candidates = estimator._observability_pseudo_candidate_measurements()
+            candidates = estimator._observability_pseudo_candidate_measurements(
+                allowed_device_type_codes=allowed_device_type_codes,
+                allowed_meas_types_by_device=allowed_codes_by_device,
+            )
             table = getattr(candidates, "table", None)
             if table is None:
                 raise RuntimeError(f"{side.upper()} observability candidates must expose an array measurement table")
@@ -9179,6 +9297,8 @@ class HybridStateEstimator:
         cand_residual = np.empty(n_meas, dtype=np.float64)
         z_est_dirty = True
         final_quantities_current = False
+        last_solved_via_aat = False
+        self._last_estimate_cholmod_factor = None
 
         for iteration in range(1, self.max_iter + 1):
             # An accepted line-search candidate already contains h(x) and its
@@ -9245,6 +9365,7 @@ class HybridStateEstimator:
                     aat_plan = None
                 if start is not None:
                     self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
+            last_solved_via_aat = solved_via_aat
 
             if not solved_via_aat:
                 if normal_pattern is None and is_sparse_matrix(H):
@@ -9371,13 +9492,21 @@ class HybridStateEstimator:
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if start is not None:
                 self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        cached_cholmod_factor = None
         if final_diagnostics:
             if not final_quantities_current or H is None:
                 start = time.perf_counter() if self.profile_enabled else None
                 H = self.jacobian_sparse(x, measurements)
                 if start is not None:
                     self._record_profile_time("solve.jacobian", time.perf_counter() - start)
-            if gain is None and self.n_state <= 5000:
+            elif (
+                last_solved_via_aat
+                and aat_solver is not None
+                and aat_solver.last_cholmod_factor is not None
+            ):
+                cached_cholmod_factor = aat_solver.last_cholmod_factor
+                self._last_estimate_cholmod_factor = (id(H), cached_cholmod_factor)
+            if gain is None and cached_cholmod_factor is None and self.n_state <= 5000:
                 if normal_pattern is None and is_sparse_matrix(H):
                     normal_pattern = _normal_equation_structural_pattern(H)
                     if active_measurement_run:
@@ -9449,7 +9578,17 @@ class HybridStateEstimator:
         else:
             _z, weights = self._measurement_vectors(result.measurements)
         R_diag = 1.0 / np.maximum(weights, 1e-12)
-        if self.n_state > 5000 and (result.H is None or result.gain is None):
+        cached_factor_entry = getattr(self, "_last_estimate_cholmod_factor", None)
+        cached_factor = (
+            cached_factor_entry[1]
+            if (
+                cached_factor_entry is not None
+                and result.H is not None
+                and cached_factor_entry[0] == id(result.H)
+            )
+            else None
+        )
+        if self.n_state > 5000 and (result.H is None or (result.gain is None and cached_factor is None)):
             leverage = None
         else:
             jacobian_measurements = (
@@ -9459,10 +9598,14 @@ class HybridStateEstimator:
             )
             H = result.H if result.H is not None else self.jacobian_sparse(result.x, jacobian_measurements)
             gain = result.gain
-            if gain is None:
+            if gain is None and cached_factor is None:
                 gain, _rhs = build_normal_equations(H, result.residual, weights)
             gain_inverse_start = time.perf_counter() if self.profile_enabled else None
-            leverage = measurement_leverage_for_bad_data(H, gain)
+            leverage = measurement_leverage_for_bad_data(H, gain, cholmod_factor=cached_factor)
+            if leverage is None and gain is None and self.n_state <= 5000:
+                # 极少数极端情况稀疏杠杆回退时再兜底构造增益矩阵
+                gain, _rhs = build_normal_equations(H, result.residual, weights)
+                leverage = measurement_leverage_for_bad_data(H, gain)
             if gain_inverse_start is not None:
                 self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
         if leverage is None:
@@ -10001,7 +10144,7 @@ class HybridStateEstimator:
                 verbose=verbose,
             )
         threshold = self.params.bad_threshold if threshold is None else threshold
-        max_remove = self.params.bad_max_remove if max_remove is None else max_remove
+        max_remove = self.params.max_remove if max_remove is None else int(max_remove)
         measurements = self.active_measurements
         removed: List[BadDataItem] = []
         x0 = self.initial_state()
@@ -10012,17 +10155,21 @@ class HybridStateEstimator:
                 break
             worst = bad_items[0]
             removed.append(worst)
-            remove_pos = result.measurements.index(worst.measurement)
+            source_measurements = result.measurements if len(result.measurements) == result.residual.size else measurements
+            if worst.row_pos is not None and 0 <= int(worst.row_pos) < len(source_measurements):
+                remove_pos = int(worst.row_pos)
+            else:
+                remove_pos = source_measurements.index(worst.measurement)
             keep_rows = np.concatenate(
                 (
                     np.arange(remove_pos, dtype=np.int64),
-                    np.arange(remove_pos + 1, len(result.measurements), dtype=np.int64),
+                    np.arange(remove_pos + 1, len(source_measurements), dtype=np.int64),
                 )
             )
-            if measurements is self.active_measurements and result.measurements is self.active_measurements:
+            if measurements is self.active_measurements and source_measurements is self.active_measurements:
                 measurements = self._shrink_active_measurement_state_layout(remove_pos)
             else:
-                measurements = take_measurement_view(result.measurements, keep_rows)
+                measurements = take_measurement_view(source_measurements, keep_rows)
             result = self.estimate(measurements=measurements, x0=result.x, verbose=verbose)
         return result, removed
 

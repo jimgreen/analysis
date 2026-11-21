@@ -274,30 +274,43 @@ def attach_device_pos_from_name_arrays(
         if not np.any(unresolved):
             continue
         rows = rows[unresolved]
+        if isinstance(device_name_id_by_name, dict):
+            # 优先使用 list 视图直接查字典，避免 np.asarray(..., dtype=object) 拷贝和逐元素拆箱
+            if isinstance(plan_names, (list, tuple)):
+                name_list = plan_names
+            elif hasattr(plan_names, "tolist"):
+                name_list = plan_names.tolist()
+            else:
+                name_list = list(plan_names)
+            if not name_list:
+                continue
+            ids = device_name_id[rows.astype(np.intp, copy=False)]
+            valid_ids = (ids >= 0) & (ids < device_names.size)
+            if not np.any(valid_ids):
+                continue
+            lookup_size = int(device_names.size)
+            lookup = [-1] * lookup_size
+            get_name_id = device_name_id_by_name.get
+            for pos, name in enumerate(name_list):
+                name_id = get_name_id(name)
+                if name_id is None and not isinstance(name, str):
+                    name_id = get_name_id(str(name))
+                if name_id is not None and 0 <= name_id < lookup_size:
+                    lookup[name_id] = pos
+            lookup_arr = np.asarray(lookup, dtype=np.int64)
+            valid_row_pos = np.flatnonzero(valid_ids)
+            target_pos = lookup_arr[ids[valid_ids].astype(np.intp, copy=False)]
+            matched = target_pos >= 0
+            if np.any(matched):
+                target_rows = rows[valid_row_pos[matched]].astype(np.intp, copy=False)
+                device_pos[target_rows] = target_pos[matched]
+            continue
         names = np.asarray(plan_names, dtype=object)
         if names.size == 0:
             continue
         ids = device_name_id[rows.astype(np.intp, copy=False)]
         valid_ids = (ids >= 0) & (ids < device_names.size)
         if not np.any(valid_ids):
-            continue
-        if isinstance(device_name_id_by_name, dict):
-            lookup = np.full(device_names.size, -1, dtype=np.int64)
-            for pos, name in enumerate(names):
-                name_id = device_name_id_by_name.get(name)
-                if name_id is None and not isinstance(name, str):
-                    name_id = device_name_id_by_name.get(str(name))
-                if name_id is None:
-                    continue
-                name_id = int(name_id)
-                if 0 <= name_id < lookup.size:
-                    lookup[name_id] = int(pos)
-            valid_row_pos = np.flatnonzero(valid_ids)
-            target_pos = lookup[ids[valid_ids].astype(np.intp, copy=False)]
-            matched = target_pos >= 0
-            if np.any(matched):
-                target_rows = rows[valid_row_pos[matched]].astype(np.intp, copy=False)
-                device_pos[target_rows] = target_pos[matched].astype(np.int64, copy=False)
             continue
         rows_valid = rows[valid_ids]
         query = device_names[ids[valid_ids].astype(np.intp, copy=False)]

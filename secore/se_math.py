@@ -11,6 +11,7 @@ from scipy.linalg import solve_triangular as SOLVE_TRIANGULAR
 from scipy.linalg.lapack import dposv as DPOSV
 from scipy.linalg.lapack import dpotrf as DPOTRF
 from scipy.linalg.lapack import dpotri as DPOTRI
+from scipy.linalg.lapack import dtrtri as DTRTRI
 from scipy.sparse import coo_matrix as SP_COO_MATRIX
 from scipy.sparse import csc_matrix as SP_CSC_MATRIX
 from scipy.sparse import csr_matrix as SP_CSR_MATRIX
@@ -1541,6 +1542,11 @@ class CholmodAAtNormalEquationSolver:
         gain = A_csc @ A_csc.T
         return self._fallback_solver.solve(gain.tocsc(), rhs, return_factor_diag=return_factor_diag)
 
+    @property
+    def last_cholmod_factor(self):
+        """返回最近一次成功分解的 CHOLMOD 因子对象（供坏数据杠杆计算复用）。"""
+        return self._cholmod_factor
+
     def solve_from_plan(
         self,
         plan: CholmodAAtNormalEquationPlan,
@@ -1587,154 +1593,227 @@ def _supernodal_selected_inverse_from_cholmod(factor):
         return None, None
     d_inv = 1.0 / d_diag
 
-    # Group consecutive columns with identical trailing sparsity patterns into supernodes.
-    sn_starts = []
-    j = 0
-    while j < n:
-        s0 = int(indptr[j])
-        e0 = int(indptr[j + 1])
-        pat0 = indices[s0:e0]
-        len0 = e0 - s0
-        k = 1
-        while j + k < n:
-            sk = int(indptr[j + k])
-            ek = int(indptr[j + k + 1])
-            if (ek - sk) == (len0 - k) and np.array_equal(indices[sk:ek], pat0[k:]):
-                k += 1
-            else:
-                break
-        sn_starts.append(j)
-        j += k
+    # 向量化识别尾部稀疏模式相同的连续列作为超节点
+    col_len = np.diff(indptr)
+    is_start = np.ones(n, dtype=bool)
+    if n > 1:
+        same_len = (col_len[:-1] - 1) == col_len[1:]
+        has_sub = col_len[1:] > 0
+        cand = np.flatnonzero(same_len & has_sub) + 1
+        if cand.size:
+            # 必要条件：前一列的次对角行号必须等于当前列号 j
+            first_sub = indices[indptr[cand - 1] + 1]
+            cand = cand[first_sub == cand]
+            for j in cand.tolist():
+                s_prev = int(indptr[j - 1])
+                e_prev = int(indptr[j])
+                e_cur = int(indptr[j + 1])
+                if indices[s_prev + 1 : e_prev].tobytes() == indices[e_prev:e_cur].tobytes():
+                    is_start[j] = False
+    sn_starts_arr = np.flatnonzero(is_start).astype(np.int32, copy=False)
+    sn_starts = sn_starts_arr.tolist()
     sn_starts.append(n)
     n_sn = len(sn_starts) - 1
 
-    col_to_sn = np.empty(n, dtype=np.int32)
-    col_to_off = np.empty(n, dtype=np.int32)
-    for sid in range(n_sn):
-        a = sn_starts[sid]
-        b = sn_starts[sid + 1]
-        col_to_sn[a:b] = sid
-        col_to_off[a:b] = np.arange(b - a, dtype=np.int32)
+    col_to_sn = np.cumsum(is_start, dtype=np.int32) - 1
+    col_to_off = (np.arange(n, dtype=np.int32) - sn_starts_arr[col_to_sn]).astype(np.int32, copy=False)
 
+    zdata = np.empty_like(ldata)
+    z_diag = np.empty(n, dtype=np.float64)
     z_blocks = [None] * n_sn
     sn_rows = [None] * n_sn
-    searchsorted = np.searchsorted
+    sn_contig = [False] * n_sn
+    sn_is_1d = [False] * n_sn
+    sn_row0 = [0] * n_sn
+    indptr_list = indptr.tolist()
+    d_inv_list = d_inv.tolist()
 
     for sid in range(n_sn - 1, -1, -1):
         a = sn_starts[sid]
         b = sn_starts[sid + 1]
         w = b - a
-        s0 = int(indptr[a])
-        e0 = int(indptr[a + 1])
+        s0 = indptr_list[a]
+        e0 = indptr_list[a + 1]
         rows = indices[s0:e0]
-        m = int(rows.size)
+        m = e0 - s0
         u = m - w
         sn_rows[sid] = rows
+        r_first = int(rows[0]) if m > 0 else 0
+        sn_row0[sid] = r_first
+        sn_contig[sid] = m > 0 and (int(rows[-1]) - r_first == m - 1)
 
         if w == 1:
+            sn_is_1d[sid] = True
             if u == 0:
-                z_blocks[sid] = np.array([[d_inv[a]]], dtype=np.float64)
+                z11 = d_inv_list[a]
+                zdata[s0] = z11
+                z_diag[a] = z11
+                z_blocks[sid] = zdata[s0:e0]
+                continue
+            if u == 1:
+                r0 = int(rows[1])
+                l1 = float(ldata[s0 + 1])
+                z21 = -float(z_diag[r0]) * l1
+                z11 = d_inv_list[a] - l1 * z21
+                zdata[s0] = z11
+                zdata[s0 + 1] = z21
+                z_diag[a] = z11
+                z_blocks[sid] = zdata[s0:e0]
                 continue
             l_21 = ldata[s0 + 1 : e0]
             upd_rows = rows[1:]
-            Z_22 = np.empty((u, u), dtype=np.float64)
-            u_sn = col_to_sn[upd_rows]
+            u_sn = col_to_sn[upd_rows].tolist()
+            z_21 = np.zeros(u, dtype=np.float64)
             rs = 0
             while rs < u:
-                target_sid = int(u_sn[rs])
+                target_sid = u_sn[rs]
                 re = rs + 1
-                while re < u and int(u_sn[re]) == target_sid:
+                while re < u and u_sn[re] == target_sid:
                     re += 1
                 t_rows = sn_rows[target_sid]
                 t_Z = z_blocks[target_sid]
-                t_cols = col_to_off[upd_rows[rs:re]]
                 query = upd_rows[rs:]
-                if query.size == t_rows.size and query[0] == t_rows[0]:
-                    sub = t_Z[:, t_cols]
+                exact_match = query.size == t_rows.size and int(query[0]) == sn_row0[target_sid]
+                if not exact_match:
+                    if sn_contig[target_sid]:
+                        r_pos = query - sn_row0[target_sid]
+                    else:
+                        r_pos = t_rows.searchsorted(query)
+                if sn_is_1d[target_sid]:
+                    col_vec = t_Z if exact_match else t_Z[r_pos]
+                    z_21[rs:] -= col_vec * float(l_21[rs])
+                    if rs + 1 < u:
+                        z_21[rs] -= float(np.dot(col_vec[1:], l_21[rs + 1 :]))
+                elif re == rs + 1:
+                    c0 = int(col_to_off[upd_rows[rs]])
+                    col_vec = t_Z[:, c0] if exact_match else t_Z[r_pos, c0]
+                    z_21[rs:] -= col_vec * float(l_21[rs])
+                    if rs + 1 < u:
+                        z_21[rs] -= float(np.dot(col_vec[1:], l_21[rs + 1 :]))
                 else:
-                    r_pos = searchsorted(t_rows, query)
-                    sub = t_Z[r_pos][:, t_cols]
-                Z_22[rs:, rs:re] = sub
-                if re < u:
-                    Z_22[rs:re, re:] = sub[re - rs :, :].T
+                    t_cols = col_to_off[upd_rows[rs:re]]
+                    c0 = int(t_cols[0])
+                    c1 = int(t_cols[-1]) + 1
+                    if c1 - c0 == re - rs:
+                        sub = t_Z[:, c0:c1] if exact_match else t_Z[r_pos, c0:c1]
+                    else:
+                        sub = t_Z[:, t_cols] if exact_match else t_Z[r_pos[:, None], t_cols]
+                    z_21[rs:] -= sub @ l_21[rs:re]
+                    if re < u:
+                        z_21[rs:re] -= sub[re - rs :, :].T @ l_21[re:]
                 rs = re
-            z_21 = -(Z_22 @ l_21)
-            z_11 = d_inv[a] - float(np.dot(l_21, z_21))
-            Z_blk = np.empty((m, 1), dtype=np.float64)
-            Z_blk[0, 0] = z_11
-            Z_blk[1:, 0] = z_21
-            z_blocks[sid] = Z_blk
+            z11 = d_inv_list[a] - float(np.dot(l_21, z_21))
+            zdata[s0] = z11
+            zdata[s0 + 1 : e0] = z_21
+            z_diag[a] = z11
+            z_blocks[sid] = zdata[s0:e0]
             continue
 
         L_blk = np.zeros((m, w), dtype=np.float64)
         for col_off in range(w):
-            cs = int(indptr[a + col_off])
-            ce = int(indptr[a + col_off + 1])
+            cs = indptr_list[a + col_off]
+            ce = indptr_list[a + col_off + 1]
             L_blk[col_off:, col_off] = ldata[cs:ce]
         L_11 = L_blk[:w, :]
         L_21 = L_blk[w:, :]
-        L11_inv = SOLVE_TRIANGULAR(
-            L_11,
-            np.eye(w, dtype=np.float64),
-            lower=True,
-            unit_diagonal=True,
-            check_finite=False,
-        )
+        # 小超节点直接用解析公式求单位下三角逆，较大超节点调用 LAPACK dtrtri 绕过 SciPy 包装开销
+        if w == 2:
+            L11_inv = np.array([[1.0, 0.0], [-L_11[1, 0], 1.0]], dtype=np.float64)
+        elif w == 3:
+            l10 = L_11[1, 0]
+            l20 = L_11[2, 0]
+            l21 = L_11[2, 1]
+            L11_inv = np.array(
+                [
+                    [1.0, 0.0, 0.0],
+                    [-l10, 1.0, 0.0],
+                    [l10 * l21 - l20, -l21, 1.0],
+                ],
+                dtype=np.float64,
+            )
+        else:
+            # L_11 严格上三角已由 L_blk 零初始化，DTRTRI 仅写入下三角，无需再调用 np.tril
+            inv_raw, info = DTRTRI(L_11, lower=1, unitdiag=1, overwrite_c=0)
+            if info == 0:
+                L11_inv = inv_raw
+            else:
+                L11_inv = SOLVE_TRIANGULAR(
+                    L_11,
+                    np.eye(w, dtype=np.float64),
+                    lower=True,
+                    unit_diagonal=True,
+                    check_finite=False,
+                )
         Z_blk = np.empty((m, w), dtype=np.float64)
         if u > 0:
             L21_eff = L_21 @ L11_inv
             upd_rows = rows[w:]
             Z_22 = np.empty((u, u), dtype=np.float64)
-            u_sn = col_to_sn[upd_rows]
+            u_sn = col_to_sn[upd_rows].tolist()
             rs = 0
             while rs < u:
-                target_sid = int(u_sn[rs])
+                target_sid = u_sn[rs]
                 re = rs + 1
-                while re < u and int(u_sn[re]) == target_sid:
+                while re < u and u_sn[re] == target_sid:
                     re += 1
                 t_rows = sn_rows[target_sid]
                 t_Z = z_blocks[target_sid]
-                t_cols = col_to_off[upd_rows[rs:re]]
                 query = upd_rows[rs:]
-                if query.size == t_rows.size and query[0] == t_rows[0]:
-                    sub = t_Z[:, t_cols]
+                exact_match = query.size == t_rows.size and int(query[0]) == sn_row0[target_sid]
+                if not exact_match:
+                    if sn_contig[target_sid]:
+                        r_pos = query - sn_row0[target_sid]
+                    else:
+                        r_pos = t_rows.searchsorted(query)
+                if sn_is_1d[target_sid]:
+                    col_vec = t_Z if exact_match else t_Z[r_pos]
+                    Z_22[rs:, rs] = col_vec
+                    if rs + 1 < u:
+                        Z_22[rs, rs + 1 :] = col_vec[1:]
+                elif re == rs + 1:
+                    c0 = int(col_to_off[upd_rows[rs]])
+                    col_vec = t_Z[:, c0] if exact_match else t_Z[r_pos, c0]
+                    Z_22[rs:, rs] = col_vec
+                    if rs + 1 < u:
+                        Z_22[rs, rs + 1 :] = col_vec[1:]
                 else:
-                    r_pos = searchsorted(t_rows, query)
-                    sub = t_Z[r_pos][:, t_cols]
-                Z_22[rs:, rs:re] = sub
-                if re < u:
-                    Z_22[rs:re, re:] = sub[re - rs :, :].T
+                    t_cols = col_to_off[upd_rows[rs:re]]
+                    c0 = int(t_cols[0])
+                    c1 = int(t_cols[-1]) + 1
+                    if c1 - c0 == re - rs:
+                        sub = t_Z[:, c0:c1] if exact_match else t_Z[r_pos, c0:c1]
+                    else:
+                        sub = t_Z[:, t_cols] if exact_match else t_Z[r_pos[:, None], t_cols]
+                    Z_22[rs:, rs:re] = sub
+                    if re < u:
+                        Z_22[rs:re, re:] = sub[re - rs :, :].T
                 rs = re
             Z_21 = -(Z_22 @ L21_eff)
             Z_11 = (L11_inv.T * d_inv[a:b]) @ L11_inv - L21_eff.T @ Z_21
             Z_blk[:w, :] = Z_11
             Z_blk[w:, :] = Z_21
         else:
-            Z_blk[:w, :] = (L11_inv.T * d_inv[a:b]) @ L11_inv
-        z_blocks[sid] = Z_blk
-
-    zdata = np.empty_like(ldata)
-    for sid in range(n_sn):
-        a = sn_starts[sid]
-        b = sn_starts[sid + 1]
-        Z_blk = z_blocks[sid]
-        for col_off in range(b - a):
-            cs = int(indptr[a + col_off])
-            ce = int(indptr[a + col_off + 1])
+            Z_11 = (L11_inv.T * d_inv[a:b]) @ L11_inv
+            Z_blk[:w, :] = Z_11
+        z_diag[a:b] = Z_11.diagonal()
+        for col_off in range(w):
+            cs = indptr_list[a + col_off]
+            ce = indptr_list[a + col_off + 1]
             zdata[cs:ce] = Z_blk[col_off:, col_off]
+        z_blocks[sid] = Z_blk
 
     Z_low = SP_CSC_MATRIX((zdata, indices, indptr), shape=(n, n), copy=False)
     Z_low.has_sorted_indices = True
     return Z_low, factor.P()
 
 
-def _measurement_leverage_from_selected_inv(H, Z_low, P) -> Optional[np.ndarray]:
-    """Compute exact diag(H G^-1 H^T) using lower-triangular selected inverse Z_low on permutation P."""
+def _measurement_leverage_from_selected_inv(H, Z_low, P, *, cholmod_factor=None) -> Optional[np.ndarray]:
+    """基于下三角选择逆 Z_low 计算精确 diag(H G^-1 H^T)；极少数数值抵消缺失项用 CHOLMOD 回代补齐。"""
     H_csr = H.tocsr() if getattr(H, "format", None) != "csr" else H
     inv_P = np.empty(P.size, dtype=np.int32)
     inv_P[P] = np.arange(P.size, dtype=np.int32)
     hp_indices = inv_P[H_csr.indices]
-    # Copy data/indptr so sort_indices() never mutates caller's H in place.
+    # 复制 data/indptr 以避免 sort_indices() 原地改动调用方的 H
     H_p = SP_CSR_MATRIX(
         (H_csr.data.copy(), hp_indices, H_csr.indptr.copy()),
         shape=H_csr.shape,
@@ -1754,7 +1833,8 @@ def _measurement_leverage_from_selected_inv(H, Z_low, P) -> Optional[np.ndarray]
     pair_ca_list = []
     pair_cb_list = []
     pair_prod_list = []
-    for k in range(1, min(max_nnz + 1, 16)):
+    pair_limit = 64
+    for k in range(1, min(max_nnz + 1, pair_limit)):
         r_idx = np.flatnonzero(row_nnz == k)
         if r_idx.size == 0:
             continue
@@ -1775,16 +1855,55 @@ def _measurement_leverage_from_selected_inv(H, Z_low, P) -> Optional[np.ndarray]
         p_ca = np.concatenate(pair_ca_list)
         p_cb = np.concatenate(pair_cb_list)
         p_prod = np.concatenate(pair_prod_list)
-        n = Z_low.shape[0]
-        z_cols = np.repeat(np.arange(n, dtype=np.int64), np.diff(Z_low.indptr))
-        z_keys = (z_cols << 32) | Z_low.indices.astype(np.int64)
-        q_keys = (p_ca.astype(np.int64) << 32) | p_cb.astype(np.int64)
-        q_pos = np.searchsorted(z_keys, q_keys)
-        if np.any(q_pos >= z_keys.size) or not np.array_equal(z_keys[q_pos], q_keys):
-            return None
-        np.add.at(lev, p_r, p_prod * Z_low.data[q_pos])
+        # 跳过由固定稀疏模式显式零元产生的零乘积对，避免误报缺失
+        nz_mask = p_prod != 0.0
+        if not np.all(nz_mask):
+            p_r = p_r[nz_mask]
+            p_ca = p_ca[nz_mask]
+            p_cb = p_cb[nz_mask]
+            p_prod = p_prod[nz_mask]
+        if p_r.size:
+            n = Z_low.shape[0]
+            z_cols = np.repeat(np.arange(n, dtype=np.int64), np.diff(Z_low.indptr))
+            z_keys = (z_cols << 32) | Z_low.indices.astype(np.int64)
+            q_keys = (p_ca.astype(np.int64) << 32) | p_cb.astype(np.int64)
+            q_pos = z_keys.searchsorted(q_keys)
+            hit = q_pos < z_keys.size
+            if np.any(hit):
+                hit_idx = np.flatnonzero(hit)
+                hit[hit_idx] = z_keys[q_pos[hit_idx]] == q_keys[hit_idx]
+            if np.all(hit):
+                lev += np.bincount(p_r, weights=p_prod * Z_low.data[q_pos], minlength=lev.size)
+            else:
+                # 极少数位置因 Cholesky 消元数值精确抵消为 0 被 L_D() 剔除；
+                # 直接用已有 CHOLMOD 因子对缺失唯一列做多右端稀疏回代精确补齐，避免退化为稠密求逆。
+                if cholmod_factor is None:
+                    return None
+                miss_mask = ~hit
+                miss_ca = p_ca[miss_mask]
+                miss_cb = p_cb[miss_mask]
+                uniq_ca, inv_ca = np.unique(miss_ca, return_inverse=True)
+                if uniq_ca.size > 64:
+                    return None
+                if np.any(hit):
+                    lev += np.bincount(
+                        p_r[hit],
+                        weights=p_prod[hit] * Z_low.data[q_pos[hit]],
+                        minlength=lev.size,
+                    )
+                rhs = np.zeros((n, uniq_ca.size), dtype=np.float64)
+                rhs[P[uniq_ca], np.arange(uniq_ca.size)] = 1.0
+                cols_inv = np.asarray(cholmod_factor(rhs), dtype=np.float64)
+                if cols_inv.ndim == 1:
+                    cols_inv = cols_inv[:, None]
+                z_miss = cols_inv[P[miss_cb], inv_ca]
+                lev += np.bincount(
+                    p_r[miss_mask],
+                    weights=p_prod[miss_mask] * z_miss,
+                    minlength=lev.size,
+                )
 
-    big_rows = np.flatnonzero(row_nnz >= 16)
+    big_rows = np.flatnonzero(row_nnz >= pair_limit)
     if big_rows.size:
         Z_sym = (Z_low + SP_TRIL(Z_low, k=-1).T).tocsr()
         H_big = H_p[big_rows]
@@ -1860,11 +1979,15 @@ def measurement_leverage_for_bad_data(
                 factor = CHOLMOD_CHOLESKY(gain_csc)
             Z_low, P = _supernodal_selected_inverse_from_cholmod(factor)
             if Z_low is not None and P is not None:
-                leverage = _measurement_leverage_from_selected_inv(H, Z_low, P)
+                leverage = _measurement_leverage_from_selected_inv(
+                    H, Z_low, P, cholmod_factor=factor
+                )
                 if leverage is not None and np.all(np.isfinite(leverage)):
                     return leverage
         except Exception:
             pass
+    if gain is None:
+        return None
     gain_inv = inverse_gain_for_bad_data(gain, dense_state_limit=dense_state_limit)
     if gain_inv is None:
         return None

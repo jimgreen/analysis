@@ -103,6 +103,15 @@ class EFileTableRows:
                 .astype(np.float64)
             )
 
+    def flat_str_column(self, col):
+        """当底层为批量扁平 token 视图时，直接返回非空字符串列 list，避免对象数组拷贝。"""
+        n = len(self.rows)
+        if col is None or n == 0:
+            return None
+        if hasattr(self.rows, "column_tokens"):
+            return self.rows.column_tokens(int(col))
+        return None
+
     def raw_column(self, col, default="") -> np.ndarray:
         n = len(self.rows)
         if col is None or n == 0:
@@ -139,12 +148,17 @@ class EFileTableRows:
 
 
 class LazyNameArray:
-    """Sequence-compatible object name array that materializes on first use."""
+    """按需物化的序列兼容名称数组，支持扁平字符串列零拷贝快速路径。"""
 
-    __slots__ = ("_raw_names", "_idx_values", "_prefix", "_array")
+    __slots__ = ("_raw_names", "_raw_list", "_idx_values", "_prefix", "_array")
 
-    def __init__(self, raw_names, idx_values: np.ndarray, prefix: str):
-        self._raw_names = None if raw_names is None else np.asarray(raw_names, dtype=object).copy()
+    def __init__(self, raw_names, idx_values: np.ndarray, prefix: str, *, verified_str_list: bool = False):
+        if verified_str_list and isinstance(raw_names, list):
+            self._raw_list = raw_names
+            self._raw_names = None
+        else:
+            self._raw_list = None
+            self._raw_names = None if raw_names is None else np.asarray(raw_names, dtype=object).copy()
         self._idx_values = np.asarray(idx_values)
         self._prefix = str(prefix)
         self._array = None
@@ -155,16 +169,20 @@ class LazyNameArray:
     def _materialize(self) -> np.ndarray:
         if self._array is not None:
             return self._array
-        if self._raw_names is None:
-            names = np.asarray([f"{self._prefix}_{int(idx)}" for idx in self._idx_values], dtype=object)
+        if self._raw_list is not None:
+            names = np.asarray(self._raw_list, dtype=object)
+        elif self._raw_names is None:
+            names = np.asarray([f"{self._prefix}_{int(idx)}" for idx in self._idx_values.tolist()], dtype=object)
         else:
             raw = self._raw_names
-            names = raw.astype(str).astype(object, copy=False)
-            missing = (raw == "") | (raw == None)
-            if np.any(missing):
-                fallback = np.asarray([f"{self._prefix}_{int(idx)}" for idx in self._idx_values], dtype=object)
-                names = names.copy()
-                names[missing] = fallback[missing]
+            prefix = self._prefix
+            names = np.asarray(
+                [
+                    str(v) if v not in (None, "") else f"{prefix}_{int(idx)}"
+                    for v, idx in zip(raw.tolist(), self._idx_values.tolist())
+                ],
+                dtype=object,
+            )
         self._array = names
         return names
 
@@ -172,6 +190,8 @@ class LazyNameArray:
         return self._materialize()[item]
 
     def __iter__(self):
+        if self._raw_list is not None and self._array is None:
+            return iter(self._raw_list)
         return iter(self._materialize())
 
     def __array__(self, dtype=None, copy=None):
@@ -192,6 +212,8 @@ class LazyNameArray:
         return self._materialize().astype(dtype, copy=copy)
 
     def tolist(self):
+        if self._raw_list is not None and self._array is None:
+            return list(self._raw_list)
         return self._materialize().tolist()
 
 
@@ -293,6 +315,10 @@ def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -
         if hasattr(table_rows, "raw_column"):
             return LazyNameArray(None, idx_values, prefix)
         return np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
+    if hasattr(table_rows, "flat_str_column"):
+        flat_names = table_rows.flat_str_column(name_col)
+        if flat_names is not None:
+            return LazyNameArray(flat_names, idx_values, prefix, verified_str_list=True)
     if hasattr(table_rows, "raw_column"):
         raw = table_rows.raw_column(name_col, "")
         return LazyNameArray(raw, idx_values, prefix)
@@ -365,7 +391,62 @@ def _current_scale_by_node(node_ids, voltage_bases, power_base_kW, i_scale, *, a
     return dict(zip(map(int, np.asarray(node_ids).tolist()), current.tolist()))
 
 
-def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
+class _DenseNodeFloatLookup:
+    """稠密节点 ID 到浮点值的向量化查表结构，兼容器字典 .get() 接口。"""
+
+    __slots__ = ("_values", "_present", "_default")
+
+    def __init__(self, values: np.ndarray, present: np.ndarray, default: float = 0.0):
+        self._values = values
+        self._present = present
+        self._default = float(default)
+
+    def get(self, node_id, default=None):
+        fallback = self._default if default is None else default
+        idx = int(node_id)
+        if 0 <= idx < self._values.size and self._present[idx]:
+            return float(self._values[idx])
+        return fallback
+
+    def lookup_array(self, node_values: np.ndarray, default: float = 0.0) -> np.ndarray:
+        nodes = np.asarray(node_values, dtype=np.int64)
+        n = int(nodes.size)
+        if n == 0:
+            return np.empty(0, dtype=np.float64)
+        out = np.full(n, float(default), dtype=np.float64)
+        in_range = (nodes >= 0) & (nodes < self._values.size)
+        if np.any(in_range):
+            valid_nodes = nodes[in_range]
+            present = self._present[valid_nodes]
+            if np.all(present):
+                out[in_range] = self._values[valid_nodes]
+            elif np.any(present):
+                hit_pos = np.flatnonzero(in_range)[present]
+                out[hit_pos] = self._values[valid_nodes[present]]
+        return out
+
+
+def _build_node_float_lookup(node_ids: np.ndarray, values: np.ndarray, default: float = 0.0):
+    """构建节点 ID 到浮点基准值的快速查找表（保留重复 ID 后行覆盖语义）。"""
+    ids = np.asarray(node_ids, dtype=np.int64).reshape(-1)
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    n = int(ids.size)
+    if n == 0:
+        return _DenseNodeFloatLookup(np.empty(0, dtype=np.float64), np.empty(0, dtype=bool), default)
+    min_id = int(ids.min())
+    max_id = int(ids.max())
+    if min_id >= 0 and max_id <= max(4 * n, 65536):
+        dense = np.full(max_id + 1, float(default), dtype=np.float64)
+        present = np.zeros(max_id + 1, dtype=bool)
+        dense[ids] = vals
+        present[ids] = True
+        return _DenseNodeFloatLookup(dense, present, default)
+    return dict(zip(ids.tolist(), vals.tolist()))
+
+
+def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx) -> np.ndarray:
+    if isinstance(raw_vbase_by_idx, _DenseNodeFloatLookup):
+        return raw_vbase_by_idx.lookup_array(node_values, 0.0)
     nodes = np.asarray(node_values, dtype=np.int64)
     n = int(nodes.size)
     if n == 0:

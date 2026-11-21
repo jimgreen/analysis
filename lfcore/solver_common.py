@@ -137,10 +137,13 @@ def get_pyklu_cls():
     return klu_cls
 
 
-def factor_jacobian(matrix, resolved_name, solver_fn):
-    """Build a factored solver object that supports .solve(b)."""
+def factor_jacobian(matrix, resolved_name, solver_fn, *, permc_spec=None):
+    """构建支持 `.solve(b)` 的稀疏矩阵分解器。"""
     if resolved_name in {"scipy", "superlu", "default"}:
-        return splu(as_solver_csc(matrix))
+        csc = as_solver_csc(matrix)
+        if permc_spec is not None:
+            return splu(csc, permc_spec=permc_spec)
+        return splu(csc)
     if resolved_name in {"pyklu", "auto"}:
         klu_cls = get_pyklu_cls()
         if klu_cls is not None:
@@ -149,12 +152,10 @@ def factor_jacobian(matrix, resolved_name, solver_fn):
 
 
 class AdaptiveNewtonFactor:
-    """Safe adaptive Shamanskii LU-factor reuse for Newton-Raphson power-flow loops.
+    """牛顿-拉夫逊潮流循环的安全自适应 Shamanskii LU 因子复用器。
 
-    Reuses the cached LU factor for cheap back-solves once the residual is small
-    and contracting rapidly, and automatically invalidates/re-factorizes when
-    contraction slows, a reuse limit is reached, or a reused step fails to reduce
-    the residual norm.
+    当残差较小且保持快速单调收缩时，复用已缓存的 LU 因子执行低开销回代；
+    当收缩变慢、达到最大复用次数，或复用步未能降低残差范数时，自动回滚并重新分解。
     """
 
     __slots__ = (
@@ -167,6 +168,8 @@ class AdaptiveNewtonFactor:
         "_reuse_threshold",
         "_contract_ratio",
         "_max_reuses",
+        "_fast_tail_max_reuses",
+        "_fast_tail_ratio",
         "_min_size",
     )
 
@@ -176,6 +179,8 @@ class AdaptiveNewtonFactor:
         reuse_threshold: float = 0.10,
         contract_ratio: float = 0.50,
         max_reuses: int = 6,
+        fast_tail_max_reuses: int = 10,
+        fast_tail_ratio: float = 0.25,
         min_size: int = 128,
     ) -> None:
         self._factor = None
@@ -187,6 +192,8 @@ class AdaptiveNewtonFactor:
         self._reuse_threshold = float(reuse_threshold)
         self._contract_ratio = float(contract_ratio)
         self._max_reuses = int(max_reuses)
+        self._fast_tail_max_reuses = max(int(max_reuses), int(fast_tail_max_reuses))
+        self._fast_tail_ratio = float(fast_tail_ratio)
         self._min_size = int(min_size)
 
     def reset(self) -> None:
@@ -208,13 +215,14 @@ class AdaptiveNewtonFactor:
     def can_reuse(self, norm_f: float, n_vars: int) -> bool:
         if self._factor is None or n_vars < self._min_size:
             return False
-        if self._reuses >= self._max_reuses:
+        if not np.isfinite(norm_f) or norm_f >= self._reuse_threshold:
             return False
-        return (
-            np.isfinite(norm_f)
-            and norm_f < self._reuse_threshold
-            and norm_f < self._contract_ratio * self._prev_norm
-        )
+        if self._reuses < self._max_reuses:
+            return norm_f < self._contract_ratio * self._prev_norm
+        # 达到常规上限后，仅在尾部保持高速收缩时继续复用，避免在临近收敛时重做整次 LU 分解
+        if self._reuses < self._fast_tail_max_reuses:
+            return norm_f < self._fast_tail_ratio * self._prev_norm
+        return False
 
     def solve_reused(self, rhs: np.ndarray, x_current: np.ndarray, norm_f: float) -> np.ndarray:
         self._x_before_reuse = x_current.copy()
