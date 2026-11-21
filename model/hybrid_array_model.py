@@ -613,6 +613,7 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
         "acac_cols": ACAC_COLS,
     }
     sanitize_dcac_voltage_setpoints(ppc)
+    ppc["_setpoints_preverified"] = True
     ppc["_effective_run_state_overrides"] = overrides
     ac_ppc["_effective_run_state_overrides"] = overrides
     dc_ppc["_effective_run_state_overrides"] = overrides

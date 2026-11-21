@@ -957,6 +957,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "acac_name": acac_names,
     }
     sanitize_ac_voltage_setpoints(ppc)
+    ppc["_setpoints_preverified"] = True
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
@@ -1730,6 +1731,7 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
     }
     sanitize_ac_voltage_setpoints(ppc)
+    ppc["_setpoints_preverified"] = True
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
@@ -2017,6 +2019,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         acac_name=_name_array(acac_converters, "acac"),
     )
     sanitize_ac_voltage_setpoints(ppc)
+    ppc["_setpoints_preverified"] = True
     ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 

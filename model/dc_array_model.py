@@ -535,6 +535,7 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "dcdc_name": dcdc_names,
     }
     sanitize_dc_voltage_setpoints(ppc)
+    ppc["_setpoints_preverified"] = True
     ppc["_topology_input"] = build_dc_topology_input_ppc(ppc)
     return ppc
 
@@ -822,6 +823,7 @@ def build_dc_ppc_from_network(network) -> Dict:
         dcdc_name=_name_array(dcdcs, "dcdc"),
     )
     sanitize_dc_voltage_setpoints(ppc)
+    ppc["_setpoints_preverified"] = True
     ppc["_topology_input"] = build_dc_topology_input_ppc(ppc)
     return ppc
 

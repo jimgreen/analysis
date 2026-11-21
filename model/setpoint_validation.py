@@ -99,6 +99,9 @@ def append_setpoint_corrections(target: dict, corrections) -> None:
     if not corrections:
         return
     existing = target.setdefault("_setpoint_corrections", [])
+    if not existing:
+        existing.extend(corrections)
+        return
     known = {
         (
             item.get("device_type"),

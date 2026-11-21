@@ -84,7 +84,9 @@ try:
         LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
+        build_group_share_metadata as _build_group_share_metadata,
         build_result_voltage_lookup,
+        build_zero_branch_components_fast,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
@@ -100,7 +102,9 @@ except ImportError:  # pragma: no cover - direct script import path
         LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
+        build_group_share_metadata as _build_group_share_metadata,
         build_result_voltage_lookup,
+        build_zero_branch_components_fast,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
@@ -174,42 +178,6 @@ def _build_csr_pattern_from_raw_coords(raw_rows, raw_cols, n_rows: int):
     a precomputed copy/reduce plan.
     """
     return build_compressed_pattern_from_raw_coords(raw_rows, raw_cols, n_rows)
-
-
-def _build_group_share_metadata(positions, setpoints, active_mask):
-    """Build one voltage equation plus equal-sharing equations per solver bus."""
-    positions = np.asarray(positions, dtype=np.int32)
-    setpoints = np.asarray(setpoints, dtype=np.float64)
-    active_mask = np.asarray(active_mask, dtype=bool)
-    n = positions.size
-    avg_set = setpoints.copy()
-    rep_mask = np.zeros(n, dtype=bool)
-    share_mask = np.zeros(n, dtype=bool)
-    ref_idx = np.arange(n, dtype=np.int32)
-    if n == 0 or not np.any(active_mask):
-        return avg_set, rep_mask, share_mask, ref_idx
-
-    active_idx = np.flatnonzero(active_mask).astype(np.int32, copy=False)
-    pos_active = positions[active_idx]
-    order = np.argsort(pos_active, kind="stable")
-    sorted_idx = active_idx[order]
-    sorted_pos = pos_active[order]
-    start = 0
-    while start < sorted_idx.size:
-        stop = start + 1
-        bus_pos = sorted_pos[start]
-        while stop < sorted_idx.size and sorted_pos[stop] == bus_pos:
-            stop += 1
-        members = sorted_idx[start:stop]
-        ref = int(members[0])
-        avg = float(np.mean(setpoints[members]))
-        avg_set[members] = avg
-        rep_mask[ref] = True
-        if members.size > 1:
-            share_mask[members[1:]] = True
-        ref_idx[members] = ref
-        start = stop
-    return avg_set, rep_mask, share_mask, ref_idx
 
 
 class _PPCNode:
@@ -996,7 +964,8 @@ class ACPowerFlowCalc:
                 self._ppc_node_row_by_id = {int(node_id): pos for pos, node_id in enumerate(bus_ids)}
         if not (ppc.pop("_topology_preverified", False) and ppc.get("_topology_arrays") is not None):
             ensure_ac_ppc_topology(ppc)
-        sanitize_ac_voltage_setpoints(ppc)
+        if not ppc.pop("_setpoints_preverified", False):
+            sanitize_ac_voltage_setpoints(ppc)
         topology = ppc["_topology_arrays"]
         self._ppc_topology = topology
         active_node = np.asarray(topology.node_alive_mask, dtype=bool)
@@ -1053,8 +1022,15 @@ class ACPowerFlowCalc:
         self._prepare_ppc_devices(branch, transformer, gen, load, shunt, zero_branch, switch, active_node)
         self._prepare_ppc_y_matrix(branch, transformer, three_winding_transformer, shunt)
         self._prepare_ppc_zero_edges(zero_branch, switch, active_node, breaker)
-        self._finalize_prepared_arrays()
+        has_acac_rows = bool(acac is not None and acac.size > 0)
+        self._finalize_prepared_arrays(defer_full_pattern=has_acac_rows)
         self._prepare_acac_converters(acac)
+        if has_acac_rows and self.N_acac == 0:
+            # 若 ACAC 表非空但无有效在运设备，补齐标准/全量雅可比稀疏模式
+            if self.N_phi > 0:
+                self._cache_full_jacobian_pattern()
+            elif not getattr(self, "_defer_csc_pattern", False):
+                self._ensure_standard_csc_pattern()
         if self.verbose:
             print(f"预处理完成：节点数 {self.N}, 变量数 {self.total_vars}, 方程数 {self.total_eq}")
 
@@ -1422,44 +1398,79 @@ class ACPowerFlowCalc:
         self.Y.sum_duplicates()
 
     def _prepare_ppc_zero_edges(self, zero_branch, switch, active_bus, breaker=None):
-        self.zero_edges = []
-        if zero_branch.size:
-            i_rows = self._ppc_node_rows(zero_branch[:, ZERO_BRANCH_COLS["i_node"]])
-            j_rows = self._ppc_node_rows(zero_branch[:, ZERO_BRANCH_COLS["j_node"]])
-            live = (zero_branch[:, ZERO_BRANCH_COLS["run_stat"]] == 1) & active_bus[i_rows] & active_bus[j_rows]
-            for row_idx in np.where(live)[0]:
-                a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
-                if a != b and not self._is_redundant_slack_zero_edge(a, b):
-                    self.zero_edges.append((int(row_idx), 0, a, b))
-        if breaker is not None and breaker.size:
-            i_rows = self._ppc_node_rows(breaker[:, SWITCH_COLS["i_node"]])
-            j_rows = self._ppc_node_rows(breaker[:, SWITCH_COLS["j_node"]])
-            live = (
-                (breaker[:, SWITCH_COLS["run_stat"]] == 1)
-                & (breaker[:, SWITCH_COLS["closed_status"]] == 1)
-                & active_bus[i_rows]
-                & active_bus[j_rows]
+        idx_parts = []
+        type_parts = []
+        a_parts = []
+        b_parts = []
+
+        def collect_table(table, cols, type_code: int, require_closed: bool):
+            if table is None or not table.size:
+                return
+            i_rows = self._ppc_node_rows(table[:, cols["i_node"]])
+            j_rows = self._ppc_node_rows(table[:, cols["j_node"]])
+            live = (table[:, cols["run_stat"]] == 1) & (i_rows >= 0) & (j_rows >= 0)
+            if require_closed:
+                live &= table[:, cols["closed_status"]] == 1
+            if not np.any(live):
+                return
+            cand_rows = np.flatnonzero(live)
+            ci = i_rows[cand_rows]
+            cj = j_rows[cand_rows]
+            act = active_bus[ci] & active_bus[cj]
+            if not np.any(act):
+                return
+            cand_rows = cand_rows[act]
+            a_arr = self.row_to_pos[ci[act]].astype(np.int32, copy=False)
+            b_arr = self.row_to_pos[cj[act]].astype(np.int32, copy=False)
+            keep = a_arr != b_arr
+            if self.node_type.size and np.any(keep):
+                both_slack = (
+                    (self.node_type[a_arr] == AC_NODE_TYPE_SLACK)
+                    & (self.node_type[b_arr] == AC_NODE_TYPE_SLACK)
+                )
+                if np.any(both_slack):
+                    redundant = (
+                        both_slack
+                        & (np.abs(self.V_spec[a_arr] - self.V_spec[b_arr]) <= 1e-10)
+                        & (np.abs(self.theta_spec[a_arr] - self.theta_spec[b_arr]) <= 1e-10)
+                    )
+                    keep &= ~redundant
+            if np.any(keep):
+                idx_parts.append(cand_rows[keep].astype(np.int32, copy=False))
+                type_parts.append(np.full(int(np.count_nonzero(keep)), type_code, dtype=np.int32))
+                a_parts.append(a_arr[keep])
+                b_parts.append(b_arr[keep])
+
+        collect_table(zero_branch, ZERO_BRANCH_COLS, 0, False)
+        collect_table(breaker, SWITCH_COLS, 2, True)
+        collect_table(switch, SWITCH_COLS, 1, True)
+
+        if idx_parts:
+            self._zero_edge_idx_arr = idx_parts[0] if len(idx_parts) == 1 else np.concatenate(idx_parts)
+            self._zero_edge_type_arr = type_parts[0] if len(type_parts) == 1 else np.concatenate(type_parts)
+            self._zero_edge_a_arr = a_parts[0] if len(a_parts) == 1 else np.concatenate(a_parts)
+            self._zero_edge_b_arr = b_parts[0] if len(b_parts) == 1 else np.concatenate(b_parts)
+        else:
+            empty_i32 = np.empty(0, dtype=np.int32)
+            self._zero_edge_idx_arr = empty_i32
+            self._zero_edge_type_arr = empty_i32
+            self._zero_edge_a_arr = empty_i32
+            self._zero_edge_b_arr = empty_i32
+
+        if self.keep_node_objects and self._zero_edge_idx_arr.size:
+            self.zero_edges = list(
+                zip(
+                    self._zero_edge_idx_arr.tolist(),
+                    self._zero_edge_type_arr.tolist(),
+                    self._zero_edge_a_arr.tolist(),
+                    self._zero_edge_b_arr.tolist(),
+                )
             )
-            for row_idx in np.where(live)[0]:
-                a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
-                if a != b and not self._is_redundant_slack_zero_edge(a, b):
-                    self.zero_edges.append((int(row_idx), 2, a, b))
-        if switch.size:
-            i_rows = self._ppc_node_rows(switch[:, SWITCH_COLS["i_node"]])
-            j_rows = self._ppc_node_rows(switch[:, SWITCH_COLS["j_node"]])
-            live = (
-                (switch[:, SWITCH_COLS["run_stat"]] == 1)
-                & (switch[:, SWITCH_COLS["closed_status"]] == 1)
-                & active_bus[i_rows]
-                & active_bus[j_rows]
-            )
-            for row_idx in np.where(live)[0]:
-                a, b = int(self.row_to_pos[i_rows[row_idx]]), int(self.row_to_pos[j_rows[row_idx]])
-                if a != b and not self._is_redundant_slack_zero_edge(a, b):
-                    self.zero_edges.append((int(row_idx), 1, a, b))
+        else:
+            self.zero_edges = []
         self._prepare_zero_branch_components()
 
-    def _finalize_prepared_arrays(self):
+    def _finalize_prepared_arrays(self, *, defer_full_pattern: bool = False):
         """Finalize variable/equation indices after node specs, Y and zero edges are ready."""
         self.theta_unknown = np.where(self.node_type != AC_NODE_TYPE_SLACK)[0].astype(np.int32)
         self.V_unknown = np.where(self.node_type == AC_NODE_TYPE_PQ)[0].astype(np.int32)
@@ -1472,8 +1483,8 @@ class ACPowerFlowCalc:
         self.base_phi_re = self.n_theta + self.n_V
         self.base_phi_im = self.base_phi_re + self.N_phi
         self.total_vars = self.base_phi_im + self.N_phi
-        n_tree = sum(len(edges) for edges in self.comp_tree_edges)
-        n_phi_fix = 2 * len(self.comp_nodes)
+        n_tree = int(getattr(self, "_zero_tree_a", np.empty(0, dtype=np.int32)).size)
+        n_phi_fix = 2 * int(getattr(self, "_n_zero_comp", len(self.comp_nodes)))
         self.total_eq = self.n_theta + self.n_V + 2 * n_tree + n_phi_fix
         self.ac_core_vars = self.total_vars
         self.ac_core_eq = self.total_eq
@@ -1496,28 +1507,15 @@ class ACPowerFlowCalc:
         self._load_value_work = np.empty(self.load_pos.size, dtype=np.float64)
         self._load_aux_work = np.empty(self.load_pos.size, dtype=np.float64)
         self._residual_work = np.zeros(self.total_eq, dtype=np.float64)
-        # 残差里零阻抗树边按 comp_tree_edges 顺序展平成 (a, b) 数组。
-        if self.comp_tree_edges:
-            flat_edges = [
-                self.zero_edges[edge_idx]
-                for tree in self.comp_tree_edges
-                for edge_idx in tree
-            ]
-            self._zero_residual_a = np.asarray(
-                [edge[2] for edge in flat_edges], dtype=np.int32
-            )
-            self._zero_residual_b = np.asarray(
-                [edge[3] for edge in flat_edges], dtype=np.int32
-            )
-        else:
-            self._zero_residual_a = np.empty(0, dtype=np.int32)
-            self._zero_residual_b = np.empty(0, dtype=np.int32)
+        # 残差里零阻抗树边直接使用向量化构造的 (a, b) 数组。
+        self._zero_residual_a = getattr(self, "_zero_tree_a", np.empty(0, dtype=np.int32))
+        self._zero_residual_b = getattr(self, "_zero_tree_b", np.empty(0, dtype=np.int32))
         self._ref_phi_idx_arr = (
             np.asarray(self.ref_phi_idx, dtype=np.int32)
-            if self.ref_phi_idx
+            if len(self.ref_phi_idx)
             else np.empty(0, dtype=np.int32)
         )
-        self._cache_static_numeric_arrays()
+        self._cache_static_numeric_arrays(defer_full_pattern=defer_full_pattern)
         if self.total_vars != self.total_eq:
             warnings.warn(f"变量数({self.total_vars})与方程数({self.total_eq})不匹配！")
 
@@ -1596,43 +1594,77 @@ class ACPowerFlowCalc:
         if table is None or table.size == 0:
             return
 
-        rows = []
-        i_pos = []
-        j_pos = []
-        ctrl_code = []
-        for row_pos, row in enumerate(table):
-            if int(row[ACAC_COLS["run_stat"]]) != 1:
-                continue
-            i_row = int(self._ppc_node_rows(np.asarray([row[ACAC_COLS["i_node"]]]))[0])
-            j_row = int(self._ppc_node_rows(np.asarray([row[ACAC_COLS["j_node"]]]))[0])
-            if i_row < 0 or j_row < 0:
-                continue
-            i_solver_pos = int(self.row_to_pos[i_row])
-            j_solver_pos = int(self.row_to_pos[j_row])
-            if i_solver_pos < 0 or j_solver_pos < 0:
-                continue
-            idx = int(row[ACAC_COLS["idx"]])
-            if i_solver_pos == j_solver_pos:
-                raise ValueError(f"ACACConverter[{idx}] 两端不能连接同一个 AC 节点")
-            i_ctrl = ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["i_control_type"]]), "PQ")
-            j_ctrl = ACAC_SIDE_CONTROL_LABEL.get(int(row[ACAC_COLS["j_control_type"]]), "PQ")
-            if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
-                raise ValueError(f"未知 ACACConverter i_control_type: {i_ctrl}")
-            if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
-                raise ValueError(f"未知 ACACConverter j_control_type: {j_ctrl}")
-            self._validate_acac_terminal_control(idx, "i", i_solver_pos, i_ctrl)
-            self._validate_acac_terminal_control(idx, "j", j_solver_pos, j_ctrl)
-            rows.append(row_pos)
-            i_pos.append(i_solver_pos)
-            j_pos.append(j_solver_pos)
-            ctrl_code.append(acac_combined_control_code(i_ctrl, j_ctrl))
-
-        self.N_acac = len(rows)
-        if self.N_acac == 0:
+        run_rows = np.flatnonzero(table[:, ACAC_COLS["run_stat"]].astype(np.int64, copy=False) == 1)
+        if run_rows.size == 0:
             return
+        cand = table[run_rows]
+        i_rows = self._ppc_node_rows(cand[:, ACAC_COLS["i_node"]])
+        j_rows = self._ppc_node_rows(cand[:, ACAC_COLS["j_node"]])
+        valid_ij = (i_rows >= 0) & (j_rows >= 0)
+        if not np.any(valid_ij):
+            return
+        run_rows = run_rows[valid_ij]
+        cand = cand[valid_ij]
+        i_sol = self.row_to_pos[i_rows[valid_ij]].astype(np.int32, copy=False)
+        j_sol = self.row_to_pos[j_rows[valid_ij]].astype(np.int32, copy=False)
+        valid_sol = (i_sol >= 0) & (j_sol >= 0)
+        if not np.any(valid_sol):
+            return
+        run_rows = run_rows[valid_sol]
+        cand = cand[valid_sol]
+        i_sol = i_sol[valid_sol]
+        j_sol = j_sol[valid_sol]
 
-        self.acac_row_pos = np.asarray(rows, dtype=np.int32)
-        active = table[self.acac_row_pos]
+        same = i_sol == j_sol
+        if np.any(same):
+            bad_pos = int(np.flatnonzero(same)[0])
+            idx = int(cand[bad_pos, ACAC_COLS["idx"]])
+            raise ValueError(f"ACACConverter[{idx}] 两端不能连接同一个 AC 节点")
+
+        i_code = cand[:, ACAC_COLS["i_control_type"]].astype(np.int32, copy=False)
+        j_code = cand[:, ACAC_COLS["j_control_type"]].astype(np.int32, copy=False)
+        pq_code = int(ACAC_SIDE_CONTROL_CODE["PQ"])
+        pv_code = int(ACAC_SIDE_CONTROL_CODE["PV"])
+        standard_codes = (
+            ((i_code == pq_code) | (i_code == pv_code))
+            & ((j_code == pq_code) | (j_code == pv_code))
+        )
+        if bool(np.all(standard_codes)):
+            i_is_pv = i_code == pv_code
+            j_is_pv = j_code == pv_code
+            if np.any(i_is_pv):
+                bad_i = i_is_pv & (self.node_type[i_sol] != AC_NODE_TYPE_PQ)
+                if np.any(bad_i):
+                    p = int(np.flatnonzero(bad_i)[0])
+                    self._validate_acac_terminal_control(
+                        int(cand[p, ACAC_COLS["idx"]]), "i", int(i_sol[p]), "PV"
+                    )
+            if np.any(j_is_pv):
+                bad_j = j_is_pv & (self.node_type[j_sol] != AC_NODE_TYPE_PQ)
+                if np.any(bad_j):
+                    p = int(np.flatnonzero(bad_j)[0])
+                    self._validate_acac_terminal_control(
+                        int(cand[p, ACAC_COLS["idx"]]), "j", int(j_sol[p]), "PV"
+                    )
+            ctrl_arr = (i_is_pv.astype(np.int8) + 2 * j_is_pv.astype(np.int8)).astype(np.int8, copy=False)
+        else:
+            ctrl_list = []
+            for p in range(run_rows.size):
+                idx = int(cand[p, ACAC_COLS["idx"]])
+                i_ctrl = ACAC_SIDE_CONTROL_LABEL.get(int(i_code[p]), "PQ")
+                j_ctrl = ACAC_SIDE_CONTROL_LABEL.get(int(j_code[p]), "PQ")
+                if i_ctrl not in ACAC_SIDE_CONTROL_TYPES:
+                    raise ValueError(f"未知 ACACConverter i_control_type: {i_ctrl}")
+                if j_ctrl not in ACAC_SIDE_CONTROL_TYPES:
+                    raise ValueError(f"未知 ACACConverter j_control_type: {j_ctrl}")
+                self._validate_acac_terminal_control(idx, "i", int(i_sol[p]), i_ctrl)
+                self._validate_acac_terminal_control(idx, "j", int(j_sol[p]), j_ctrl)
+                ctrl_list.append(acac_combined_control_code(i_ctrl, j_ctrl))
+            ctrl_arr = np.asarray(ctrl_list, dtype=np.int8)
+
+        self.N_acac = int(run_rows.size)
+        self.acac_row_pos = run_rows.astype(np.int32, copy=False)
+        active = cand
         self.acac_idx = active[:, ACAC_COLS["idx"]].astype(np.int32, copy=True)
         names = np.asarray(self.ppc.get("acac_name", ()), dtype=object)
         self.acac_names = (
@@ -1640,9 +1672,9 @@ class ACPowerFlowCalc:
             if names.size == table.shape[0]
             else np.asarray([str(idx) for idx in self.acac_idx], dtype=object)
         )
-        self.acac_i_pos = np.asarray(i_pos, dtype=np.int32)
-        self.acac_j_pos = np.asarray(j_pos, dtype=np.int32)
-        self.acac_ctrl_code = np.asarray(ctrl_code, dtype=np.int8)
+        self.acac_i_pos = i_sol
+        self.acac_j_pos = j_sol
+        self.acac_ctrl_code = ctrl_arr
         self.acac_r1 = active[:, ACAC_COLS["r1"]].astype(np.float64, copy=True)
         self.acac_r2 = active[:, ACAC_COLS["r2"]].astype(np.float64, copy=True)
         self.acac_p_set = active[:, ACAC_COLS["p_set"]].astype(np.float64, copy=True)
@@ -1779,7 +1811,7 @@ class ACPowerFlowCalc:
         self.acac_ctrl_cols = np.concatenate(ctrl_cols).astype(np.int32, copy=False)
         self.acac_ctrl_data = np.concatenate(ctrl_data).astype(np.float64, copy=False)
 
-    def _cache_static_numeric_arrays(self):
+    def _cache_static_numeric_arrays(self, *, defer_full_pattern: bool = False):
         """Cache numeric arrays used by Newton iterations without object-model access."""
         self._cache_node_type_masks()
         # 预填已知节点的相角和电压幅值设定，迭代时无需重复清零与回填
@@ -1856,14 +1888,30 @@ class ACPowerFlowCalc:
         self.Y_jac_diag_nodes = self.Y_jac_rows[self.Y_jac_diag_idx]
         self.Y_jac_diag_g = self.Y_jac_diag[self.Y_jac_diag_nodes].real
         self.Y_jac_diag_b = self.Y_jac_diag[self.Y_jac_diag_nodes].imag
-        self._cache_standard_jacobian_pattern()
+        self._cache_standard_jacobian_pattern(build_csc=not defer_full_pattern)
         self._cache_zero_jacobian_pattern()
-        self._cache_full_jacobian_pattern()
+        if defer_full_pattern:
+            self._full_jac_raw_rows = np.array([], dtype=np.int32)
+            self._full_jac_raw_cols = np.array([], dtype=np.int32)
+            self.full_jac_raw_data = np.array([], dtype=np.float64)
+            self.full_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+            self.full_jac_csc_indices = np.array([], dtype=np.int32)
+            self.full_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
+            self.full_jac_csc_data = np.array([], dtype=np.float64)
+            self._full_jac_csc_matrix = None
+            self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, 0)
+            self.full_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
+            self.full_jac_csr_indices = np.array([], dtype=np.int32)
+            self.full_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
+            self.full_jac_csr_data = np.array([], dtype=np.float64)
+            self.full_jac_csr_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csr_pos, 0)
+        else:
+            self._cache_full_jacobian_pattern()
         self.Y_diag = np.array([], dtype=np.complex128)
         self.Y_offdiag_indices = []
         self.Y_offdiag_data = []
 
-    def _cache_standard_jacobian_pattern(self):
+    def _cache_standard_jacobian_pattern(self, *, build_csc: bool = True):
         """Cache fixed COO coordinates for the standard P/Q Jacobian."""
         self.standard_jac_rows = np.array([], dtype=np.int32)
         self.standard_jac_cols = np.array([], dtype=np.int32)
@@ -1957,8 +2005,13 @@ class ACPowerFlowCalc:
             self.standard_jac_data[self.std_jac_load_q_slice] = 0.0
         if cursor:
             n_dim = self.n_theta + self.n_V
-            cache_standard_csc = self.N_phi == 0
-            # CSR 模式统一懒构建：仅在外部调用 get_jacobi(x) 需要 CSR 时构建并缓存
+            cache_standard_csc = (
+                build_csc
+                and self.N_phi == 0
+                and self.N_acac == 0
+                and not getattr(self, "_defer_csc_pattern", False)
+            )
+            # CSR 模式统一懒构建；混合耦合模式下 CSC 模式亦按需懒构建
             if cache_standard_csc:
                 (
                     self.standard_jac_csc_indices,
@@ -1973,6 +2026,22 @@ class ACPowerFlowCalc:
             y_nnz = self.Y_jac_rows.size
             self._jac_w_work = np.empty(y_nnz, dtype=np.complex128)
             self._jac_tmp = np.empty(y_nnz, dtype=np.float64)
+
+    def _ensure_standard_csc_pattern(self):
+        """按需懒构建标准 P/Q 雅可比的 CSC 压缩模式并缓存。"""
+        if self.standard_jac_raw_to_csc_pos.size or not self.standard_jac_rows.size:
+            return
+        n_dim = self.n_theta + self.n_V
+        (
+            self.standard_jac_csc_indices,
+            self.standard_jac_csc_indptr,
+            self.standard_jac_raw_to_csc_pos,
+        ) = build_compressed_pattern_from_raw_coords(self.standard_jac_cols, self.standard_jac_rows, n_dim)
+        self.standard_jac_csc_data = np.empty(self.standard_jac_csc_indices.size, dtype=np.float64)
+        self.standard_jac_csc_sum_plan = build_raw_sum_plan(
+            self.standard_jac_raw_to_csc_pos,
+            self.standard_jac_csc_data.size,
+        )
 
     def _ensure_standard_csr_pattern(self):
         """按需懒构建标准 P/Q 雅可比的 CSR 压缩模式并缓存。"""
@@ -2118,10 +2187,9 @@ class ACPowerFlowCalc:
         self.zero_top_right_kind = (group[:, None] * 4 + np.arange(4)).reshape(-1).astype(np.int8)
         self.zero_top_right_data = np.empty(self.zero_top_right_rows.size, dtype=np.float64)
 
-        # Tree constraints retain the original component and edge ordering.
-        tree_edges = [self.zero_edges[idx][2:] for edges in self.comp_tree_edges for idx in edges]
-        terminals = np.asarray(tree_edges, dtype=np.int32).reshape(-1, 2)
-        a, b = terminals[:, 0], terminals[:, 1]
+        # 直接使用向量化构造的生成树端点数组
+        a = getattr(self, "_zero_tree_a", np.empty(0, dtype=np.int32))
+        b = getattr(self, "_zero_tree_b", np.empty(0, dtype=np.int32))
         ta, tb = self.theta_idx[a], self.theta_idx[b]
         va, vb = self.n_theta + self.V_idx[a], self.n_theta + self.V_idx[b]
         mask4 = np.column_stack((
@@ -2137,13 +2205,15 @@ class ACPowerFlowCalc:
         self.zero_bottom_left_data = np.empty(edge.size, dtype=np.float64)
 
         ref_phi = np.asarray(self.ref_phi_idx, dtype=np.int32)
-        self.zero_bottom_right_rows = 2 * len(tree_edges) + np.arange(2 * ref_phi.size, dtype=np.int32)
+        self.zero_bottom_right_rows = 2 * int(a.size) + np.arange(2 * ref_phi.size, dtype=np.int32)
         self.zero_bottom_right_cols = np.column_stack((ref_phi, self.N_phi + ref_phi)).reshape(-1)
         self.zero_bottom_right_data = np.ones(self.zero_bottom_right_rows.size, dtype=np.float64)
         self._cache_zero_jacobian_runtime_arrays()
 
     def _cache_full_jacobian_pattern(self):
         """Precompute the full AC Jacobian CSR pattern for standard and zero-branch blocks."""
+        self._full_jac_raw_rows = np.array([], dtype=np.int32)
+        self._full_jac_raw_cols = np.array([], dtype=np.int32)
         self.full_jac_raw_data = np.array([], dtype=np.float64)
         self.full_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self.full_jac_csr_indices = np.array([], dtype=np.int32)
@@ -2230,12 +2300,25 @@ class ACPowerFlowCalc:
         raw_cols = np.concatenate(cols_parts)
         self._full_jac_raw_rows = raw_rows
         self._full_jac_raw_cols = raw_cols
-        # 仅在 prepare 阶段构建 NR 求解所需的 CSC 模式；CSR 模式在 get_jacobi(x) 时懒构建
+        # 独立求解时预构建 CSC 模式；混合耦合模式（_defer_csc_pattern=True）直接向混合层输出 raw COO
+        if not getattr(self, "_defer_csc_pattern", False):
+            (
+                self.full_jac_csc_indices,
+                self.full_jac_csc_indptr,
+                self.full_jac_raw_to_csc_pos,
+            ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
+            self.full_jac_csc_data = np.empty(self.full_jac_csc_indices.size, dtype=np.float64)
+            self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, self.full_jac_csc_data.size)
+
+    def _ensure_full_csc_pattern(self):
+        """按需懒构建完整 AC 雅可比的 CSC 压缩模式并缓存。"""
+        if self.full_jac_raw_to_csc_pos.size or not self._full_jac_raw_rows.size:
+            return
         (
             self.full_jac_csc_indices,
             self.full_jac_csc_indptr,
             self.full_jac_raw_to_csc_pos,
-        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
+        ) = build_compressed_pattern_from_raw_coords(self._full_jac_raw_cols, self._full_jac_raw_rows, self.total_vars)
         self.full_jac_csc_data = np.empty(self.full_jac_csc_indices.size, dtype=np.float64)
         self.full_jac_csc_sum_plan = build_raw_sum_plan(self.full_jac_raw_to_csc_pos, self.full_jac_csc_data.size)
 
@@ -2254,7 +2337,7 @@ class ACPowerFlowCalc:
     # --------------------------------------------------------------------------
     # 预处理阶段（精简版）
     # --------------------------------------------------------------------------
-    def prepare(self):
+    def prepare(self) -> None:
         """预处理并确保拓扑/PPC 就绪。
 
         调用方无需先对 ACPowerNetwork 显式执行 `topo()`；prepare() 会基于
@@ -2263,88 +2346,71 @@ class ACPowerFlowCalc:
         self._prepare_from_ppc()
 
     def _prepare_zero_branch_components(self):
-        """根据 self.zero_edges 建立零阻抗连通块、生成树约束和 phi 变量映射。"""
-        if not self.zero_edges:
+        """基于稀疏连通分量分析与无环快路径建立零阻抗连通块、生成树约束和 phi 映射。"""
+        idx_arr = getattr(self, "_zero_edge_idx_arr", None)
+        if idx_arr is None or (len(self.zero_edges) > 0 and idx_arr.size != len(self.zero_edges)):
+            if self.zero_edges:
+                arr = np.asarray(self.zero_edges, dtype=np.int32)
+                idx_arr = arr[:, 0]
+                type_arr = arr[:, 1]
+                a_arr = arr[:, 2]
+                b_arr = arr[:, 3]
+            else:
+                empty_i32 = np.empty(0, dtype=np.int32)
+                idx_arr = type_arr = a_arr = b_arr = empty_i32
+            self._zero_edge_idx_arr = idx_arr
+            self._zero_edge_type_arr = type_arr
+            self._zero_edge_a_arr = a_arr
+            self._zero_edge_b_arr = b_arr
+        else:
+            type_arr = self._zero_edge_type_arr
+            a_arr = self._zero_edge_a_arr
+            b_arr = self._zero_edge_b_arr
+
+        if idx_arr.size == 0:
+            empty_i32 = np.empty(0, dtype=np.int32)
             self.comp_nodes = []
             self.comp_tree_edges = []
             self.phi_node = []
             self.phi_comp = []
             self.ref_phi_idx = []
             self.zero_branch_info = np.zeros((0, 6))
+            self._zero_tree_a = empty_i32
+            self._zero_tree_b = empty_i32
+            self._n_zero_comp = 0
             self.N_phi = 0
             return
 
-        # 只围绕零阻抗边端点做连通分量分析，避免在大系统里扫描全部普通节点。
-        edge_by_node: Dict[int, List[int]] = {}
-        for edge_idx, (_, _, a, b) in enumerate(self.zero_edges):
-            edge_by_node.setdefault(a, []).append(edge_idx)
-            edge_by_node.setdefault(b, []).append(edge_idx)
+        comp_res = build_zero_branch_components_fast(
+            a_arr,
+            b_arr,
+            build_lists=self.keep_node_objects,
+        )
+        self.comp_nodes = comp_res["comp_nodes"]
+        self.comp_tree_edges = comp_res["comp_tree_edges"]
+        self._n_zero_comp = int(comp_res["n_comp"])
+        self.N_phi = int(comp_res["phi_node"].size)
+        self.ref_phi_idx = comp_res["ref_phi_idx"]
+        tree_idx = comp_res["tree_edge_indices"]
+        self._zero_tree_a = a_arr[tree_idx] if tree_idx.size else np.empty(0, dtype=np.int32)
+        self._zero_tree_b = b_arr[tree_idx] if tree_idx.size else np.empty(0, dtype=np.int32)
+        if self.keep_node_objects:
+            self.phi_node = comp_res["phi_node"].tolist()
+            self.phi_comp = comp_res["phi_comp"].tolist()
+        else:
+            self.phi_node = comp_res["phi_node"]
+            self.phi_comp = comp_res["phi_comp"]
 
-        raw_components = []
-        visited_nodes = set()
-        visited_edges = set()
-        for start in edge_by_node:
-            if start in visited_nodes:
-                continue
-            q = deque([start])
-            visited_nodes.add(start)
-            nodes = []
-            edges_idx = []
-            while q:
-                u = q.popleft()
-                nodes.append(u)
-                for edge_idx in edge_by_node[u]:
-                    if edge_idx not in visited_edges:
-                        visited_edges.add(edge_idx)
-                        edges_idx.append(edge_idx)
-                    _, _, a, b = self.zero_edges[edge_idx]
-                    v = b if a == u else a
-                    if v not in visited_nodes:
-                        visited_nodes.add(v)
-                        q.append(v)
-            raw_components.append((nodes, edges_idx))
-
-        # 只对生成树边施加电压相等约束，环路边由 phi 电流变量承担。
-        self.comp_nodes = []
-        self.comp_tree_edges = []
-        for nodes, edges_idx in raw_components:
-            if len(nodes) <= 1 or not edges_idx:
-                continue
-            comp_local_idx = {node: idx for idx, node in enumerate(nodes)}
-            local_edges = []
-            orig_indices = []
-            for orig_idx in edges_idx:
-                _, _, a, b = self.zero_edges[orig_idx]
-                local_edges.append((comp_local_idx[a], comp_local_idx[b]))
-                orig_indices.append(orig_idx)
-            tree_local_idx = find_spanning_tree_edges(local_edges, len(nodes))
-            tree_edges = [orig_indices[i] for i in tree_local_idx]
-            if tree_edges:
-                self.comp_nodes.append(nodes)
-                self.comp_tree_edges.append(tree_edges)
-
-        # 构建phi变量映射（精简）
-        self.phi_node = []
-        self.phi_comp = []
-        phi_index_by_node = {}
-        for c, nodes in enumerate(self.comp_nodes):
-            for node in nodes:
-                phi_index_by_node[node] = len(self.phi_node)
-                self.phi_node.append(node)
-                self.phi_comp.append(c)
-        self.N_phi = len(self.phi_node)
-
-        # 参考phi索引（精简）
-        self.ref_phi_idx = [phi_index_by_node[nodes[0]] for nodes in self.comp_nodes]
-
-        # 零阻抗边phi映射（精简）
-        self.zero_branch_info = np.zeros((len(self.zero_edges), 6))
-
-        for idx, (index, type, a, b) in enumerate(self.zero_edges):
-            if a not in phi_index_by_node or b not in phi_index_by_node:
-                raise RuntimeError(f"节点{a}/{b}不在φ变量映射中")
-
-            self.zero_branch_info[idx] = [index, type, a, b, phi_index_by_node[a], phi_index_by_node[b]]
+        self.zero_branch_info = np.column_stack(
+            (
+                idx_arr,
+                type_arr,
+                a_arr,
+                b_arr,
+                comp_res["phi_a"],
+                comp_res["phi_b"],
+            )
+        ).astype(np.float64, copy=False)
 
     def _is_redundant_slack_zero_edge(self, a: int, b: int) -> bool:
         """Skip ideal ties between equal fixed-voltage slack nodes in Newton equations.
@@ -2608,8 +2674,11 @@ class ACPowerFlowCalc:
     def _get_standard_jacobi_direct(self, V: np.ndarray, Sbus=None, *, matrix_format="csr", build_matrix=True):
         """Build the standard P/Q Jacobian directly from Y nonzeros."""
         data = self._fill_standard_jacobian_data(V, Sbus=Sbus)
+        if matrix_format == "raw":
+            return data
         shape = (self.n_theta + self.n_V, self.n_theta + self.n_V)
         if matrix_format == "csc":
+            self._ensure_standard_csc_pattern()
             if self.standard_jac_raw_to_csc_pos.size:
                 apply_raw_sum_plan(self.standard_jac_csc_data, data, self.standard_jac_csc_sum_plan)
             if not build_matrix:
@@ -2868,7 +2937,11 @@ class ACPowerFlowCalc:
             raw[self.full_jac_zero_bottom_right_slice] = self.zero_bottom_right_data
         self._fill_acac_jacobian_data(raw, V)
 
+        if matrix_format == "raw":
+            return raw
+
         if matrix_format == "csc":
+            self._ensure_full_csc_pattern()
             apply_raw_sum_plan(self.full_jac_csc_data, raw, self.full_jac_csc_sum_plan)
             if not build_matrix:
                 return self.full_jac_csc_data

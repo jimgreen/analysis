@@ -305,8 +305,10 @@ def test_lf_init_attrs_failure_reason_summary_and_lazy_csr(tmp_path: Path, kind:
         "linear_solver",
         "result_mode",
         "verbose",
+        "ppc",
     ):
         assert hasattr(calc, attr), f"{cls.__name__} 初始化后缺少属性 {attr}"
+    assert isinstance(calc.ppc, dict)
     assert calc.lf_result is None
     assert calc.total_vars == 0 and calc.total_eq == 0
 
@@ -357,3 +359,73 @@ def test_lf_init_attrs_failure_reason_summary_and_lazy_csr(tmp_path: Path, kind:
     assert not calc_div.converged
     assert calc_div.iterations == 1
     assert "发散" in calc_div.failure_reason
+
+
+def test_build_group_share_metadata_and_zero_branch_components_fast():
+    """验证向量化分组共享元数据与含环/无环零阻抗连通分量算法的精确等价性。"""
+    from lfcore.common import build_group_share_metadata, build_zero_branch_components_fast
+
+    positions = np.array([5, 2, 5, 8, 2, 5, 9], dtype=np.int32)
+    setpoints = np.array([1.02, 1.00, 1.06, 0.99, 1.04, 1.01, 1.05], dtype=np.float64)
+    active_mask = np.array([True, True, True, False, True, True, True], dtype=bool)
+    avg_set, rep_mask, share_mask, ref_idx = build_group_share_metadata(positions, setpoints, active_mask)
+
+    assert np.isclose(avg_set[0], (1.02 + 1.06 + 1.01) / 3.0)
+    assert np.isclose(avg_set[2], avg_set[0]) and np.isclose(avg_set[5], avg_set[0])
+    assert np.isclose(avg_set[1], 1.02) and np.isclose(avg_set[4], 1.02)
+    assert np.isclose(avg_set[3], 0.99)
+    assert np.isclose(avg_set[6], 1.05)
+    assert rep_mask.tolist() == [True, True, False, False, False, False, True]
+    assert share_mask.tolist() == [False, False, True, False, True, True, False]
+    assert ref_idx.tolist() == [0, 1, 0, 3, 1, 0, 6]
+
+    # 含环连通分量（节点 0-1-2 构成三角形 + 节点 4-5 单边树分量）
+    edge_a = np.array([0, 1, 2, 4], dtype=np.int32)
+    edge_b = np.array([1, 2, 0, 5], dtype=np.int32)
+    res = build_zero_branch_components_fast(edge_a, edge_b, build_lists=True)
+    assert res["n_comp"] == 2
+    assert res["phi_node"].size == 5
+    # 三角形选 2 条生成树边 + 单边选 1 条 = 共 3 条树边
+    assert res["tree_edge_indices"].size == 3
+    assert len(res["comp_nodes"]) == 2
+    assert sum(len(edges) for edges in res["comp_tree_edges"]) == 3
+
+
+def test_hybrid_deferred_subsolver_csc_and_acac_zero_branch_convergence(tmp_path: Path):
+    """混合耦合模式跳过子求解器重复 CSC 构建时，求解结果、子求解器懒构建 get_jacobi 与含零阻抗/ACAC 网络均应正确。"""
+    ef = _gen_hybrid_e(16, 12, tmp_path)
+    # 追加 ACACConverter、ACZeroBranch 与 DCZeroBranch 以覆盖全部向量化预处理分支
+    extra = NL.join(
+        [
+            "<ACACConverter>",
+            "@ idx name i_node j_node r1 r2 i_control_type j_control_type p_set i_q_set j_q_set i_v_set j_v_set run_stat",
+            "# 1 acac_1 2 6 0.004 0.004 PQ PQ 0.1 0.02 -0.02 110.0 110.0 1",
+            "</ACACConverter>",
+            "<ACZeroBranch>",
+            "@ idx name i_node j_node run_stat",
+            "# 1 acz_1 7 8 1",
+            "</ACZeroBranch>",
+            "<DCZeroBranch>",
+            "@ idx name i_node j_node run_stat",
+            "# 1 dcz_1 5 6 1",
+            "</DCZeroBranch>",
+        ]
+    )
+    ef_ext = tmp_path / "hyb_ext.e"
+    ef_ext.write_text(ef.read_text(encoding="utf8") + NL + extra + NL, encoding="utf8")
+
+    calc = HybridPowerFlowCalc.from_file_fast(ef_ext, parameters=LF_PARAMS, result_mode="array", verbose=False)
+    calc.prepare()
+    # 验证混合耦合模式下子求解器确实跳过了冗余子块 CSC 构建
+    assert calc.ac_calc.full_jac_raw_to_csc_pos.size == 0
+    assert calc.dc_calc._dc_jac_raw_to_csc_pos.size == 0
+    assert calc.run() == 0 and calc.converged
+    assert calc.normF < LF_PARAMS.tol
+
+    # 外部显式调用子求解器 get_jacobi() 仍能按需懒构建并返回正确 CSR 矩阵
+    ac_x, dc_x, _ = calc._split_x(calc.x)
+    j_ac = calc.ac_calc.get_jacobi(ac_x)
+    j_dc = calc.dc_calc.get_jacobi(dc_x)
+    assert j_ac.format == "csr" and j_ac.shape == (calc.ac_eq, calc.ac_size)
+    assert j_dc.format == "csr" and j_dc.shape == (calc.dc_eq, calc.dc_size)
+

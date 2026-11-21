@@ -48,19 +48,29 @@ _HYBRID_DCAC_DC_REFERENCE_STATE_KEY = "_hybrid_dcac_dc_reference_state"
 
 
 def _update_signature_table(digest, ppc: Dict, key: str, columns) -> None:
-    table = np.asarray(ppc.get(key, ()), dtype=np.float64)
+    raw = ppc.get(key)
+    if raw is None:
+        digest.update(key.encode("ascii"))
+        digest.update(b"\x00")
+        return
+    table = raw if isinstance(raw, np.ndarray) and raw.dtype == np.float64 else np.asarray(raw, dtype=np.float64)
     digest.update(key.encode("ascii"))
-    digest.update(np.asarray(table.shape, dtype=np.int64).tobytes())
+    digest.update(np.asarray(table.shape, dtype=np.int64))
     if table.ndim == 2 and table.size:
         values = np.ascontiguousarray(table[:, columns])
-        digest.update(values.tobytes())
+        digest.update(values)
 
 
 def _update_signature_array(digest, ppc: Dict, key: str, dtype) -> None:
-    values = np.ascontiguousarray(np.asarray(ppc.get(key, ()), dtype=dtype))
+    raw = ppc.get(key)
+    if raw is None:
+        digest.update(key.encode("ascii"))
+        digest.update(b"\x00")
+        return
+    values = np.ascontiguousarray(raw if isinstance(raw, np.ndarray) and raw.dtype == dtype else np.asarray(raw, dtype=dtype))
     digest.update(key.encode("ascii"))
-    digest.update(np.asarray(values.shape, dtype=np.int64).tobytes())
-    digest.update(values.tobytes())
+    digest.update(np.asarray(values.shape, dtype=np.int64))
+    digest.update(values)
 
 
 def _ac_topology_signature(ppc: Dict) -> bytes:

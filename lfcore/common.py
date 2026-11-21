@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 
 @dataclass(slots=True)
@@ -529,3 +531,173 @@ def allocate_limited_residual(
             participating = np.flatnonzero(overflow_weights > 0.0)
             result[int(participating[-1])] += correction
     return result
+
+
+def build_group_share_metadata(positions, setpoints, active_mask):
+    """纯 NumPy 向量化计算同母线多设备控制分组均值、代表掩码与均分映射。"""
+    positions = np.asarray(positions, dtype=np.int32)
+    setpoints = np.asarray(setpoints, dtype=np.float64)
+    active_mask = np.asarray(active_mask, dtype=bool)
+    n = int(positions.size)
+    avg_set = setpoints.copy()
+    rep_mask = np.zeros(n, dtype=bool)
+    share_mask = np.zeros(n, dtype=bool)
+    ref_idx = np.arange(n, dtype=np.int32)
+    if n == 0 or not np.any(active_mask):
+        return avg_set, rep_mask, share_mask, ref_idx
+
+    active_idx = np.flatnonzero(active_mask).astype(np.int32, copy=False)
+    pos_active = positions[active_idx]
+    order = np.argsort(pos_active, kind="stable")
+    sorted_idx = active_idx[order]
+    sorted_pos = pos_active[order]
+
+    is_new = np.empty(sorted_pos.size, dtype=bool)
+    is_new[0] = True
+    if sorted_pos.size > 1:
+        is_new[1:] = sorted_pos[1:] != sorted_pos[:-1]
+    starts = np.flatnonzero(is_new)
+    ends = np.empty(starts.size, dtype=np.intp)
+    if starts.size > 1:
+        ends[:-1] = starts[1:]
+    ends[-1] = sorted_pos.size
+    counts = ends - starts
+
+    group_avgs = np.add.reduceat(setpoints[sorted_idx], starts) / counts
+    group_id = np.repeat(np.arange(starts.size, dtype=np.intp), counts)
+    reps = sorted_idx[starts]
+
+    avg_set[sorted_idx] = group_avgs[group_id]
+    rep_mask[reps] = True
+    share_mask[sorted_idx] = True
+    share_mask[reps] = False
+    ref_idx[sorted_idx] = reps[group_id]
+    return avg_set, rep_mask, share_mask, ref_idx
+
+
+def build_zero_branch_components_fast(edge_a, edge_b, *, build_lists: bool = False):
+    """基于稀疏连通分量分析与无环快路径构建零阻抗支路 phi 映射及生成树边。"""
+    a = np.asarray(edge_a, dtype=np.int32)
+    b = np.asarray(edge_b, dtype=np.int32)
+    m = int(a.size)
+    empty_i32 = np.empty(0, dtype=np.int32)
+    if m == 0:
+        return {
+            "phi_node": empty_i32,
+            "phi_comp": empty_i32,
+            "ref_phi_idx": empty_i32,
+            "phi_a": empty_i32,
+            "phi_b": empty_i32,
+            "tree_edge_indices": empty_i32,
+            "n_comp": 0,
+            "comp_nodes": [],
+            "comp_tree_edges": [],
+        }
+
+    endpoints = np.concatenate((a, b))
+    uniq_nodes, inv = np.unique(endpoints, return_inverse=True)
+    k = int(uniq_nodes.size)
+    la = inv[:m].astype(np.int32, copy=False)
+    lb = inv[m:].astype(np.int32, copy=False)
+
+    adj_rows = np.concatenate((la, lb))
+    adj_cols = np.concatenate((lb, la))
+    adj = csr_matrix(
+        (np.ones(adj_rows.size, dtype=np.int8), (adj_rows, adj_cols)),
+        shape=(k, k),
+    )
+    n_comp, comp_labels = connected_components(adj, directed=False)
+    comp_labels = np.asarray(comp_labels, dtype=np.int32)
+
+    node_order = np.argsort(comp_labels, kind="stable")
+    phi_node = uniq_nodes[node_order].astype(np.int32, copy=False)
+    phi_comp = comp_labels[node_order].astype(np.int32, copy=False)
+
+    node_counts = np.bincount(comp_labels, minlength=n_comp)
+    ref_phi_idx = np.empty(n_comp, dtype=np.int32)
+    ref_phi_idx[0] = 0
+    if n_comp > 1:
+        ref_phi_idx[1:] = np.cumsum(node_counts[:-1], dtype=np.int32)
+
+    local_to_phi = np.empty(k, dtype=np.int32)
+    local_to_phi[node_order] = np.arange(k, dtype=np.int32)
+    phi_a = local_to_phi[la]
+    phi_b = local_to_phi[lb]
+
+    edge_comp = comp_labels[la]
+    edge_counts = np.bincount(edge_comp, minlength=n_comp)
+    is_tree_comp = edge_counts == (node_counts - 1)
+
+    if bool(np.all(is_tree_comp)):
+        tree_edge_indices = np.arange(m, dtype=np.int32)
+    else:
+        tree_edge_mask = is_tree_comp[edge_comp]
+        tree_parts = []
+        if bool(np.any(tree_edge_mask)):
+            tree_parts.append(np.flatnonzero(tree_edge_mask).astype(np.int32, copy=False))
+        cyc_edge_idx = np.flatnonzero(~tree_edge_mask).astype(np.int32, copy=False)
+        cyc_comp = edge_comp[cyc_edge_idx]
+        c_order = np.argsort(cyc_comp, kind="stable")
+        cyc_edge_sorted = cyc_edge_idx[c_order]
+        cyc_comp_sorted = cyc_comp[c_order]
+        is_new_c = np.empty(cyc_comp_sorted.size, dtype=bool)
+        is_new_c[0] = True
+        if cyc_comp_sorted.size > 1:
+            is_new_c[1:] = cyc_comp_sorted[1:] != cyc_comp_sorted[:-1]
+        c_starts = np.flatnonzero(is_new_c)
+        c_ends = np.empty(c_starts.size, dtype=np.intp)
+        if c_starts.size > 1:
+            c_ends[:-1] = c_starts[1:]
+        c_ends[-1] = cyc_comp_sorted.size
+        for s_idx, e_idx in zip(c_starts.tolist(), c_ends.tolist()):
+            c_id = int(cyc_comp_sorted[s_idx])
+            base_phi = int(ref_phi_idx[c_id])
+            c_n_nodes = int(node_counts[c_id])
+            c_edges = cyc_edge_sorted[s_idx:e_idx]
+            local_edges = list(
+                zip(
+                    (phi_a[c_edges] - base_phi).tolist(),
+                    (phi_b[c_edges] - base_phi).tolist(),
+                )
+            )
+            chosen_local = find_spanning_tree_edges(local_edges, c_n_nodes)
+            if chosen_local:
+                tree_parts.append(c_edges[np.asarray(chosen_local, dtype=np.intp)])
+        tree_edge_indices = (
+            np.concatenate(tree_parts).astype(np.int32, copy=False)
+            if tree_parts
+            else empty_i32
+        )
+
+    comp_nodes = []
+    comp_tree_edges = []
+    if build_lists:
+        node_ends = np.empty(n_comp, dtype=np.intp)
+        if n_comp > 1:
+            node_ends[:-1] = ref_phi_idx[1:]
+        node_ends[-1] = k
+        phi_node_list = phi_node.tolist()
+        for s_idx, e_idx in zip(ref_phi_idx.tolist(), node_ends.tolist()):
+            comp_nodes.append(phi_node_list[s_idx:e_idx])
+        if tree_edge_indices.size:
+            t_comp = edge_comp[tree_edge_indices]
+            t_order = np.argsort(t_comp, kind="stable")
+            t_sorted = tree_edge_indices[t_order].tolist()
+            t_comp_sorted = t_comp[t_order]
+            comp_tree_edges = [[] for _ in range(n_comp)]
+            for e_i, c_i in zip(t_sorted, t_comp_sorted.tolist()):
+                comp_tree_edges[c_i].append(e_i)
+        else:
+            comp_tree_edges = [[] for _ in range(n_comp)]
+
+    return {
+        "phi_node": phi_node,
+        "phi_comp": phi_comp,
+        "ref_phi_idx": ref_phi_idx,
+        "phi_a": phi_a,
+        "phi_b": phi_b,
+        "tree_edge_indices": tree_edge_indices,
+        "n_comp": int(n_comp),
+        "comp_nodes": comp_nodes,
+        "comp_tree_edges": comp_tree_edges,
+    }

@@ -108,7 +108,9 @@ try:
         LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
+        build_group_share_metadata as _build_group_share_metadata,
         build_result_voltage_lookup,
+        build_zero_branch_components_fast,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
@@ -123,7 +125,9 @@ except ImportError:  # pragma: no cover - direct script import path
         LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
+        build_group_share_metadata as _build_group_share_metadata,
         build_result_voltage_lookup,
+        build_zero_branch_components_fast,
         find_spanning_tree_edges,
         normalize_result_mode as _normalize_lf_result_mode,
         optional_ppc_vector,
@@ -190,40 +194,6 @@ class _DenseNodePositionMap:
     def items(self):
         for node_id, pos in zip(self.node_ids, self.positions):
             yield int(node_id), int(pos)
-
-
-def _build_group_share_metadata(positions, setpoints, active_mask):
-    positions = np.asarray(positions, dtype=np.int32)
-    setpoints = np.asarray(setpoints, dtype=np.float64)
-    active_mask = np.asarray(active_mask, dtype=bool)
-    n = positions.size
-    avg_set = setpoints.copy()
-    rep_mask = np.zeros(n, dtype=bool)
-    share_mask = np.zeros(n, dtype=bool)
-    ref_idx = np.arange(n, dtype=np.int32)
-    if n == 0 or not np.any(active_mask):
-        return avg_set, rep_mask, share_mask, ref_idx
-    active_idx = np.flatnonzero(active_mask).astype(np.int32, copy=False)
-    pos_active = positions[active_idx]
-    order = np.argsort(pos_active, kind="stable")
-    sorted_idx = active_idx[order]
-    sorted_pos = pos_active[order]
-    start = 0
-    while start < sorted_idx.size:
-        stop = start + 1
-        pos = sorted_pos[start]
-        while stop < sorted_idx.size and sorted_pos[stop] == pos:
-            stop += 1
-        members = sorted_idx[start:stop]
-        ref = int(members[0])
-        avg = float(np.mean(setpoints[members]))
-        avg_set[members] = avg
-        rep_mask[ref] = True
-        if members.size > 1:
-            share_mask[members[1:]] = True
-        ref_idx[members] = ref
-        start = stop
-    return avg_set, rep_mask, share_mask, ref_idx
 
 
 def load_dc_ppc_from_e_file(file_name) -> Dict:
@@ -616,16 +586,33 @@ class DCPowerFlowCalc:
         external_nodes = np.asarray(self.ppc.get("_external_voltage_reference_node_ids", ()), dtype=np.int64)
         if external_nodes.size:
             node_ids = np.asarray(topology.node_ids, dtype=np.int64)
-            node_pos_by_id = {int(node_id): pos for pos, node_id in enumerate(node_ids)}
-            external_pos = np.asarray(
-                [node_pos_by_id.get(int(node_id), -1) for node_id in external_nodes],
-                dtype=np.int32,
-            )
-            valid = external_pos >= 0
-            if np.any(valid):
-                controlled_parts.append(
-                    topology.node_to_bus_pos[external_pos[valid]].astype(np.int32, copy=False)
-                )
+            if node_ids.size:
+                if node_ids.min() >= 0:
+                    max_id = int(node_ids.max())
+                    if max_id <= max(4 * int(node_ids.size), 1_000_000):
+                        lookup = np.full(max_id + 1, -1, dtype=np.int32)
+                        lookup[node_ids.astype(np.intp, copy=False)] = np.arange(node_ids.size, dtype=np.int32)
+                        in_range = (external_nodes >= 0) & (external_nodes <= max_id)
+                        external_pos = np.full(external_nodes.size, -1, dtype=np.int32)
+                        if np.any(in_range):
+                            external_pos[in_range] = lookup[external_nodes[in_range].astype(np.intp, copy=False)]
+                    else:
+                        order = np.argsort(node_ids)
+                        sorted_ids = node_ids[order]
+                        idx = np.searchsorted(sorted_ids, external_nodes)
+                        matched = (idx < sorted_ids.size) & (sorted_ids[np.minimum(idx, sorted_ids.size - 1)] == external_nodes)
+                        external_pos = np.where(matched, order[np.minimum(idx, sorted_ids.size - 1)], -1).astype(np.int32)
+                else:
+                    order = np.argsort(node_ids)
+                    sorted_ids = node_ids[order]
+                    idx = np.searchsorted(sorted_ids, external_nodes)
+                    matched = (idx < sorted_ids.size) & (sorted_ids[np.minimum(idx, sorted_ids.size - 1)] == external_nodes)
+                    external_pos = np.where(matched, order[np.minimum(idx, sorted_ids.size - 1)], -1).astype(np.int32)
+                valid = external_pos >= 0
+                if np.any(valid):
+                    controlled_parts.append(
+                        topology.node_to_bus_pos[external_pos[valid]].astype(np.int32, copy=False)
+                    )
 
         return (
             np.concatenate(controlled_parts).astype(np.int32, copy=False)
@@ -633,7 +620,21 @@ class DCPowerFlowCalc:
             else np.asarray([], dtype=np.int32)
         )
 
-    def prepare(self):
+    @property
+    def slack_nodes(self) -> Dict[int, float]:
+        """按需返回松弛节点电压设定字典（兼容历史访问，热路径免分配）。"""
+        cached = getattr(self, "_slack_nodes_cache", None)
+        if cached is None:
+            node_arr = getattr(self, "slack_node_arr", None)
+            val_arr = getattr(self, "slack_value_arr", None)
+            if node_arr is not None and val_arr is not None and len(node_arr):
+                cached = dict(zip(node_arr.tolist(), val_arr.tolist()))
+            else:
+                cached = {}
+            self._slack_nodes_cache = cached
+        return cached
+
+    def prepare(self) -> None:
         """预处理并确保拓扑/PPC 就绪。
 
         调用方无需先对 DCPowerNetwork 显式执行 `topo()`；prepare() 会基于
@@ -646,7 +647,8 @@ class DCPowerFlowCalc:
         apply_lf_closed_status_boundaries(self.ppc, DC_SWITCH_COLS)
         if not (self.ppc.pop("_topology_preverified", False) and self.ppc.get("_topology_arrays") is not None):
             ensure_dc_ppc_topology(self.ppc)
-        sanitize_dc_voltage_setpoints(self.ppc)
+        if not self.ppc.pop("_setpoints_preverified", False):
+            sanitize_dc_voltage_setpoints(self.ppc)
         self._prepare_direct_ppc_topology()
 
         if self.N == 0:
@@ -655,6 +657,9 @@ class DCPowerFlowCalc:
         self.P_const = np.zeros(self.N, dtype=np.float64)   # 注入为正：P型发电机 - P型负荷
         self.I_shunt = np.zeros(self.N, dtype=np.float64)   # 消耗为正：负荷电流 - 发电电流
         self.slack_gen_info = {}
+        self._slack_gen_nodes = np.empty(0, dtype=np.int32)
+        self._slack_gen_rows = np.empty(0, dtype=np.int32)
+        self._slack_nodes_cache = None
         node_lookup = self._alive_node_lookup_array()
 
         # ---------- 1. 数据预处理 ----------
@@ -740,8 +745,11 @@ class DCPowerFlowCalc:
                     minlength=self.I_shunt.size,
                 )
             if np.any(v_mask):
-                for row_idx, node in zip(gen_rows[v_mask], gen_pos[v_mask]):
-                    self.slack_gen_info.setdefault(int(node), []).append(int(row_idx))
+                self._slack_gen_nodes = gen_pos[v_mask].astype(np.int32, copy=False)
+                self._slack_gen_rows = gen_rows[v_mask].astype(np.int32, copy=False)
+                if self.keep_node_objects:
+                    for row_idx, node in zip(self._slack_gen_rows.tolist(), self._slack_gen_nodes.tolist()):
+                        self.slack_gen_info.setdefault(node, []).append(row_idx)
             bad_ctrl = ~(p_mask | i_mask | v_mask)
             if np.any(bad_ctrl):
                 raise ValueError(f"未知发电机控制类型: {gen_ctrl[int(np.where(bad_ctrl)[0][0])]}")
@@ -773,10 +781,13 @@ class DCPowerFlowCalc:
         G.sum_duplicates()
         self.G = G
 
-        # ---------- 2. 零阻抗支路处理（节点电位法） ----------
-        self.zero_edges = []
+        # ---------- 2. 零阻抗支路处理（向量化稀疏连通分量 + 节点电位法） ----------
+        zero_code_parts = []
+        zero_dev_parts = []
+        zero_i_parts = []
+        zero_j_parts = []
 
-        def append_zero_edges(table_key, table, cols, code):
+        def append_zero_edges(table_key, table, cols, type_code: int):
             if table is None or not table.size:
                 return
             positions = self._topology_terminal_solver_positions(
@@ -801,101 +812,67 @@ class DCPowerFlowCalc:
                 i_pos = i_all[mask].astype(np.int32, copy=False)
                 j_pos = j_all[mask].astype(np.int32, copy=False)
             if rows.size:
-                self.zero_edges.extend(
-                    (code, int(dev_idx), int(i_node), int(j_node))
-                    for dev_idx, i_node, j_node in zip(rows, i_pos, j_pos)
+                zero_code_parts.append(np.full(rows.size, type_code, dtype=np.int8))
+                zero_dev_parts.append(rows.astype(np.int32, copy=False))
+                zero_i_parts.append(i_pos.astype(np.int32, copy=False))
+                zero_j_parts.append(j_pos.astype(np.int32, copy=False))
+
+        append_zero_edges("zero_branch", self.ppc["zero_branch"], DC_ZERO_BRANCH_COLS, 0)
+        append_zero_edges("switch", self.ppc["switch"], DC_SWITCH_COLS, 1)
+        append_zero_edges("break", self.ppc.get("break"), DC_BREAK_COLS, 2)
+
+        if zero_dev_parts:
+            self._zero_type_code = (
+                zero_code_parts[0] if len(zero_code_parts) == 1 else np.concatenate(zero_code_parts)
+            )
+            self.zero_dev_idx = (
+                zero_dev_parts[0] if len(zero_dev_parts) == 1 else np.concatenate(zero_dev_parts)
+            )
+            self.zero_i = zero_i_parts[0] if len(zero_i_parts) == 1 else np.concatenate(zero_i_parts)
+            self.zero_j = zero_j_parts[0] if len(zero_j_parts) == 1 else np.concatenate(zero_j_parts)
+        else:
+            self._zero_type_code = np.empty(0, dtype=np.int8)
+            self.zero_dev_idx = np.empty(0, dtype=np.int32)
+            self.zero_i = np.empty(0, dtype=np.int32)
+            self.zero_j = np.empty(0, dtype=np.int32)
+
+        comp_res = build_zero_branch_components_fast(
+            self.zero_i,
+            self.zero_j,
+            build_lists=self.keep_node_objects,
+        )
+        self.N_phi = int(comp_res["phi_node"].size)
+        self.ref_phi_idx = comp_res["ref_phi_idx"]
+        self.zero_phi_a = comp_res["phi_a"]
+        self.zero_phi_b = comp_res["phi_b"]
+        tree_edge_indices = comp_res["tree_edge_indices"]
+        if tree_edge_indices.size:
+            self.zero_con_i = self.zero_i[tree_edge_indices]
+            self.zero_con_j = self.zero_j[tree_edge_indices]
+        else:
+            self.zero_con_i = self.zero_con_j = np.empty(0, dtype=np.int32)
+
+        self.comp_nodes = comp_res["comp_nodes"]
+        self.comp_tree_edges = comp_res["comp_tree_edges"]
+        if self.keep_node_objects and self.zero_dev_idx.size:
+            _code_labels = ("Z", "S", "B")
+            z_labels = [_code_labels[c] for c in self._zero_type_code.tolist()]
+            self.zero_edges = list(zip(z_labels, self.zero_dev_idx.tolist(), self.zero_i.tolist(), self.zero_j.tolist()))
+            self.zero_branch_info = list(
+                zip(
+                    z_labels,
+                    self.zero_dev_idx.tolist(),
+                    self.zero_i.tolist(),
+                    self.zero_j.tolist(),
+                    self.zero_phi_a.tolist(),
+                    self.zero_phi_b.tolist(),
                 )
-
-        append_zero_edges("zero_branch", self.ppc["zero_branch"], DC_ZERO_BRANCH_COLS, "Z")
-        append_zero_edges("switch", self.ppc["switch"], DC_SWITCH_COLS, "S")
-        append_zero_edges("break", self.ppc.get("break"), DC_BREAK_COLS, "B")
-
-        zero_adj = {}
-        for edge_idx, (_, _, i_node, j_node) in enumerate(self.zero_edges):
-            zero_adj.setdefault(i_node, []).append((edge_idx, j_node))
-            zero_adj.setdefault(j_node, []).append((edge_idx, i_node))
-
-        visited_nodes = set()
-        edge_used = np.zeros(len(self.zero_edges), dtype=bool)
-        comp_nodes = []
-        comp_edge_indices = []
-
-        for start in zero_adj:
-            if start in visited_nodes:
-                continue
-            q = deque([start])
-            visited_nodes.add(start)
-            nodes = []
-            edges_idx = []
-            while q:
-                u = q.popleft()
-                nodes.append(u)
-                for edge_idx, v in zero_adj[u]:
-                    if not edge_used[edge_idx]:
-                        edge_used[edge_idx] = True
-                        edges_idx.append(edge_idx)
-                    if v not in visited_nodes:
-                        visited_nodes.add(v)
-                        q.append(v)
-            if len(nodes) > 1:
-                comp_nodes.append(nodes)
-                comp_edge_indices.append(edges_idx)
-
-        self.comp_nodes = comp_nodes
-        self.comp_tree_edges = []
-        for nodes, edge_indices in zip(comp_nodes, comp_edge_indices):
-            if len(edge_indices) == len(nodes) - 1:
-                self.comp_tree_edges.append(list(edge_indices))
-                continue
-            local_idx = {node: i for i, node in enumerate(nodes)}
-            local_edges = []
-            orig_indices = []
-            for edge_idx in edge_indices:
-                _, _, i_node, j_node = self.zero_edges[edge_idx]
-                local_edges.append((local_idx[i_node], local_idx[j_node]))
-                orig_indices.append(edge_idx)
-            tree_local_idx = find_spanning_tree_edges(local_edges, len(nodes))
-            self.comp_tree_edges.append([orig_indices[i] for i in tree_local_idx])
-
-        self.N_phi = sum(len(nodes) for nodes in self.comp_nodes)
-        phi_node = []
-        self.ref_phi_idx = []
-        for nodes in self.comp_nodes:
-            # 每个零阻抗连通分量固定一个 phi 参考，其余 phi 差值代表支路电流。
-            self.ref_phi_idx.append(len(phi_node))
-            phi_node.extend(nodes)
-
-        node_to_phi = np.full(self.N, -1, dtype=np.int32)
-        if phi_node:
-            node_to_phi[np.asarray(phi_node, dtype=np.int32)] = np.arange(len(phi_node), dtype=np.int32)
-
-        self.zero_branch_info = []
-        for tp, dev_idx, i_node, j_node in self.zero_edges:
-            phi_a = int(node_to_phi[i_node])
-            phi_b = int(node_to_phi[j_node])
-            if phi_a < 0 or phi_b < 0:
-                raise RuntimeError("节点不在 phi 变量中")
-            self.zero_branch_info.append((tp, dev_idx, i_node, j_node, phi_a, phi_b))
-
-        if self.zero_branch_info:
-            self.zero_type = np.asarray([item[0] for item in self.zero_branch_info], dtype=object)
-            self.zero_dev_idx = np.asarray([item[1] for item in self.zero_branch_info], dtype=np.int32)
-            self.zero_i = np.asarray([item[2] for item in self.zero_branch_info], dtype=np.int32)
-            self.zero_j = np.asarray([item[3] for item in self.zero_branch_info], dtype=np.int32)
-            self.zero_phi_a = np.asarray([item[4] for item in self.zero_branch_info], dtype=np.int32)
-            self.zero_phi_b = np.asarray([item[5] for item in self.zero_branch_info], dtype=np.int32)
+            )
+            self.zero_type = np.asarray(z_labels, dtype=object)
         else:
-            self.zero_type = np.array([], dtype=object)
-            self.zero_dev_idx = self.zero_i = self.zero_j = np.array([], dtype=np.int32)
-            self.zero_phi_a = self.zero_phi_b = np.array([], dtype=np.int32)
-
-        zero_constraint_edges = [edge_idx for edges in self.comp_tree_edges for edge_idx in edges]
-        if zero_constraint_edges:
-            self.zero_con_i = np.asarray([self.zero_edges[idx][2] for idx in zero_constraint_edges], dtype=np.int32)
-            self.zero_con_j = np.asarray([self.zero_edges[idx][3] for idx in zero_constraint_edges], dtype=np.int32)
-        else:
-            self.zero_con_i = self.zero_con_j = np.array([], dtype=np.int32)
-        self.ref_phi_idx = np.asarray(self.ref_phi_idx, dtype=np.int32)
+            self.zero_edges = []
+            self.zero_branch_info = []
+            self.zero_type = np.empty(0, dtype=object)
 
         # ---------- 3. DC-DC变流器 ----------
         dcdc = self.ppc["dcdc"]
@@ -949,15 +926,23 @@ class DCPowerFlowCalc:
                 f"j_control_type={int(self.dcdc_j_ctrl_code[bad_pos])}"
             )
 
-        # ---------- 4. 确定松弛节点 ----------
+        # ---------- 4. 确定松弛节点（纯 NumPy 向量化求均值） ----------
         gen = self.ppc["gen"]
-        self.slack_nodes = {}
-        for node, gens in self.slack_gen_info.items():
-            if not gens:
-                continue
-            self.slack_nodes[node] = float(np.mean(gen[np.asarray(gens, dtype=np.int32), DC_GEN_COLS["v_set"]]))
-        self.slack_node_arr = np.fromiter(self.slack_nodes.keys(), dtype=np.int32, count=len(self.slack_nodes))
-        self.slack_value_arr = np.fromiter(self.slack_nodes.values(), dtype=np.float64, count=len(self.slack_nodes))
+        if self._slack_gen_nodes.size:
+            v_counts = np.bincount(self._slack_gen_nodes, minlength=self.N)
+            v_sums = np.bincount(
+                self._slack_gen_nodes,
+                weights=gen[self._slack_gen_rows, DC_GEN_COLS["v_set"]],
+                minlength=self.N,
+            )
+            self.slack_node_arr = np.flatnonzero(v_counts).astype(np.int32, copy=False)
+            self.slack_value_arr = (
+                v_sums[self.slack_node_arr] / v_counts[self.slack_node_arr]
+            ).astype(np.float64, copy=False)
+        else:
+            self.slack_node_arr = np.empty(0, dtype=np.int32)
+            self.slack_value_arr = np.empty(0, dtype=np.float64)
+        self._slack_nodes_cache = None
 
         # ---------- 5. 变量定义 ----------
         # 前 N 个变量是节点电压；随后是零阻抗连通分量的 phi。
@@ -1406,17 +1391,36 @@ class DCPowerFlowCalc:
         raw_cols = np.concatenate(cols_parts)
         self._dc_jac_raw_rows = raw_rows
         self._dc_jac_raw_cols = raw_cols
-        # 仅预构建 NR 求解所需的 CSC 模式；CSR 模式在 get_jacobi(x) 首次需要时懒构建
+        # 独立求解时预构建 CSC 模式；混合耦合模式（_defer_csc_pattern=True）直接向混合层输出 raw COO
         self._dc_jac_raw_to_csr_pos = np.array([], dtype=np.intp)
         self._dc_jac_csr_indices = np.array([], dtype=np.int32)
         self._dc_jac_csr_indptr = np.zeros(self.total_eq + 1, dtype=np.int32)
         self._dc_jac_csr_data = np.array([], dtype=np.float64)
         self._dc_jac_csr_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csr_pos, 0)
+        if getattr(self, "_defer_csc_pattern", False):
+            self._dc_jac_raw_to_csc_pos = np.array([], dtype=np.intp)
+            self._dc_jac_csc_indices = np.array([], dtype=np.int32)
+            self._dc_jac_csc_indptr = np.zeros(self.total_vars + 1, dtype=np.int32)
+            self._dc_jac_csc_data = np.array([], dtype=np.float64)
+            self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, 0)
+        else:
+            (
+                self._dc_jac_csc_indices,
+                self._dc_jac_csc_indptr,
+                self._dc_jac_raw_to_csc_pos,
+            ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
+            self._dc_jac_csc_data = np.empty(self._dc_jac_csc_indices.size, dtype=np.float64)
+            self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, self._dc_jac_csc_data.size)
+
+    def _ensure_dc_csc_pattern(self):
+        """按需懒构建 DC 雅可比的 CSC 压缩模式并缓存。"""
+        if self._dc_jac_raw_to_csc_pos.size or not self._dc_jac_raw_rows.size:
+            return
         (
             self._dc_jac_csc_indices,
             self._dc_jac_csc_indptr,
             self._dc_jac_raw_to_csc_pos,
-        ) = build_compressed_pattern_from_raw_coords(raw_cols, raw_rows, self.total_vars)
+        ) = build_compressed_pattern_from_raw_coords(self._dc_jac_raw_cols, self._dc_jac_raw_rows, self.total_vars)
         self._dc_jac_csc_data = np.empty(self._dc_jac_csc_indices.size, dtype=np.float64)
         self._dc_jac_csc_sum_plan = build_raw_sum_plan(self._dc_jac_raw_to_csc_pos, self._dc_jac_csc_data.size)
 
@@ -1514,7 +1518,11 @@ class DCPowerFlowCalc:
             return csc_matrix(shape, dtype=np.float64) if matrix_format == "csc" else csr_matrix(shape, dtype=np.float64)
         self._fill_jacobian_raw_data(terms)
 
+        if matrix_format == "raw":
+            return self._dc_jac_raw_data
+
         if matrix_format == "csc":
+            self._ensure_dc_csc_pattern()
             apply_raw_sum_plan(self._dc_jac_csc_data, self._dc_jac_raw_data, self._dc_jac_csc_sum_plan)
             if not build_matrix:
                 return self._dc_jac_csc_data
@@ -1860,9 +1868,8 @@ class DCPowerFlowCalc:
             switch[:, [DC_SWITCH_COLS["p"], DC_SWITCH_COLS["current"]]] = 0.0
         if breaker.size:
             breaker[:, [DC_BREAK_COLS["p"], DC_BREAK_COLS["current"]]] = 0.0
-        if self.zero_branch_info:
-            z_types = [row[0] for row in self.zero_branch_info]
-            z_dev = np.fromiter((int(row[1]) for row in self.zero_branch_info), dtype=np.intp, count=len(self.zero_branch_info))
+        if self.zero_i.size:
+            z_dev = self.zero_dev_idx.astype(np.intp, copy=False)
             z_i = self.zero_i
             z_j = self.zero_j
             z_cur = phi_final[self.zero_phi_a] - phi_final[self.zero_phi_b]
@@ -1870,13 +1877,13 @@ class DCPowerFlowCalc:
             z_p_to = -V_final[z_j] * z_cur
             P_inj += np.bincount(z_i, weights=z_p_from, minlength=P_inj.size)
             P_inj += np.bincount(z_j, weights=z_p_to, minlength=P_inj.size)
-            z_type_arr = np.asarray(z_types)
-            for code, table, cols in (
-                ('Z', zero_branch, DC_ZERO_BRANCH_COLS),
-                ('S', switch, DC_SWITCH_COLS),
-                ('B', breaker, DC_BREAK_COLS),
+            z_code = self._zero_type_code
+            for code_int, table, cols in (
+                (0, zero_branch, DC_ZERO_BRANCH_COLS),
+                (1, switch, DC_SWITCH_COLS),
+                (2, breaker, DC_BREAK_COLS),
             ):
-                mask = z_type_arr == code
+                mask = z_code == code_int
                 if np.any(mask):
                     dev_rows = z_dev[mask]
                     table[dev_rows, cols["p"]] = z_p_from[mask]
@@ -1970,12 +1977,9 @@ class DCPowerFlowCalc:
         gen_p_min_all = optional_ppc_vector(ppc, "_gen_p_min", gen.shape[0])
         gen_p_max_all = optional_ppc_vector(ppc, "_gen_p_max", gen.shape[0])
         gen_alpha_all = optional_ppc_vector(ppc, "_gen_alpha", gen.shape[0], default=1.0)
-        participants = np.asarray(
-            [(node, row) for node, gens in self.slack_gen_info.items() for row in gens],
-            dtype=np.intp,
-        ).reshape(-1, 2)
-        if participants.size:
-            nodes, gen_refs = participants.T
+        if self._slack_gen_nodes.size:
+            nodes = self._slack_gen_nodes.astype(np.intp, copy=False)
+            gen_refs = self._slack_gen_rows.astype(np.intp, copy=False)
             allocated = allocate_grouped_residual(
                 nodes,
                 gen[gen_refs, DC_GEN_COLS["p_set"]],
@@ -2017,10 +2021,11 @@ class DCPowerFlowCalc:
             return {int(row[idx_col]): row for row in rows}
 
         bus_by_idx = rows_by_idx("bus", DC_BUS_COLS["idx"])
+        slack_pos_set = set(self.slack_node_arr.tolist())
         slack_node_ids = {
             int(node_id)
             for node_id, pos in self.alive_node_dict.items()
-            if int(pos) in self.slack_nodes
+            if int(pos) in slack_pos_set
         }
         for node in getattr(network, "nodes", []):
             row = bus_by_idx.get(int(getattr(node, "idx", -1)))

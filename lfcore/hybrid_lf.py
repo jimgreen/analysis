@@ -39,6 +39,7 @@ try:
     from lfcore.common import (
         DCACPortResult,
         LazyResultDict,
+        build_group_share_metadata as _build_group_share_metadata,
         device_key as _lf_device_key,
         normalize_result_mode as _normalize_lf_result_mode,
         result_name_list,
@@ -47,6 +48,7 @@ except ImportError:  # pragma: no cover - direct script import path
     from common import (
         DCACPortResult,
         LazyResultDict,
+        build_group_share_metadata as _build_group_share_metadata,
         device_key as _lf_device_key,
         normalize_result_mode as _normalize_lf_result_mode,
         result_name_list,
@@ -310,40 +312,6 @@ def _default_hybrid_linear_solver(has_dc: bool) -> str:
 
 def _array_device(idx, name=None, **values):
     return SimpleNamespace(idx=int(idx), name=str(name if name is not None else idx), **values)
-
-
-def _build_group_share_metadata(positions, setpoints, active_mask):
-    positions = np.asarray(positions, dtype=np.int32)
-    setpoints = np.asarray(setpoints, dtype=np.float64)
-    active_mask = np.asarray(active_mask, dtype=bool)
-    n = positions.size
-    avg_set = setpoints.copy()
-    rep_mask = np.zeros(n, dtype=bool)
-    share_mask = np.zeros(n, dtype=bool)
-    ref_idx = np.arange(n, dtype=np.int32)
-    if n == 0 or not np.any(active_mask):
-        return avg_set, rep_mask, share_mask, ref_idx
-    active_idx = np.flatnonzero(active_mask).astype(np.int32, copy=False)
-    pos_active = positions[active_idx]
-    order = np.argsort(pos_active, kind="stable")
-    sorted_idx = active_idx[order]
-    sorted_pos = pos_active[order]
-    start = 0
-    while start < sorted_idx.size:
-        stop = start + 1
-        bus_pos = sorted_pos[start]
-        while stop < sorted_idx.size and sorted_pos[stop] == bus_pos:
-            stop += 1
-        members = sorted_idx[start:stop]
-        ref = int(members[0])
-        avg = float(np.mean(setpoints[members]))
-        avg_set[members] = avg
-        rep_mask[ref] = True
-        if members.size > 1:
-            share_mask[members[1:]] = True
-        ref_idx[members] = ref
-        start = stop
-    return avg_set, rep_mask, share_mask, ref_idx
 
 
 class _LightweightHybridNetwork(SimpleNamespace):
@@ -1144,6 +1112,16 @@ class HybridPowerFlowCalc:
         self.coupling_results: List[object] = []
         self.electric_converged = False
         self._prepared = False
+
+    @property
+    def ppc(self):
+        """暴露底层的混合网络 PPC 字典（与 ACPowerFlowCalc.ppc / DCPowerFlowCalc.ppc 接口保持一致）。"""
+        return getattr(self.network, "ppc", None)
+
+    @ppc.setter
+    def ppc(self, value) -> None:
+        if self.network is not None:
+            self.network.ppc = value
 
     @classmethod
     def from_file_fast(
@@ -2491,7 +2469,7 @@ class HybridPowerFlowCalc:
         else:
             self.ac_calc.ppc.pop("_external_voltage_control_node_ids", None)
 
-    def prepare(self):
+    def prepare(self) -> None:
         if self._prepared:
             return None
         electric_x = self._prepare_electric().copy()
@@ -2580,12 +2558,15 @@ class HybridPowerFlowCalc:
             else:
                 # 消费一次性初始化校验标记，避免重复全表哈希；后续再次 prepare 将重新校验
                 self._topology_verified_in_init = False
-            sanitize_dcac_voltage_setpoints(self.network.ppc)
+            if not self.network.ppc.pop("_setpoints_preverified", False):
+                sanitize_dcac_voltage_setpoints(self.network.ppc)
         self._install_ac_converter_voltage_control_nodes()
         parts = []
+        coupled_subsolvers = bool(self.ac_calc is not None and self.dc_calc is not None)
         if self.ac_calc is not None:
             if self._converter_ppc_mode and self.ac_calc.ppc.get("_topology_arrays") is not None:
                 self.ac_calc.ppc["_topology_preverified"] = True
+            self.ac_calc._defer_csc_pattern = coupled_subsolvers
             self.ac_calc.verbose = self.verbose
             self.ac_calc.prepare()
             self.ac_size = self.ac_calc.total_vars
@@ -2594,6 +2575,7 @@ class HybridPowerFlowCalc:
         if self.dc_calc is not None:
             if self._converter_ppc_mode and self.dc_calc.ppc.get("_topology_arrays") is not None:
                 self.dc_calc.ppc["_topology_preverified"] = True
+            self.dc_calc._defer_csc_pattern = coupled_subsolvers
             self.dc_calc.prepare()
             self.dc_G = self.dc_calc.G
             dc_x = self.dc_calc.x
@@ -3155,11 +3137,37 @@ class HybridPowerFlowCalc:
     def _sub_jacobian_pattern(self, calc, is_dc=False):
         if calc is None or getattr(calc, "total_eq", 0) == 0 or getattr(calc, "total_vars", 0) == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-        if is_dc and hasattr(calc, "_dc_jac_csc_indices") and calc._dc_jac_csc_indices.size:
-            return (
-                calc._dc_jac_csc_indices.astype(np.int32, copy=True),
-                self._cols_from_csc_indptr(calc._dc_jac_csc_indptr),
-            )
+        # 优先直接复用子求解器 raw COO 坐标，避免先做子块 CSC 排序归约再拆回 COO
+        if is_dc:
+            raw_rows = getattr(calc, "_dc_jac_raw_rows", None)
+            raw_cols = getattr(calc, "_dc_jac_raw_cols", None)
+            if raw_rows is not None and raw_cols is not None and raw_rows.size:
+                self._global_jac_dc_uses_raw = True
+                return raw_rows.astype(np.int32, copy=False), raw_cols.astype(np.int32, copy=False)
+            self._global_jac_dc_uses_raw = False
+            if hasattr(calc, "_dc_jac_csc_indices") and calc._dc_jac_csc_indices.size:
+                return (
+                    calc._dc_jac_csc_indices.astype(np.int32, copy=True),
+                    self._cols_from_csc_indptr(calc._dc_jac_csc_indptr),
+                )
+        else:
+            raw_rows = getattr(calc, "_full_jac_raw_rows", None)
+            raw_cols = getattr(calc, "_full_jac_raw_cols", None)
+            if raw_rows is not None and raw_cols is not None and raw_rows.size:
+                self._global_jac_ac_uses_raw = True
+                return raw_rows.astype(np.int32, copy=False), raw_cols.astype(np.int32, copy=False)
+            std_rows = getattr(calc, "standard_jac_rows", None)
+            std_cols = getattr(calc, "standard_jac_cols", None)
+            if (
+                std_rows is not None
+                and std_cols is not None
+                and std_rows.size
+                and getattr(calc, "N_phi", 0) == 0
+                and getattr(calc, "N_acac", 0) == 0
+            ):
+                self._global_jac_ac_uses_raw = True
+                return std_rows.astype(np.int32, copy=False), std_cols.astype(np.int32, copy=False)
+            self._global_jac_ac_uses_raw = False
         if hasattr(calc, "full_jac_csc_indices") and calc.full_jac_csc_indices.size:
             return (
                 calc.full_jac_csc_indices.astype(np.int32, copy=True),
@@ -3189,9 +3197,19 @@ class HybridPowerFlowCalc:
         jac = jac.tocsr()
         return self._rows_from_csr_indptr(jac.indptr), jac.indices.astype(np.int32, copy=True)
 
-    @staticmethod
-    def _sub_jacobian_cached_values(calc, is_dc=False):
-        """Return values aligned with the CSC pattern selected above."""
+    def _sub_jacobian_cached_values(self, calc, is_dc=False):
+        """Return values aligned with the raw/CSC pattern selected above."""
+        if is_dc and getattr(self, "_global_jac_dc_uses_raw", False):
+            data = getattr(calc, "_dc_jac_raw_data", None)
+            if data is not None and np.asarray(data).size:
+                return np.asarray(data, dtype=np.float64)
+        if (not is_dc) and getattr(self, "_global_jac_ac_uses_raw", False):
+            full_data = getattr(calc, "full_jac_raw_data", None)
+            if full_data is not None and np.asarray(full_data).size:
+                return np.asarray(full_data, dtype=np.float64)
+            std_data = getattr(calc, "standard_jac_data", None)
+            if std_data is not None and np.asarray(std_data).size:
+                return np.asarray(std_data, dtype=np.float64)
         candidates = []
         if is_dc:
             candidates.append(("_dc_jac_csc_indices", "_dc_jac_csc_data"))
@@ -3632,12 +3650,11 @@ class HybridPowerFlowCalc:
         dc_f = dc_j = None
         if self.ac_calc is not None:
             if return_jacobian:
-                # A global Jacobian needs numerical sub-block data, not a
-                # temporary sparse matrix. Residual-only trials need neither.
+                ac_sub_fmt = "raw" if getattr(self, "_global_jac_ac_uses_raw", False) else "csc"
                 ac_f, ac_j = self.ac_calc._build_newton_system(
                     ac_x,
                     return_jacobian=False,
-                    jacobian_format="csc",
+                    jacobian_format=ac_sub_fmt,
                 )
             else:
                 ac_f = self.ac_calc.get_f(ac_x)
@@ -3653,10 +3670,11 @@ class HybridPowerFlowCalc:
                 ac_j = self.ac_calc.get_jacobi(ac_x)
         if self.dc_calc is not None:
             if return_jacobian:
+                dc_sub_fmt = "raw" if getattr(self, "_global_jac_dc_uses_raw", False) else "csc"
                 dc_f, dc_j = self.dc_calc._build_newton_system(
                     dc_x,
                     return_jacobian=False,
-                    jacobian_format="csc",
+                    jacobian_format=dc_sub_fmt,
                 )
             else:
                 dc_f = self.dc_calc.get_f(dc_x)
@@ -3732,6 +3750,7 @@ class HybridPowerFlowCalc:
         if self.ac_calc is not None:
             ac = self.ac_calc
             need_matrix = self.global_jac_raw_data.size == 0
+            ac_sub_fmt = "raw" if (not need_matrix and getattr(self, "_global_jac_ac_uses_raw", False)) else "csc"
             theta, V, phi_re, phi_im = ac._extract_state_vars(ac_x, update_cache=False)
             ac_j = ac._get_jacobi_from_cached_state(
                 theta,
@@ -3739,7 +3758,7 @@ class HybridPowerFlowCalc:
                 phi_re,
                 phi_im,
                 Sbus=ac._last_Sbus,
-                matrix_format="csc",
+                matrix_format=ac_sub_fmt,
                 build_matrix=need_matrix,
             )
             if ac_j is None and self._slice_len(self.global_jac_ac_slice):
@@ -3749,6 +3768,7 @@ class HybridPowerFlowCalc:
         if self.dc_calc is not None:
             dc = self.dc_calc
             need_matrix = self.global_jac_raw_data.size == 0
+            dc_sub_fmt = "raw" if (not need_matrix and getattr(self, "_global_jac_dc_uses_raw", False)) else "csc"
             terms = getattr(dc, "_last_terms", None)
             if terms is None:
                 terms = dc._eval_newton_terms(dc.G, dc_x)
@@ -3756,7 +3776,7 @@ class HybridPowerFlowCalc:
                 dc.G,
                 dc_x,
                 terms,
-                matrix_format="csc",
+                matrix_format=dc_sub_fmt,
                 build_matrix=need_matrix,
             )
             if dc_j is None and self._slice_len(self.global_jac_dc_slice):
