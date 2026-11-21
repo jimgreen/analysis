@@ -318,18 +318,23 @@ def ensure_hybrid_ppc_topology(ppc: Dict) -> Dict:
         _attach_hybrid_dc_reference_nodes(ppc)
     if ac_ppc is not None:
         _attach_hybrid_ac_reference_nodes(ppc)
+    ac_signature = None
     if ac_ppc is not None:
         ac_signature = _ac_topology_signature(ac_ppc)
         rebuild_both = rebuild_both or (
             ac_ppc.get("_topology_arrays") is None
             or ac_ppc.get("_ac_topology_signature") != ac_signature
         )
+    dc_signature = None
     if dc_ppc is not None:
         dc_signature = _dc_topology_signature(dc_ppc)
         rebuild_both = rebuild_both or (
             dc_ppc.get("_topology_arrays") is None
             or dc_ppc.get("_dc_topology_signature") != dc_signature
         )
+    applied_signature = (hybrid_signature, ac_signature, dc_signature)
+    if not rebuild_both and ppc.get("_hybrid_topology_applied_signature") == applied_signature:
+        return ppc
     if rebuild_both:
         if ac_ppc is not None:
             ac_ppc.pop("_topology_arrays", None)
@@ -340,6 +345,7 @@ def ensure_hybrid_ppc_topology(ppc: Dict) -> Dict:
     if ac_ppc is not None:
         _ensure_ac_ppc_topology_with_signature(ac_ppc, ac_signature)
     _apply_hybrid_operational_island_filter(ppc)
+    ppc["_hybrid_topology_applied_signature"] = applied_signature
     return ppc
 
 

@@ -2289,7 +2289,8 @@ class DCPowerFlowCalc:
 
         for it in range(self.max_iter):
             self.iterations += 1
-            F, J = self._build_newton_system(x)
+            terms = self._eval_newton_terms(self.G, x)
+            F = self._get_f_from_terms(x, terms)
             self.normF = np.linalg.norm(F, np.inf)
             if self.verbose:
                 print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
@@ -2301,6 +2302,14 @@ class DCPowerFlowCalc:
                 self.x = x
                 self._write_back()
                 return 0
+
+            J = self._get_jacobi_from_terms(
+                self.G,
+                x,
+                terms,
+                matrix_format="csc",
+                build_matrix=True,
+            )
 
             try:
                 if reusable_factorizer is None:

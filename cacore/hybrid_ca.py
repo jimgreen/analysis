@@ -14,8 +14,13 @@ for path in (ROOT_DIR, LFCORE_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from efile_read import EBook
-from lfcore.hybrid_lf import HybridPowerFlowCalc, _read_lf_network_from_file
+from algorithm_parameters import load_lf_parameters
+from efile_read import EBook, _read_efile_rows
+from lfcore.hybrid_lf import (
+    HybridPowerFlowCalc,
+    _read_lf_network_from_efile_rows,
+    _read_lf_network_from_file,
+)
 from paths import DATA_DIR, model_file
 
 
@@ -227,79 +232,110 @@ def _active_load_power(result) -> float:
 
 def collect_limit_risks(result, constraints, source: str) -> list[CARisk]:
     risks: list[CARisk] = []
+    if not constraints:
+        return risks
     network = result.network
 
-    for node in getattr(result.ac_network, "nodes", []):
-        _check_device_range(risks, constraints, "ACNode", node, "v", _physical_voltage(network, node), source)
-    for node in getattr(result.dc_network, "nodes", []):
-        _check_device_range(risks, constraints, "DCNode", node, "v", _physical_voltage(network, node), source)
+    if constraints.get("ACNode"):
+        for node in getattr(result.ac_network, "nodes", []):
+            _check_device_range(risks, constraints, "ACNode", node, "v", _physical_voltage(network, node), source)
+    if constraints.get("DCNode"):
+        for node in getattr(result.dc_network, "nodes", []):
+            _check_device_range(risks, constraints, "DCNode", node, "v", _physical_voltage(network, node), source)
 
-    for gen in getattr(result.ac_network, "generators", []):
-        _check_device_range(risks, constraints, "ACUnit", gen, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
-        _check_device_range(risks, constraints, "ACUnit", gen, "v", _node_voltage(network, "ac", gen.node), source)
-    for gen in getattr(result.dc_network, "generators", []):
-        _check_device_range(risks, constraints, "DCUnit", gen, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
-        _check_device_range(risks, constraints, "DCUnit", gen, "v", _node_voltage(network, "dc", gen.node), source)
+    if constraints.get("ACUnit"):
+        for gen in getattr(result.ac_network, "generators", []):
+            _check_device_range(risks, constraints, "ACUnit", gen, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
+            _check_device_range(risks, constraints, "ACUnit", gen, "v", _node_voltage(network, "ac", gen.node), source)
+    if constraints.get("DCUnit"):
+        for gen in getattr(result.dc_network, "generators", []):
+            _check_device_range(risks, constraints, "DCUnit", gen, "p", _physical_power(network, getattr(gen, "p", 0.0)), source)
+            _check_device_range(risks, constraints, "DCUnit", gen, "v", _node_voltage(network, "dc", gen.node), source)
 
-    for load in getattr(result.ac_network, "loads", []):
-        _check_device_range(risks, constraints, "ACLoad", load, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
-        _check_device_range(risks, constraints, "ACLoad", load, "v", _node_voltage(network, "ac", load.node), source)
-    for load in getattr(result.dc_network, "loads", []):
-        _check_device_range(risks, constraints, "DCLoad", load, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
-        _check_device_range(risks, constraints, "DCLoad", load, "v", _node_voltage(network, "dc", load.node), source)
+    if constraints.get("ACLoad"):
+        for load in getattr(result.ac_network, "loads", []):
+            _check_device_range(risks, constraints, "ACLoad", load, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
+            _check_device_range(risks, constraints, "ACLoad", load, "v", _node_voltage(network, "ac", load.node), source)
+    if constraints.get("DCLoad"):
+        for load in getattr(result.dc_network, "loads", []):
+            _check_device_range(risks, constraints, "DCLoad", load, "p", abs(_physical_power(network, getattr(load, "p", 0.0))), source)
+            _check_device_range(risks, constraints, "DCLoad", load, "v", _node_voltage(network, "dc", load.node), source)
 
-    for branch in getattr(result.ac_network, "branches", []):
-        i_node = _terminal_node(network, "ac", branch.i_node)
-        j_node = _terminal_node(network, "ac", branch.j_node)
-        current = max(
-            abs(_physical_current(network, getattr(branch, "i_c", 0.0), i_node)),
-            abs(_physical_current(network, getattr(branch, "j_c", 0.0), j_node)),
-        )
-        power = max(
-            _physical_power(network, math.hypot(_as_float(getattr(branch, "i_p", 0.0)), _as_float(getattr(branch, "i_q", 0.0)))),
-            _physical_power(network, math.hypot(_as_float(getattr(branch, "j_p", 0.0)), _as_float(getattr(branch, "j_q", 0.0)))),
-        )
-        _check_device_range(risks, constraints, "ACBranch", branch, "i", current, source)
-        _check_device_range(risks, constraints, "ACBranch", branch, "p", power, source)
-    for branch in getattr(result.dc_network, "branches", []):
-        i_node = _terminal_node(network, "dc", branch.i_node)
-        current = abs(_physical_current(network, getattr(branch, "current", 0.0), i_node))
-        power = max(abs(_physical_power(network, getattr(branch, "i_p", 0.0))), abs(_physical_power(network, getattr(branch, "j_p", 0.0))))
-        _check_device_range(risks, constraints, "DCBranch", branch, "i", current, source)
-        _check_device_range(risks, constraints, "DCBranch", branch, "p", power, source)
+    if constraints.get("ACBranch"):
+        for branch in getattr(result.ac_network, "branches", []):
+            i_node = _terminal_node(network, "ac", branch.i_node)
+            j_node = _terminal_node(network, "ac", branch.j_node)
+            current = max(
+                abs(_physical_current(network, getattr(branch, "i_c", 0.0), i_node)),
+                abs(_physical_current(network, getattr(branch, "j_c", 0.0), j_node)),
+            )
+            power = max(
+                _physical_power(network, math.hypot(_as_float(getattr(branch, "i_p", 0.0)), _as_float(getattr(branch, "i_q", 0.0)))),
+                _physical_power(network, math.hypot(_as_float(getattr(branch, "j_p", 0.0)), _as_float(getattr(branch, "j_q", 0.0)))),
+            )
+            _check_device_range(risks, constraints, "ACBranch", branch, "i", current, source)
+            _check_device_range(risks, constraints, "ACBranch", branch, "p", power, source)
+    if constraints.get("DCBranch"):
+        for branch in getattr(result.dc_network, "branches", []):
+            i_node = _terminal_node(network, "dc", branch.i_node)
+            current = abs(_physical_current(network, getattr(branch, "current", 0.0), i_node))
+            power = max(abs(_physical_power(network, getattr(branch, "i_p", 0.0))), abs(_physical_power(network, getattr(branch, "j_p", 0.0))))
+            _check_device_range(risks, constraints, "DCBranch", branch, "i", current, source)
+            _check_device_range(risks, constraints, "DCBranch", branch, "p", power, source)
 
-    for brk in getattr(result.ac_network, "breakers", []):
-        _check_device_range(risks, constraints, "ACBreaker", brk, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "ac", brk.i_node))), source)
-        voltage = max(_node_voltage(network, "ac", brk.i_node), _node_voltage(network, "ac", brk.j_node))
-        _check_device_range(risks, constraints, "ACBreaker", brk, "v", voltage, source)
-    for brk in getattr(result.dc_network, "breakers", []):
-        _check_device_range(risks, constraints, "DCBreaker", brk, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "dc", brk.i_node))), source)
-        voltage = max(_node_voltage(network, "dc", brk.i_node), _node_voltage(network, "dc", brk.j_node))
-        _check_device_range(risks, constraints, "DCBreaker", brk, "v", voltage, source)
+    if constraints.get("ACBreaker"):
+        for brk in getattr(result.ac_network, "breakers", []):
+            _check_device_range(risks, constraints, "ACBreaker", brk, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "ac", brk.i_node))), source)
+            voltage = max(_node_voltage(network, "ac", brk.i_node), _node_voltage(network, "ac", brk.j_node))
+            _check_device_range(risks, constraints, "ACBreaker", brk, "v", voltage, source)
+    if constraints.get("DCBreaker"):
+        for brk in getattr(result.dc_network, "breakers", []):
+            _check_device_range(risks, constraints, "DCBreaker", brk, "i", abs(_physical_current(network, getattr(brk, "current", 0.0), _terminal_node(network, "dc", brk.i_node))), source)
+            voltage = max(_node_voltage(network, "dc", brk.i_node), _node_voltage(network, "dc", brk.j_node))
+            _check_device_range(risks, constraints, "DCBreaker", brk, "v", voltage, source)
 
-    for conv in getattr(result.dc_network, "dcdc_converters", []):
-        _check_device_range(risks, constraints, "DCDCConver", conv, "i_c", _physical_current(network, getattr(conv, "i_c", 0.0), _terminal_node(network, "dc", conv.i_node)), source)
-        _check_device_range(risks, constraints, "DCDCConver", conv, "j_c", _physical_current(network, getattr(conv, "j_c", 0.0), _terminal_node(network, "dc", conv.j_node)), source)
-        _check_device_range(risks, constraints, "DCDCConver", conv, "i_v", _node_voltage(network, "dc", conv.i_node), source)
-        _check_device_range(risks, constraints, "DCDCConver", conv, "j_v", _node_voltage(network, "dc", conv.j_node), source)
-    for conv in getattr(network, "dcac_converters", []):
-        _check_device_range(risks, constraints, "DCACConver", conv, "i_c", _physical_current(network, getattr(conv, "dc_i", 0.0), _terminal_node(network, "dc", conv.dc_node)), source)
-        _check_device_range(risks, constraints, "DCACConver", conv, "j_c", _physical_current(network, getattr(conv, "ac_i", 0.0), _terminal_node(network, "ac", conv.ac_node)), source)
-        _check_device_range(risks, constraints, "DCACConver", conv, "i_v", _node_voltage(network, "dc", conv.dc_node), source)
-        _check_device_range(risks, constraints, "DCACConver", conv, "j_v", _node_voltage(network, "ac", conv.ac_node), source)
-    for conv in getattr(network, "acac_converters", []):
-        _check_device_range(risks, constraints, "ACACConver", conv, "i_c", _physical_current(network, getattr(conv, "i_i", 0.0), _terminal_node(network, "ac", conv.i_node)), source)
-        _check_device_range(risks, constraints, "ACACConver", conv, "j_c", _physical_current(network, getattr(conv, "j_i", 0.0), _terminal_node(network, "ac", conv.j_node)), source)
-        _check_device_range(risks, constraints, "ACACConver", conv, "i_v", _node_voltage(network, "ac", conv.i_node), source)
-        _check_device_range(risks, constraints, "ACACConver", conv, "j_v", _node_voltage(network, "ac", conv.j_node), source)
+    if constraints.get("DCDCConver"):
+        for conv in getattr(result.dc_network, "dcdc_converters", []):
+            _check_device_range(risks, constraints, "DCDCConver", conv, "i_c", _physical_current(network, getattr(conv, "i_c", 0.0), _terminal_node(network, "dc", conv.i_node)), source)
+            _check_device_range(risks, constraints, "DCDCConver", conv, "j_c", _physical_current(network, getattr(conv, "j_c", 0.0), _terminal_node(network, "dc", conv.j_node)), source)
+            _check_device_range(risks, constraints, "DCDCConver", conv, "i_v", _node_voltage(network, "dc", conv.i_node), source)
+            _check_device_range(risks, constraints, "DCDCConver", conv, "j_v", _node_voltage(network, "dc", conv.j_node), source)
+    if constraints.get("DCACConver"):
+        for conv in getattr(network, "dcac_converters", []):
+            _check_device_range(risks, constraints, "DCACConver", conv, "i_c", _physical_current(network, getattr(conv, "dc_i", 0.0), _terminal_node(network, "dc", conv.dc_node)), source)
+            _check_device_range(risks, constraints, "DCACConver", conv, "j_c", _physical_current(network, getattr(conv, "ac_i", 0.0), _terminal_node(network, "ac", conv.ac_node)), source)
+            _check_device_range(risks, constraints, "DCACConver", conv, "i_v", _node_voltage(network, "dc", conv.dc_node), source)
+            _check_device_range(risks, constraints, "DCACConver", conv, "j_v", _node_voltage(network, "ac", conv.ac_node), source)
+    if constraints.get("ACACConver"):
+        for conv in getattr(network, "acac_converters", []):
+            _check_device_range(risks, constraints, "ACACConver", conv, "i_c", _physical_current(network, getattr(conv, "i_i", 0.0), _terminal_node(network, "ac", conv.i_node)), source)
+            _check_device_range(risks, constraints, "ACACConver", conv, "j_c", _physical_current(network, getattr(conv, "j_i", 0.0), _terminal_node(network, "ac", conv.j_node)), source)
+            _check_device_range(risks, constraints, "ACACConver", conv, "i_v", _node_voltage(network, "ac", conv.i_node), source)
+            _check_device_range(risks, constraints, "ACACConver", conv, "j_v", _node_voltage(network, "ac", conv.j_node), source)
 
     return risks
 
 
-def _run_case(model_file: str | Path):
+_CONTINGENCY_TABLES = (
+    ("ACGenerator", "ACUnit"),
+    ("ACLoad", "ACLoad"),
+    ("ACBranch", "ACBranch"),
+    ("ACBreak", "ACBreaker"),
+    ("ACTransformer", "ACTransformer"),
+    ("DCGenerator", "DCUnit"),
+    ("DCLoad", "DCLoad"),
+    ("DCBranch", "DCBranch"),
+    ("DCBreak", "DCBreaker"),
+    ("DCDCConverter", "DCDCConver"),
+    ("DCACConverter", "DCACConver"),
+    ("ACACConverter", "ACACConver"),
+)
+
+
+def _run_case(model_file: str | Path, *, parameters=None):
     try:
         network = _read_lf_network_from_file(model_file)
-        calc = HybridPowerFlowCalc(network, verbose=False, result_mode="full")
+        calc = HybridPowerFlowCalc(network, parameters=parameters, verbose=False, result_mode="full")
         calc.run()
         result = calc.lf_result
         return result, None
@@ -307,22 +343,19 @@ def _run_case(model_file: str | Path):
         return None, exc
 
 
+def _run_case_from_rows(model_file: str | Path, efile_rows: dict, *, parameters=None):
+    try:
+        network = _read_lf_network_from_efile_rows(model_file, efile_rows)
+        calc = HybridPowerFlowCalc(network, parameters=parameters, verbose=False, result_mode="full")
+        calc.run()
+        return calc.lf_result, None
+    except Exception as exc:  # pragma: no cover - exercised by real divergent cases.
+        return None, exc
+
+
 def _contingency_rows(model_file: str | Path) -> Iterable[tuple[str, str, int, str]]:
     book = EBook(model_file)
-    for table, source_table in (
-        ("ACGenerator", "ACUnit"),
-        ("ACLoad", "ACLoad"),
-        ("ACBranch", "ACBranch"),
-        ("ACBreak", "ACBreaker"),
-        ("ACTransformer", "ACTransformer"),
-        ("DCGenerator", "DCUnit"),
-        ("DCLoad", "DCLoad"),
-        ("DCBranch", "DCBranch"),
-        ("DCBreak", "DCBreaker"),
-        ("DCDCConverter", "DCDCConver"),
-        ("DCACConverter", "DCACConver"),
-        ("ACACConverter", "ACACConver"),
-    ):
+    for table, source_table in _CONTINGENCY_TABLES:
         block = book.data.get(table)
         if block is None or "run_stat" not in block.header_list:
             continue
@@ -330,6 +363,26 @@ def _contingency_rows(model_file: str | Path) -> Iterable[tuple[str, str, int, s
             if int(_as_float(row.get("run_stat", 1), 1)) == 1:
                 idx = _as_idx(row.get("idx"))
                 yield table, source_table, idx, str(row.get("name", idx))
+
+
+def _contingency_entries_from_rows(efile_rows: dict):
+    for table, source_table in _CONTINGENCY_TABLES:
+        block = efile_rows.get(table)
+        if not block:
+            continue
+        header = block.get("header_list") or []
+        if "run_stat" not in header:
+            continue
+        run_stat_col = header.index("run_stat")
+        idx_col = header.index("idx") if "idx" in header else None
+        name_col = header.index("name") if "name" in header else None
+        for row in block.get("rows") or ():
+            raw_stat = row[run_stat_col] if run_stat_col < len(row) else 1
+            if int(_as_float(raw_stat, 1)) == 1:
+                raw_idx = row[idx_col] if (idx_col is not None and idx_col < len(row)) else None
+                idx = _as_idx(raw_idx)
+                raw_name = row[name_col] if (name_col is not None and name_col < len(row)) else idx
+                yield table, source_table, idx, str(raw_name), row, run_stat_col
 
 
 def _write_outage_case(src_file: str | Path, dst_file: str | Path, table: str, idx: int) -> None:
@@ -427,7 +480,19 @@ def run_hybrid_ca(
     n1_risks: list[CARisk] = []
     n1_scan_count = 0
 
-    base_result, base_error = _run_case(model_file)
+    try:
+        lf_params = load_lf_parameters()
+    except Exception:
+        lf_params = None
+
+    model_path = Path(model_file)
+    use_in_memory_rows = model_path.suffix.lower() not in {".m", ".mat"}
+    efile_rows = _read_efile_rows(model_file) if use_in_memory_rows else None
+
+    if use_in_memory_rows:
+        base_result, base_error = _run_case_from_rows(model_file, efile_rows, parameters=lf_params)
+    else:
+        base_result, base_error = _run_case(model_file, parameters=lf_params)
     if base_error is not None or base_result is None or not base_result.converged:
         detail = str(base_error) if base_error is not None else "hybrid_power_flow_not_converged"
         _add_risk(n0_risks, "BASE", "HybridPowerFlow", "潮流发散", 1, detail.replace(" ", "_"))
@@ -448,14 +513,18 @@ def run_hybrid_ca(
     base_load = _active_load_power(base_result)
 
     if scan_n1:
-        with tempfile.TemporaryDirectory(prefix="hybrid_ca_") as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            for table, source_table, idx, display_name in _contingency_rows(model_file):
+        if use_in_memory_rows:
+            for _table, source_table, _idx, display_name, row, run_stat_col in _contingency_entries_from_rows(
+                efile_rows
+            ):
                 n1_scan_count += 1
                 source = f"N-1:{source_table}.{display_name}"
-                outage_file = tmp_path / f"{table}_{idx}.e"
-                _write_outage_case(model_file, outage_file, table, idx)
-                result, error = _run_case(outage_file)
+                old_stat = row[run_stat_col]
+                row[run_stat_col] = "0"
+                try:
+                    result, error = _run_case_from_rows(model_file, efile_rows, parameters=lf_params)
+                finally:
+                    row[run_stat_col] = old_stat
                 if error is not None or result is None or not result.converged:
                     detail = str(error) if error is not None else "hybrid_power_flow_not_converged"
                     _add_risk(n1_risks, source, "HybridPowerFlow", "潮流发散", 1, detail.replace(" ", "_"))
@@ -471,6 +540,30 @@ def run_hybrid_ca(
                         load_loss,
                         f"loss={_fmt(load_loss)};base_load={_fmt(base_load)}",
                     )
+        else:
+            with tempfile.TemporaryDirectory(prefix="hybrid_ca_") as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                for table, source_table, idx, display_name in _contingency_rows(model_file):
+                    n1_scan_count += 1
+                    source = f"N-1:{source_table}.{display_name}"
+                    outage_file = tmp_path / f"{table}_{idx}.e"
+                    _write_outage_case(model_file, outage_file, table, idx)
+                    result, error = _run_case(outage_file, parameters=lf_params)
+                    if error is not None or result is None or not result.converged:
+                        detail = str(error) if error is not None else "hybrid_power_flow_not_converged"
+                        _add_risk(n1_risks, source, "HybridPowerFlow", "潮流发散", 1, detail.replace(" ", "_"))
+                        continue
+                    n1_risks.extend(collect_limit_risks(result, constraints, source))
+                    load_loss = max(0.0, base_load - _active_load_power(result))
+                    if load_loss > 1e-6:
+                        _add_risk(
+                            n1_risks,
+                            source,
+                            "Load",
+                            "负荷损失",
+                            load_loss,
+                            f"loss={_fmt(load_loss)};base_load={_fmt(base_load)}",
+                        )
 
     write_risk_result(n0_risks, n0_result_file)
     write_risk_result(n1_risks, n1_result_file)

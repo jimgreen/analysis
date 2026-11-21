@@ -206,13 +206,8 @@ def _read_efile_rows(file_path):
     block_name = None
     header = None
     rows = None
+    rows_append = None
     split_data_row = _split_data_row
-
-    def append_data_row(text):
-        if "'" not in text:
-            rows.append(text.split())
-        else:
-            rows.append(split_data_row(text))
 
     def finish_block():
         if block_name is None:
@@ -231,35 +226,49 @@ def _read_efile_rows(file_path):
         }
 
     with open(file_path, mode="rt", encoding="utf8") as fp:
-        for idx, raw_line in enumerate(fp):
-            first = raw_line[0] if raw_line else ""
-            if first == "#":
-                if block_name is None:
-                    raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
-                append_data_row(raw_line[1:])
-                continue
-            line = raw_line.strip()
-            if not line:
-                continue
-            first = line[0]
-            if first == "<":
-                if line.startswith("</"):
-                    finish_block()
-                    block_name = header = rows = None
-                    continue
-                block_name = line[1:-1]
-                header = []
-                rows = []
-            elif first == "@":
-                if block_name is None:
-                    raise SyntaxError(f"Header outside block at line {idx + 1} in {file_path}")
-                header = line[1:].split()
-            elif first == "#":
-                if block_name is None:
-                    raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
-                append_data_row(line[1:])
+        text = fp.read()
+
+    has_quotes = "'" in text
+    for idx, raw_line in enumerate(text.splitlines()):
+        if not raw_line:
+            continue
+        first = raw_line[0]
+        if first == "#":
+            if block_name is None:
+                raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
+            if not has_quotes:
+                if len(raw_line) > 1 and raw_line[1] <= " ":
+                    rows_append(raw_line.split()[1:])
+                else:
+                    rows_append(raw_line[1:].split())
             else:
-                raise SyntaxError(f"Invalid row at line {idx + 1} {line} in {file_path}")
+                body = raw_line[1:]
+                rows_append(body.split() if "'" not in body else split_data_row(body))
+            continue
+        line = raw_line.strip()
+        if not line:
+            continue
+        first = line[0]
+        if first == "<":
+            if line.startswith("</"):
+                finish_block()
+                block_name = header = rows = rows_append = None
+                continue
+            block_name = line[1:-1]
+            header = []
+            rows = []
+            rows_append = rows.append
+        elif first == "@":
+            if block_name is None:
+                raise SyntaxError(f"Header outside block at line {idx + 1} in {file_path}")
+            header = line[1:].split()
+        elif first == "#":
+            if block_name is None:
+                raise SyntaxError(f"Data row outside block at line {idx + 1} in {file_path}")
+            body = line[1:]
+            rows_append(body.split() if (not has_quotes or "'" not in body) else split_data_row(body))
+        else:
+            raise SyntaxError(f"Invalid row at line {idx + 1} {line} in {file_path}")
     return data
 
 

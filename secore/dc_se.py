@@ -5757,21 +5757,24 @@ class DCStateEstimator:
                 if profile_start is not None:
                     self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
                 return [], normalized_upper_bound
-        if result.H is None or result.gain is None:
-            result.H = self.jacobian_sparse(result.x, plan_tables)
-            result.gain, _ = build_normal_equations(
-                result.H,
-                result.residual,
-                weights,
-            )
         R_diag = 1.0 / weights
-        if self.profile_enabled:
-            gain_inverse_start = time.perf_counter()
+        if self.n_state > 5000 and (result.H is None or result.gain is None):
+            gain_inv = None
         else:
-            gain_inverse_start = None
-        gain_inv = inverse_gain_for_bad_data(result.gain)
-        if gain_inverse_start is not None:
-            self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
+            if result.H is None or result.gain is None:
+                result.H = self.jacobian_sparse(result.x, plan_tables)
+                result.gain, _ = build_normal_equations(
+                    result.H,
+                    result.residual,
+                    weights,
+                )
+            if self.profile_enabled:
+                gain_inverse_start = time.perf_counter()
+            else:
+                gain_inverse_start = None
+            gain_inv = inverse_gain_for_bad_data(result.gain)
+            if gain_inverse_start is not None:
+                self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
         if gain_inv is None:
             leverage = np.zeros_like(R_diag)
         else:

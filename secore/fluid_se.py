@@ -10,8 +10,7 @@ import sys
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix, diags
 from scipy.sparse.csgraph import structural_rank
-from scipy.sparse.linalg import MatrixRankWarning, spsolve
-import warnings
+from scipy.sparse.linalg import MatrixRankWarning
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -32,6 +31,7 @@ from model.meas_model import (
     measurement_table_from_measurements,
 )
 from model.meas_type import DEVICE_TYPE_CODES, MEAS_TYPE_CODES
+from secore.se_math import NormalEquationSolver
 from secore.se_result import SEResult
 
 
@@ -235,6 +235,8 @@ class FluidStateEstimator:
             key: np.asarray(rows, dtype=np.int64) for key, rows in groups.items()
         }
         self.active_measurements.table = measurement_table_from_measurements(self.active_measurements)
+        self._compiled_meas_plan_key = None
+        self._compiled_meas_plan = None
 
     def initial_state(self, flat_start: Optional[bool] = None) -> np.ndarray:
         if not self.prepared:
@@ -297,46 +299,103 @@ class FluidStateEstimator:
                 x[self.base_enthalpy :] = net.node_enthalpy
         return x
 
-    def _flow_state(self, x: np.ndarray):
+    def _flow_state_arrays(self, x: np.ndarray, *, need_derivative: bool = True):
         net = self.network
         potential = np.asarray(x[: self.n_potential], dtype=np.float64)
         flow = net.edge_flow_set.copy()
-        rows = []
-        cols = []
-        data = []
-        for edge_pos in net.passive_edge_pos.tolist():
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            delta = float(potential[i] - potential[j])
-            conductance = float(net.edge_conductance[edge_pos])
-            flow[edge_pos] = conductance * np.sign(delta) * np.sqrt(abs(delta))
-            derivative = 0.5 * conductance / np.sqrt(max(abs(delta), 1e-10))
-            rows.extend((edge_pos, edge_pos))
-            cols.extend((i, j))
-            data.extend((derivative, -derivative))
-        for edge_pos in net.regulated_edge_pos.tolist():
-            state_pos = int(self.regulated_state_by_edge[edge_pos])
-            flow[edge_pos] = x[state_pos]
-            rows.append(edge_pos)
-            cols.append(state_pos)
-            data.append(1.0)
-        derivative = coo_matrix(
-            (np.asarray(data, dtype=np.float64), (np.asarray(rows), np.asarray(cols))),
+        passive = net.passive_edge_pos
+        passive_deriv = None
+        if passive.size:
+            pi = net.edge_i[passive]
+            pj = net.edge_j[passive]
+            delta = potential[pi] - potential[pj]
+            abs_delta = np.abs(delta)
+            conductance = net.edge_conductance[passive]
+            flow[passive] = conductance * np.sign(delta) * np.sqrt(abs_delta)
+            if need_derivative:
+                passive_deriv = 0.5 * conductance / np.sqrt(np.maximum(abs_delta, 1e-10))
+        regulated = net.regulated_edge_pos
+        if regulated.size:
+            flow[regulated] = x[self.regulated_state_by_edge[regulated]]
+        return potential, flow, passive_deriv
+
+    def _build_flow_derivative_csr(self, passive_deriv: Optional[np.ndarray]) -> csr_matrix:
+        net = self.network
+        row_parts = []
+        col_parts = []
+        data_parts = []
+        passive = net.passive_edge_pos
+        if passive.size and passive_deriv is not None:
+            p_rows = np.concatenate((passive, passive)).astype(np.int32, copy=False)
+            p_cols = np.concatenate((net.edge_i[passive], net.edge_j[passive])).astype(np.int32, copy=False)
+            p_data = np.concatenate((passive_deriv, -passive_deriv))
+            row_parts.append(p_rows)
+            col_parts.append(p_cols)
+            data_parts.append(p_data)
+        regulated = net.regulated_edge_pos
+        if regulated.size:
+            row_parts.append(regulated.astype(np.int32, copy=False))
+            col_parts.append(self.regulated_state_by_edge[regulated].astype(np.int32, copy=False))
+            data_parts.append(np.ones(regulated.size, dtype=np.float64))
+        if not row_parts:
+            return csr_matrix((len(net.edges), self.state_count), dtype=np.float64)
+        return coo_matrix(
+            (np.concatenate(data_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
             shape=(len(net.edges), self.state_count),
         ).tocsr()
+
+    def _flow_state(self, x: np.ndarray):
+        potential, flow, passive_deriv = self._flow_state_arrays(x, need_derivative=True)
+        derivative = self._build_flow_derivative_csr(passive_deriv)
         return potential, flow, derivative
+
+    def _non_group_pressure_source_nodes(self):
+        net = self.network
+        cached = getattr(self, "_cached_non_group_pressure_sources", None)
+        if cached is not None and cached[0] == id(net):
+            return cached[1]
+        mask = np.asarray(net.source_is_pressure_controlled, dtype=bool)
+        if net.thermal and mask.size:
+            mask = mask & ~np.asarray(net.source_explicit_return, dtype=bool)
+        positions = np.flatnonzero(mask)
+        groups = []
+        if positions.size:
+            by_node = defaultdict(list)
+            for pos in positions.tolist():
+                by_node[int(net.source_node_pos[pos])].append(pos)
+            for node_pos in sorted(by_node.keys()):
+                groups.append((node_pos, np.asarray(by_node[node_pos], dtype=np.int64)))
+        self._cached_non_group_pressure_sources = (id(net), groups)
+        return groups
 
     def _source_flow_and_derivative(
         self,
         x: np.ndarray,
         flow: np.ndarray,
-        flow_derivative: csr_matrix,
+        flow_derivative: Optional[csr_matrix],
+        *,
+        need_derivative: bool = True,
     ):
         net = self.network
         source_flow = net.source_flow_set.copy()
-        source_derivatives = [csr_matrix((1, self.state_count), dtype=np.float64) for _ in net.sources]
+        non_group_nodes = self._non_group_pressure_source_nodes()
+        has_pressure_sources = bool(net.pressure_source_groups) or bool(non_group_nodes)
+        if not has_pressure_sources:
+            if not need_derivative:
+                return source_flow, None
+            return source_flow, [csr_matrix((1, self.state_count), dtype=np.float64) for _ in net.sources]
+
+        source_derivatives = (
+            [csr_matrix((1, self.state_count), dtype=np.float64) for _ in net.sources]
+            if need_derivative
+            else None
+        )
         node_edge_balance = np.asarray(net.incidence @ flow, dtype=np.float64)
-        node_target_derivative = -(net.incidence @ flow_derivative).tocsr()
+        node_target_derivative = (
+            -(net.incidence @ flow_derivative).tocsr()
+            if (need_derivative and flow_derivative is not None)
+            else None
+        )
         for source_positions in net.pressure_source_groups:
             node_pos = int(net.source_supply_node_pos[source_positions[0]])
             target = float(
@@ -352,29 +411,20 @@ class FluidStateEstimator:
                 alpha=net.source_alpha[source_positions],
             )
             source_flow[source_positions] = allocated
-            step = max(1e-7, abs(target) * 1e-7)
-            allocated_plus = allocate_limited_residual(
-                net.source_flow_set[source_positions],
-                target + step,
-                lower=net.source_flow_min[source_positions],
-                upper=net.source_flow_max[source_positions],
-                alpha=net.source_alpha[source_positions],
-            )
-            shares = (allocated_plus - allocated) / step
-            target_row = node_target_derivative.getrow(node_pos)
-            for local, source_pos in enumerate(source_positions.tolist()):
-                source_derivatives[source_pos] = target_row * float(shares[local])
-        for node_pos in range(len(net.nodes)):
-            positions = np.flatnonzero(net.source_node_pos == node_pos)
-            pressure_positions = positions[
-                net.source_is_pressure_controlled[positions]
-            ]
-            if net.thermal and pressure_positions.size:
-                pressure_positions = pressure_positions[
-                    ~net.source_explicit_return[pressure_positions]
-                ]
-            if pressure_positions.size == 0:
-                continue
+            if need_derivative and node_target_derivative is not None:
+                step = max(1e-7, abs(target) * 1e-7)
+                allocated_plus = allocate_limited_residual(
+                    net.source_flow_set[source_positions],
+                    target + step,
+                    lower=net.source_flow_min[source_positions],
+                    upper=net.source_flow_max[source_positions],
+                    alpha=net.source_alpha[source_positions],
+                )
+                shares = (allocated_plus - allocated) / step
+                target_row = node_target_derivative.getrow(node_pos)
+                for local, source_pos in enumerate(source_positions.tolist()):
+                    source_derivatives[source_pos] = target_row * float(shares[local])
+        for node_pos, pressure_positions in non_group_nodes:
             target = float(net.demand[node_pos] - node_edge_balance[node_pos] - net.fixed_injection[node_pos])
             allocated = allocate_limited_residual(
                 net.source_flow_set[pressure_positions],
@@ -384,27 +434,145 @@ class FluidStateEstimator:
                 alpha=net.source_alpha[pressure_positions],
             )
             source_flow[pressure_positions] = allocated
-            step = max(1e-7, abs(target) * 1e-7)
-            allocated_plus = allocate_limited_residual(
-                net.source_flow_set[pressure_positions],
-                target + step,
-                lower=net.source_flow_min[pressure_positions],
-                upper=net.source_flow_max[pressure_positions],
-                alpha=net.source_alpha[pressure_positions],
-            )
-            shares = (allocated_plus - allocated) / step
-            target_row = node_target_derivative.getrow(node_pos)
-            for local, source_pos in enumerate(pressure_positions.tolist()):
-                source_derivatives[source_pos] = target_row * float(shares[local])
+            if need_derivative and node_target_derivative is not None:
+                step = max(1e-7, abs(target) * 1e-7)
+                allocated_plus = allocate_limited_residual(
+                    net.source_flow_set[pressure_positions],
+                    target + step,
+                    lower=net.source_flow_min[pressure_positions],
+                    upper=net.source_flow_max[pressure_positions],
+                    alpha=net.source_alpha[pressure_positions],
+                )
+                shares = (allocated_plus - allocated) / step
+                target_row = node_target_derivative.getrow(node_pos)
+                for local, source_pos in enumerate(pressure_positions.tolist()):
+                    source_derivatives[source_pos] = target_row * float(shares[local])
         return source_flow, source_derivatives
+
+    def _get_compiled_meas_plan(self, active: Sequence[Measurement]):
+        use_cache = active is self.active_measurements
+        if use_cache:
+            key = (id(active), len(active), id(self.network))
+            if getattr(self, "_compiled_meas_plan_key", None) == key and getattr(self, "_compiled_meas_plan", None) is not None:
+                return self._compiled_meas_plan
+        net = self.network
+        node_type = f"{net.prefix}Node"
+        edge_types = {f"{net.prefix}Pipe", f"{net.prefix}Valve", self._controller_device_type()}
+        source_types = self._source_device_types()
+
+        passive_lookup = np.full(len(net.edges), -1, dtype=np.int64)
+        if net.passive_edge_pos.size:
+            passive_lookup[net.passive_edge_pos] = np.arange(net.passive_edge_pos.size, dtype=np.int64)
+
+        node_p_rows, node_p_pos = [], []
+        edge_flow_rows, edge_flow_pos, edge_flow_sign = [], [], []
+        edge_flow_passive_rows, edge_flow_passive_idx, edge_flow_passive_i, edge_flow_passive_j, edge_flow_passive_sign = [], [], [], [], []
+        edge_flow_reg_rows, edge_flow_reg_col, edge_flow_reg_sign = [], [], []
+        edge_pf_rows, edge_pf_node = [], []
+        edge_pt_rows, edge_pt_node = [], []
+        fallback_items = []
+        has_source_meas = False
+        fallback_needs_flow_deriv = False
+
+        for row, measurement in enumerate(active):
+            device_type = str(measurement.device_type)
+            meas_type = str(measurement.meas_type)
+            pos = int(measurement.device_pos)
+            if device_type == node_type and meas_type == "PRESSURE":
+                node_p_rows.append(row)
+                node_p_pos.append(pos)
+            elif device_type in edge_types:
+                if meas_type in ("FLOW", "FLOW_FROM", "FLOW_TO"):
+                    sign = -1.0 if meas_type == "FLOW_TO" else 1.0
+                    edge_flow_rows.append(row)
+                    edge_flow_pos.append(pos)
+                    edge_flow_sign.append(sign)
+                    p_idx = int(passive_lookup[pos])
+                    if p_idx >= 0:
+                        edge_flow_passive_rows.append(row)
+                        edge_flow_passive_idx.append(p_idx)
+                        edge_flow_passive_i.append(int(net.edge_i[pos]))
+                        edge_flow_passive_j.append(int(net.edge_j[pos]))
+                        edge_flow_passive_sign.append(sign)
+                    else:
+                        reg_col = int(self.regulated_state_by_edge[pos])
+                        if reg_col >= 0:
+                            edge_flow_reg_rows.append(row)
+                            edge_flow_reg_col.append(reg_col)
+                            edge_flow_reg_sign.append(sign)
+                elif meas_type == "PRESSURE_FROM":
+                    edge_pf_rows.append(row)
+                    edge_pf_node.append(int(net.edge_i[pos]))
+                elif meas_type == "PRESSURE_TO":
+                    edge_pt_rows.append(row)
+                    edge_pt_node.append(int(net.edge_j[pos]))
+                else:
+                    fallback_items.append((row, measurement))
+                    fallback_needs_flow_deriv = True
+            else:
+                if device_type in source_types:
+                    has_source_meas = True
+                    fallback_needs_flow_deriv = True
+                fallback_items.append((row, measurement))
+
+        plan = {
+            "node_p_rows": np.asarray(node_p_rows, dtype=np.int64),
+            "node_p_pos": np.asarray(node_p_pos, dtype=np.int64),
+            "edge_flow_rows": np.asarray(edge_flow_rows, dtype=np.int64),
+            "edge_flow_pos": np.asarray(edge_flow_pos, dtype=np.int64),
+            "edge_flow_sign": np.asarray(edge_flow_sign, dtype=np.float64),
+            "edge_flow_passive_rows": np.asarray(edge_flow_passive_rows, dtype=np.int32),
+            "edge_flow_passive_idx": np.asarray(edge_flow_passive_idx, dtype=np.int64),
+            "edge_flow_passive_i": np.asarray(edge_flow_passive_i, dtype=np.int32),
+            "edge_flow_passive_j": np.asarray(edge_flow_passive_j, dtype=np.int32),
+            "edge_flow_passive_sign": np.asarray(edge_flow_passive_sign, dtype=np.float64),
+            "edge_flow_reg_rows": np.asarray(edge_flow_reg_rows, dtype=np.int32),
+            "edge_flow_reg_col": np.asarray(edge_flow_reg_col, dtype=np.int32),
+            "edge_flow_reg_sign": np.asarray(edge_flow_reg_sign, dtype=np.float64),
+            "edge_pf_rows": np.asarray(edge_pf_rows, dtype=np.int64),
+            "edge_pf_node": np.asarray(edge_pf_node, dtype=np.int64),
+            "edge_pt_rows": np.asarray(edge_pt_rows, dtype=np.int64),
+            "edge_pt_node": np.asarray(edge_pt_node, dtype=np.int64),
+            "fallback_items": fallback_items,
+            "has_source_meas": has_source_meas,
+            "fallback_needs_flow_deriv": fallback_needs_flow_deriv,
+        }
+        if use_cache:
+            self._compiled_meas_plan_key = (id(active), len(active), id(self.network))
+            self._compiled_meas_plan = plan
+        return plan
 
     def evaluate(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
         if not self.prepared:
             self.prepare()
         active = self.active_measurements if measurements is None else measurements
-        potential, flow, flow_derivative = self._flow_state(x)
-        source_flow, _ = self._source_flow_and_derivative(x, flow, flow_derivative)
+        plan = self._get_compiled_meas_plan(active)
+        potential, flow, _ = self._flow_state_arrays(x, need_derivative=False)
         pressure = np.maximum(potential, 1e-12) ** (1.0 / self.network.potential_power)
+        values = np.empty(len(active), dtype=np.float64)
+
+        node_p_rows = plan["node_p_rows"]
+        if node_p_rows.size:
+            values[node_p_rows] = pressure[plan["node_p_pos"]]
+        edge_flow_rows = plan["edge_flow_rows"]
+        if edge_flow_rows.size:
+            values[edge_flow_rows] = flow[plan["edge_flow_pos"]] * plan["edge_flow_sign"]
+        edge_pf_rows = plan["edge_pf_rows"]
+        if edge_pf_rows.size:
+            values[edge_pf_rows] = pressure[plan["edge_pf_node"]]
+        edge_pt_rows = plan["edge_pt_rows"]
+        if edge_pt_rows.size:
+            values[edge_pt_rows] = pressure[plan["edge_pt_node"]]
+
+        fallback_items = plan["fallback_items"]
+        if not fallback_items:
+            return values
+
+        source_flow = (
+            self._source_flow_and_derivative(x, flow, None, need_derivative=False)[0]
+            if plan["has_source_meas"]
+            else self.network.source_flow_set
+        )
         if self.network.thermal:
             temperature_state = x[self.base_temperature : self.base_enthalpy]
             supply = temperature_state[
@@ -419,9 +587,8 @@ class FluidStateEstimator:
         exchanger_values = self._heat_exchanger_state(x) if self.network.thermal else None
         enthalpy = x[self.base_enthalpy :] if self.network.steam else None
         steam_temperature = self._steam_temperature(enthalpy) if enthalpy is not None else None
-        values = np.empty(len(active), dtype=np.float64)
         net = self.network
-        for row, measurement in enumerate(active):
+        for row, measurement in fallback_items:
             device_type = str(measurement.device_type)
             meas_type = str(measurement.meas_type)
             pos = int(measurement.device_pos)
@@ -627,11 +794,73 @@ class FluidStateEstimator:
 
     def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> csr_matrix:
         active = self.active_measurements if measurements is None else measurements
-        potential, flow, flow_derivative = self._flow_state(x)
-        source_flow, source_derivatives = self._source_flow_and_derivative(
-            x, flow, flow_derivative
-        )
+        plan = self._get_compiled_meas_plan(active)
         net = self.network
+        potential, flow, passive_deriv = self._flow_state_arrays(x, need_derivative=True)
+        pressure_derivative = (1.0 / net.potential_power) * np.maximum(potential, 1e-12) ** (
+            1.0 / net.potential_power - 1.0
+        )
+
+        row_parts = []
+        col_parts = []
+        data_parts = []
+
+        node_p_rows = plan["node_p_rows"]
+        if node_p_rows.size:
+            node_p_pos = plan["node_p_pos"]
+            row_parts.append(node_p_rows.astype(np.int32, copy=False))
+            col_parts.append(node_p_pos.astype(np.int32, copy=False))
+            data_parts.append(pressure_derivative[node_p_pos])
+
+        efp_rows = plan["edge_flow_passive_rows"]
+        if efp_rows.size and passive_deriv is not None:
+            dvals = passive_deriv[plan["edge_flow_passive_idx"]] * plan["edge_flow_passive_sign"]
+            row_parts.append(efp_rows)
+            col_parts.append(plan["edge_flow_passive_i"])
+            data_parts.append(dvals)
+            row_parts.append(efp_rows)
+            col_parts.append(plan["edge_flow_passive_j"])
+            data_parts.append(-dvals)
+
+        efr_rows = plan["edge_flow_reg_rows"]
+        if efr_rows.size:
+            row_parts.append(efr_rows)
+            col_parts.append(plan["edge_flow_reg_col"])
+            data_parts.append(plan["edge_flow_reg_sign"])
+
+        edge_pf_rows = plan["edge_pf_rows"]
+        if edge_pf_rows.size:
+            edge_pf_node = plan["edge_pf_node"]
+            row_parts.append(edge_pf_rows.astype(np.int32, copy=False))
+            col_parts.append(edge_pf_node.astype(np.int32, copy=False))
+            data_parts.append(pressure_derivative[edge_pf_node])
+
+        edge_pt_rows = plan["edge_pt_rows"]
+        if edge_pt_rows.size:
+            edge_pt_node = plan["edge_pt_node"]
+            row_parts.append(edge_pt_rows.astype(np.int32, copy=False))
+            col_parts.append(edge_pt_node.astype(np.int32, copy=False))
+            data_parts.append(pressure_derivative[edge_pt_node])
+
+        fallback_items = plan["fallback_items"]
+        if not fallback_items:
+            if not row_parts:
+                return csr_matrix((len(active), self.state_count), dtype=np.float64)
+            return coo_matrix(
+                (np.concatenate(data_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
+                shape=(len(active), self.state_count),
+            ).tocsr()
+
+        flow_derivative = (
+            self._build_flow_derivative_csr(passive_deriv)
+            if plan["fallback_needs_flow_deriv"]
+            else None
+        )
+        source_flow, source_derivatives = (
+            self._source_flow_and_derivative(x, flow, flow_derivative, need_derivative=True)
+            if plan["has_source_meas"]
+            else (net.source_flow_set, None)
+        )
         rows = []
         cols = []
         data = []
@@ -645,10 +874,7 @@ class FluidStateEstimator:
                 cols.extend(sparse_row.indices[start:stop].tolist())
                 data.extend((sparse_row.data[start:stop] * scale).tolist())
 
-        pressure_derivative = (1.0 / net.potential_power) * np.maximum(potential, 1e-12) ** (
-            1.0 / net.potential_power - 1.0
-        )
-        for row, measurement in enumerate(active):
+        for row, measurement in fallback_items:
             device_type = str(measurement.device_type)
             meas_type = str(measurement.meas_type)
             pos = int(measurement.device_pos)
@@ -965,8 +1191,14 @@ class FluidStateEstimator:
                     rows.extend((row, row))
                     cols.extend((ts_i, tr_j))
                     data.extend((scale, 1.0 - scale))
+        if rows:
+            row_parts.append(np.asarray(rows, dtype=np.int32))
+            col_parts.append(np.asarray(cols, dtype=np.int32))
+            data_parts.append(np.asarray(data, dtype=np.float64))
+        if not row_parts:
+            return csr_matrix((len(active), self.state_count), dtype=np.float64)
         return coo_matrix(
-            (np.asarray(data, dtype=np.float64), (np.asarray(rows), np.asarray(cols))),
+            (np.concatenate(data_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
             shape=(len(active), self.state_count),
         ).tocsr()
 
@@ -1110,18 +1342,28 @@ class FluidStateEstimator:
         H = csr_matrix((len(z), self.state_count), dtype=np.float64)
         gain = csr_matrix((self.state_count, self.state_count), dtype=np.float64)
         minimum = 1e-12
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=True)
+        cached_z_est = None
+        cached_residual = None
+        cached_objective = None
+        evaluated_at_final_x = False
         for iteration in range(1, self.max_iter + 1):
-            z_est = self.evaluate(x)
-            residual = z - z_est
-            objective = float(np.dot(weight, residual * residual))
+            if cached_z_est is not None:
+                z_est = cached_z_est
+                residual = cached_residual
+                objective = cached_objective
+                cached_z_est = cached_residual = cached_objective = None
+            else:
+                z_est = self.evaluate(x)
+                residual = z - z_est
+                objective = float(np.dot(weight, residual * residual))
             H = self.jacobian_sparse(x)
             weighted_H = diags(weight) @ H
             gain = (H.T @ weighted_H).tocsc()
             rhs = H.T @ (weight * residual)
             try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("error", MatrixRankWarning)
-                    dx = np.asarray(spsolve(gain, rhs, use_umfpack=False), dtype=np.float64)
+                dx, _ = normal_solver.solve(gain, rhs, return_factor_diag=False)
+                dx = np.asarray(dx, dtype=np.float64)
             except (MatrixRankWarning, RuntimeError, ValueError):
                 break
             if not np.all(np.isfinite(dx)):
@@ -1134,28 +1376,43 @@ class FluidStateEstimator:
                 )
             if max_correction < self.tol:
                 converged = True
+                evaluated_at_final_x = True
                 break
             accepted = False
             step = 1.0
             for _ in range(20):
                 candidate = x + step * dx
                 candidate[: self.n_potential] = np.maximum(candidate[: self.n_potential], minimum)
-                candidate_residual = z - self.evaluate(candidate)
+                candidate_z_est = self.evaluate(candidate)
+                candidate_residual = z - candidate_z_est
                 candidate_objective = float(np.dot(weight, candidate_residual * candidate_residual))
                 if np.isfinite(candidate_objective) and candidate_objective <= objective + 1e-14:
                     x = candidate
+                    cached_z_est = candidate_z_est
+                    cached_residual = candidate_residual
+                    cached_objective = candidate_objective
                     accepted = True
                     break
                 step *= 0.5
             if not accepted:
+                evaluated_at_final_x = True
                 break
-        z_est = self.evaluate(x)
-        residual = z - z_est
-        objective = float(np.dot(weight, residual * residual))
-        if max_correction < self.tol:
-            converged = True
-        H = self.jacobian_sparse(x)
-        gain = (H.T @ (diags(weight) @ H)).tocsr()
+        if not evaluated_at_final_x:
+            if cached_z_est is not None:
+                z_est = cached_z_est
+                residual = cached_residual
+                objective = cached_objective
+            else:
+                z_est = self.evaluate(x)
+                residual = z - z_est
+                objective = float(np.dot(weight, residual * residual))
+            if max_correction < self.tol:
+                converged = True
+            H = self.jacobian_sparse(x)
+            gain = (H.T @ (diags(weight) @ H)).tocsr()
+        else:
+            if gain is None or getattr(gain, "format", None) != "csr":
+                gain = (H.T @ (diags(weight) @ H)).tocsr()
         result = EstimateResult(
             converged=bool(converged and obs.observable),
             iterations=int(iteration),

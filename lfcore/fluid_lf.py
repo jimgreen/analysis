@@ -21,6 +21,11 @@ for path in (ROOT_DIR, MODEL_DIR):
         sys.path.insert(0, str(path))
 
 from algorithm_parameters import DEFAULT_LF_PARAMETER_FILE, PowerFlowParameters, load_lf_parameters
+from lfcore._sparse_pattern import (
+    apply_raw_sum_plan,
+    build_compressed_pattern_from_raw_coords,
+    build_raw_sum_plan,
+)
 from lfcore.common import allocate_limited_residual, normalize_result_mode
 from model.fluid_model import (
     GAIN_CONTROL,
@@ -113,6 +118,8 @@ class FluidPowerFlowCalc:
         self.hydraulic_presolve: Dict[str, object] = {}
         self.excluded_device_keys: set[tuple[str, int]] = set()
         self.thermal_zero_flow_edge_pos = np.empty(0, dtype=np.int64)
+        self._hydraulic_jac_plan_key = None
+        self._hydraulic_jac_plan = None
 
     def _transport_flow_tolerance(self) -> float:
         return THERMAL_ZERO_FLOW_TOLERANCE if self.network.thermal else 1.0e-12
@@ -641,6 +648,157 @@ class FluidPowerFlowCalc:
                 )
         return potential, edge_flow, derivative
 
+    def _get_hydraulic_jac_plan(self, net, n_balance: int, n_reg: int, residual_size: int):
+        key = (id(net), int(n_balance), int(n_reg), int(residual_size), int(self.hydraulic_state_count))
+        if self._hydraulic_jac_plan_key == key and self._hydraulic_jac_plan is not None:
+            return self._hydraulic_jac_plan
+
+        row_parts = []
+        col_parts = []
+
+        passive = net.passive_edge_pos
+        if passive.size:
+            pi = net.edge_i[passive]
+            pj = net.edge_j[passive]
+            i_row = net.balance_row_by_node[pi]
+            j_row = net.balance_row_by_node[pj]
+            di = net.free_state_by_node[pi]
+            dj = net.free_state_by_node[pj]
+
+            m1 = (i_row >= 0) & (di >= 0)
+            m2 = (i_row >= 0) & (dj >= 0)
+            m3 = (j_row >= 0) & (dj >= 0)
+            m4 = (j_row >= 0) & (di >= 0)
+
+            p_rows = np.concatenate((i_row[m1], i_row[m2], j_row[m3], j_row[m4])).astype(np.int32, copy=False)
+            p_cols = np.concatenate((di[m1], dj[m2], dj[m3], di[m4])).astype(np.int32, copy=False)
+            p_edges = np.concatenate((passive[m1], passive[m2], passive[m3], passive[m4])).astype(np.intp, copy=False)
+            p_signs = np.concatenate(
+                (
+                    np.full(int(np.count_nonzero(m1)), -1.0, dtype=np.float64),
+                    np.full(int(np.count_nonzero(m2)), 1.0, dtype=np.float64),
+                    np.full(int(np.count_nonzero(m3)), -1.0, dtype=np.float64),
+                    np.full(int(np.count_nonzero(m4)), 1.0, dtype=np.float64),
+                )
+            )
+            row_parts.append(p_rows)
+            col_parts.append(p_cols)
+        else:
+            p_edges = np.empty(0, dtype=np.intp)
+            p_signs = np.empty(0, dtype=np.float64)
+        n_passive_entries = int(p_edges.size)
+
+        static_rows = []
+        static_cols = []
+        static_vals = []
+        for edge_pos in net.regulated_edge_pos.tolist():
+            state_col = int(net.regulated_state_by_edge[edge_pos])
+            i = int(net.edge_i[edge_pos])
+            j = int(net.edge_j[edge_pos])
+            i_row_s = int(net.balance_row_by_node[i])
+            j_row_s = int(net.balance_row_by_node[j])
+            if i_row_s >= 0:
+                static_rows.append(i_row_s)
+                static_cols.append(state_col)
+                static_vals.append(-1.0)
+            if j_row_s >= 0:
+                static_rows.append(j_row_s)
+                static_cols.append(state_col)
+                static_vals.append(1.0)
+
+        for local_pos, edge_pos in enumerate(net.regulated_edge_pos.tolist()):
+            row = n_balance + local_pos
+            i = int(net.edge_i[edge_pos])
+            j = int(net.edge_j[edge_pos])
+            i_col = int(net.free_state_by_node[i])
+            j_col = int(net.free_state_by_node[j])
+            control = str(net.edge_control_type[edge_pos])
+            if control == RATIO_CONTROL:
+                ratio2 = float(net.edge_ratio[edge_pos] ** net.potential_power)
+                if i_col >= 0:
+                    static_rows.append(row)
+                    static_cols.append(i_col)
+                    static_vals.append(-ratio2)
+                if j_col >= 0:
+                    static_rows.append(row)
+                    static_cols.append(j_col)
+                    static_vals.append(1.0)
+            elif control == GAIN_CONTROL:
+                if i_col >= 0:
+                    static_rows.append(row)
+                    static_cols.append(i_col)
+                    static_vals.append(-1.0)
+                if j_col >= 0:
+                    static_rows.append(row)
+                    static_cols.append(j_col)
+                    static_vals.append(1.0)
+            else:
+                static_rows.append(row)
+                static_cols.append(int(net.regulated_state_by_edge[edge_pos]))
+                static_vals.append(1.0)
+
+        if static_rows:
+            row_parts.append(np.asarray(static_rows, dtype=np.int32))
+            col_parts.append(np.asarray(static_cols, dtype=np.int32))
+        static_vals_arr = np.asarray(static_vals, dtype=np.float64)
+        n_static_entries = int(static_vals_arr.size)
+
+        group_rows = []
+        group_cols = []
+        group_meta = []
+        for group_pos, source_positions in enumerate(net.pressure_source_groups):
+            state_col = self.base_pressure_source_group_flow + group_pos
+            for local_pos, source_pos in enumerate(source_positions.tolist()):
+                supply_row = int(net.balance_row_by_node[net.source_supply_node_pos[source_pos]])
+                return_row = int(net.balance_row_by_node[net.source_return_node_pos[source_pos]])
+                if supply_row >= 0:
+                    group_rows.append(supply_row)
+                    group_cols.append(state_col)
+                    group_meta.append((group_pos, local_pos, 1.0))
+                if return_row >= 0:
+                    group_rows.append(return_row)
+                    group_cols.append(state_col)
+                    group_meta.append((group_pos, local_pos, -1.0))
+
+        if group_rows:
+            row_parts.append(np.asarray(group_rows, dtype=np.int32))
+            col_parts.append(np.asarray(group_cols, dtype=np.int32))
+
+        if row_parts:
+            all_rows = np.concatenate(row_parts)
+            all_cols = np.concatenate(col_parts)
+        else:
+            all_rows = np.empty(0, dtype=np.int32)
+            all_cols = np.empty(0, dtype=np.int32)
+
+        # CSC format: major = col, minor = row
+        indices, indptr, raw_to_pos = build_compressed_pattern_from_raw_coords(
+            all_cols,
+            all_rows,
+            self.hydraulic_state_count,
+        )
+        sum_plan = build_raw_sum_plan(raw_to_pos, int(indices.size))
+        raw_buf = np.zeros(int(all_rows.size), dtype=np.float64)
+        if n_static_entries:
+            raw_buf[n_passive_entries : n_passive_entries + n_static_entries] = static_vals_arr
+        jac_data = np.zeros(int(indices.size), dtype=np.float64)
+
+        plan = {
+            "p_edges": p_edges,
+            "p_signs": p_signs,
+            "n_passive": n_passive_entries,
+            "group_offset": n_passive_entries + n_static_entries,
+            "group_meta": group_meta,
+            "indices": indices,
+            "indptr": indptr,
+            "sum_plan": sum_plan,
+            "raw_buf": raw_buf,
+            "jac_data": jac_data,
+        }
+        self._hydraulic_jac_plan_key = key
+        self._hydraulic_jac_plan = plan
+        return plan
+
     def _hydraulic_residual_and_jacobian(
         self,
         x: np.ndarray,
@@ -675,122 +833,41 @@ class FluidPowerFlowCalc:
         residual = np.empty(n_balance + n_reg, dtype=np.float64)
         residual[:n_balance] = node_balance[net.balance_node_pos]
 
-        for local_pos, edge_pos in enumerate(net.regulated_edge_pos.tolist()):
-            row = n_balance + local_pos
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            control = str(net.edge_control_type[edge_pos])
-            if control == RATIO_CONTROL:
-                ratio2 = float(net.edge_ratio[edge_pos] ** net.potential_power)
-                residual[row] = potential[j] - ratio2 * potential[i]
-            elif control == GAIN_CONTROL:
-                residual[row] = potential[j] - potential[i] - net.edge_pressure_gain[edge_pos]
-            else:
-                residual[row] = edge_flow[edge_pos] - net.edge_flow_set[edge_pos]
+        if n_reg:
+            for local_pos, edge_pos in enumerate(net.regulated_edge_pos.tolist()):
+                row = n_balance + local_pos
+                i = int(net.edge_i[edge_pos])
+                j = int(net.edge_j[edge_pos])
+                control = str(net.edge_control_type[edge_pos])
+                if control == RATIO_CONTROL:
+                    ratio2 = float(net.edge_ratio[edge_pos] ** net.potential_power)
+                    residual[row] = potential[j] - ratio2 * potential[i]
+                elif control == GAIN_CONTROL:
+                    residual[row] = potential[j] - potential[i] - net.edge_pressure_gain[edge_pos]
+                else:
+                    residual[row] = edge_flow[edge_pos] - net.edge_flow_set[edge_pos]
 
         if not return_jacobian:
             return residual, None, potential, edge_flow
 
-        rows = []
-        cols = []
-        data = []
-        for edge_pos in net.passive_edge_pos.tolist():
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            i_row = int(net.balance_row_by_node[i])
-            j_row = int(net.balance_row_by_node[j])
-            di = int(net.free_state_by_node[i])
-            dj = int(net.free_state_by_node[j])
-            value = float(derivative[edge_pos])
-            if i_row >= 0:
-                if di >= 0:
-                    rows.append(i_row)
-                    cols.append(di)
-                    data.append(-value)
-                if dj >= 0:
-                    rows.append(i_row)
-                    cols.append(dj)
-                    data.append(value)
-            if j_row >= 0:
-                if dj >= 0:
-                    rows.append(j_row)
-                    cols.append(dj)
-                    data.append(-value)
-                if di >= 0:
-                    rows.append(j_row)
-                    cols.append(di)
-                    data.append(value)
-
-        for edge_pos in net.regulated_edge_pos.tolist():
-            state_col = int(net.regulated_state_by_edge[edge_pos])
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            i_row = int(net.balance_row_by_node[i])
-            j_row = int(net.balance_row_by_node[j])
-            if i_row >= 0:
-                rows.append(i_row)
-                cols.append(state_col)
-                data.append(-1.0)
-            if j_row >= 0:
-                rows.append(j_row)
-                cols.append(state_col)
-                data.append(1.0)
-
-        for group_pos, source_positions in enumerate(net.pressure_source_groups):
-            state_col = self.base_pressure_source_group_flow + group_pos
-            shares = source_group_shares[group_pos]
-            for local_pos, source_pos in enumerate(source_positions.tolist()):
-                share = float(shares[local_pos])
-                supply_row = int(
-                    net.balance_row_by_node[net.source_supply_node_pos[source_pos]]
-                )
-                return_row = int(
-                    net.balance_row_by_node[net.source_return_node_pos[source_pos]]
-                )
-                if supply_row >= 0:
-                    rows.append(supply_row)
-                    cols.append(state_col)
-                    data.append(share)
-                if return_row >= 0:
-                    rows.append(return_row)
-                    cols.append(state_col)
-                    data.append(-share)
-
-        for local_pos, edge_pos in enumerate(net.regulated_edge_pos.tolist()):
-            row = n_balance + local_pos
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            i_col = int(net.free_state_by_node[i])
-            j_col = int(net.free_state_by_node[j])
-            control = str(net.edge_control_type[edge_pos])
-            if control == RATIO_CONTROL:
-                ratio2 = float(net.edge_ratio[edge_pos] ** net.potential_power)
-                if i_col >= 0:
-                    rows.append(row)
-                    cols.append(i_col)
-                    data.append(-ratio2)
-                if j_col >= 0:
-                    rows.append(row)
-                    cols.append(j_col)
-                    data.append(1.0)
-            elif control == GAIN_CONTROL:
-                if i_col >= 0:
-                    rows.append(row)
-                    cols.append(i_col)
-                    data.append(-1.0)
-                if j_col >= 0:
-                    rows.append(row)
-                    cols.append(j_col)
-                    data.append(1.0)
-            else:
-                rows.append(row)
-                cols.append(int(net.regulated_state_by_edge[edge_pos]))
-                data.append(1.0)
-
-        jacobian = coo_matrix(
-            (np.asarray(data, dtype=np.float64), (np.asarray(rows), np.asarray(cols))),
+        plan = self._get_hydraulic_jac_plan(net, n_balance, n_reg, residual.size)
+        raw_buf = plan["raw_buf"]
+        n_passive = plan["n_passive"]
+        if n_passive:
+            np.multiply(plan["p_signs"], derivative[plan["p_edges"]], out=raw_buf[:n_passive])
+        group_meta = plan["group_meta"]
+        if group_meta:
+            offset = plan["group_offset"]
+            for k, (group_pos, local_pos, sign) in enumerate(group_meta):
+                raw_buf[offset + k] = sign * float(source_group_shares[group_pos][local_pos])
+        jac_data = plan["jac_data"]
+        apply_raw_sum_plan(jac_data, raw_buf, plan["sum_plan"])
+        jacobian = csc_matrix(
+            (jac_data.copy(), plan["indices"], plan["indptr"]),
             shape=(residual.size, self.hydraulic_state_count),
-        ).tocsc()
+            copy=False,
+        )
+        jacobian.has_sorted_indices = True
         return residual, jacobian, potential, edge_flow
 
     def _explicit_pressure_source_flows(
@@ -827,32 +904,36 @@ class FluidPowerFlowCalc:
     def _edge_flow_jacobian(self, potential: np.ndarray) -> csr_matrix:
         """Return d(edge_flow)/d(hydraulic_state) for the prepared topology."""
         net = self.network
-        rows = []
-        cols = []
-        data = []
-        for edge_pos in net.passive_edge_pos.tolist():
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            delta = float(potential[i] - potential[j])
-            derivative = 0.5 * float(net.edge_conductance[edge_pos]) / np.sqrt(
-                max(abs(delta), 1e-10)
-            )
-            i_col = int(net.free_state_by_node[i])
-            j_col = int(net.free_state_by_node[j])
-            if i_col >= 0:
-                rows.append(edge_pos)
-                cols.append(i_col)
-                data.append(derivative)
-            if j_col >= 0:
-                rows.append(edge_pos)
-                cols.append(j_col)
-                data.append(-derivative)
-        for edge_pos in net.regulated_edge_pos.tolist():
-            rows.append(edge_pos)
-            cols.append(int(net.regulated_state_by_edge[edge_pos]))
-            data.append(1.0)
+        row_parts = []
+        col_parts = []
+        data_parts = []
+        passive = net.passive_edge_pos
+        if passive.size:
+            pi = net.edge_i[passive]
+            pj = net.edge_j[passive]
+            delta = potential[pi] - potential[pj]
+            deriv = 0.5 * net.edge_conductance[passive] / np.sqrt(np.maximum(np.abs(delta), 1e-10))
+            i_col = net.free_state_by_node[pi]
+            j_col = net.free_state_by_node[pj]
+            mi = i_col >= 0
+            mj = j_col >= 0
+            if np.any(mi):
+                row_parts.append(passive[mi].astype(np.int32, copy=False))
+                col_parts.append(i_col[mi].astype(np.int32, copy=False))
+                data_parts.append(deriv[mi])
+            if np.any(mj):
+                row_parts.append(passive[mj].astype(np.int32, copy=False))
+                col_parts.append(j_col[mj].astype(np.int32, copy=False))
+                data_parts.append(-deriv[mj])
+        regulated = net.regulated_edge_pos
+        if regulated.size:
+            row_parts.append(regulated.astype(np.int32, copy=False))
+            col_parts.append(net.regulated_state_by_edge[regulated].astype(np.int32, copy=False))
+            data_parts.append(np.ones(regulated.size, dtype=np.float64))
+        if not row_parts:
+            return csr_matrix((len(net.edges), self.hydraulic_state_count), dtype=np.float64)
         return coo_matrix(
-            (np.asarray(data, dtype=np.float64), (np.asarray(rows), np.asarray(cols))),
+            (np.concatenate(data_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
             shape=(len(net.edges), self.hydraulic_state_count),
         ).tocsr()
 
@@ -1633,8 +1714,13 @@ class FluidPowerFlowCalc:
         self.iterations = 0
         x = self.x.copy()
         minimum = self._minimum_potential()
+        cached_residual = None
         for iteration in range(1, self.max_iter + 1):
-            residual, jacobian, potential, edge_flow = self._residual_and_jacobian(x)
+            if cached_residual is not None:
+                residual = cached_residual
+                cached_residual = None
+            else:
+                residual, _, _, _ = self._residual_and_jacobian(x, return_jacobian=False)
             self.iterations = iteration
             self.normF = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if self.verbose:
@@ -1642,10 +1728,11 @@ class FluidPowerFlowCalc:
             if self.normF < self.tol:
                 self.converged = True
                 break
+            residual, jacobian, _potential, _edge_flow = self._residual_and_jacobian(x, return_jacobian=True)
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("error", MatrixRankWarning)
-                    correction = spsolve(csc_matrix(jacobian), -residual)
+                    correction = spsolve(jacobian if jacobian.format == "csc" else csc_matrix(jacobian), -residual)
             except (MatrixRankWarning, RuntimeError, ValueError) as exc:
                 self.failure_reason = str(exc)
                 break
@@ -1670,6 +1757,7 @@ class FluidPowerFlowCalc:
                 )
                 if np.isfinite(candidate_norm) and candidate_norm < self.normF:
                     x = candidate
+                    cached_residual = candidate_residual
                     accepted = True
                     break
                 step *= 0.5
@@ -1677,13 +1765,15 @@ class FluidPowerFlowCalc:
                 self.failure_reason = "line search could not reduce the residual"
                 break
 
-        residual, _, _potential, _edge_flow = self._residual_and_jacobian(
-            x,
-            return_jacobian=False,
-        )
-        self.normF = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-        if self.normF < self.tol:
-            self.converged = True
+        if not self.converged:
+            residual = (
+                cached_residual
+                if cached_residual is not None
+                else self._residual_and_jacobian(x, return_jacobian=False)[0]
+            )
+            self.normF = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+            if self.normF < self.tol:
+                self.converged = True
         self.commit_state(
             x,
             converged=self.converged,

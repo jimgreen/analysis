@@ -101,79 +101,193 @@ def simulate_primary_frequency_response(
     diesel_units, storage_units = _normalize_units(diesel, storage, diesels, storages)
     _validate_inputs(system, diesel_units, storage_units, disturbance, duration_s, dt_s)
     steps = int(round(duration_s / dt_s))
-    f_hz = system.f_nom_hz
-    diesel_powers = [0.0 for _ in diesel_units]
-    storage_powers = [0.0 for _ in storage_units]
+    n_points = steps + 1
+    f_nom = system.f_nom_hz
+    f_hz = f_nom
+    damping = system.damping_mw_per_hz
+    dfdt_scale = f_nom / (2.0 * system.inertia_s * system.s_base_mw)
+    dist_start = disturbance.start_s
+    dist_end = disturbance.end_s
+    dist_deficit = disturbance.deficit_mw
+    dt_h = dt_s / 3600.0
+
+    n_diesel = len(diesel_units)
+    n_storage = len(storage_units)
+    diesel_powers = [0.0] * n_diesel
+    storage_powers = [0.0] * n_storage
     storage_socs = [unit.initial_soc for unit in storage_units]
     previous_dfdt = 0.0
     diesel_names = _unit_names(diesel_units, "diesel")
     storage_names = _unit_names(storage_units, "bess")
 
-    time_s: list[float] = []
-    frequency_hz: list[float] = []
-    delta_frequency_hz: list[float] = []
-    diesel_power_mw: list[float] = []
-    storage_power_mw: list[float] = []
-    storage_soc_values: list[float] = []
-    power_deficit_mw: list[float] = []
-    diesel_units_power_mw: list[list[float]] = [[] for _ in diesel_units]
-    storage_units_power_mw: list[list[float]] = [[] for _ in storage_units]
-    storage_units_soc: list[list[float]] = [[] for _ in storage_units]
+    time_s: list[float] = [0.0] * n_points
+    frequency_hz: list[float] = [0.0] * n_points
+    delta_frequency_hz: list[float] = [0.0] * n_points
+    diesel_power_mw: list[float] = [0.0] * n_points
+    storage_power_mw: list[float] = [0.0] * n_points
+    storage_soc_values: list[float] = [0.0] * n_points
+    power_deficit_mw: list[float] = [0.0] * n_points
+    diesel_units_power_mw: list[list[float]] = [[0.0] * n_points for _ in range(n_diesel)]
+    storage_units_power_mw: list[list[float]] = [[0.0] * n_points for _ in range(n_storage)]
+    storage_units_soc: list[list[float]] = [[0.0] * n_points for _ in range(n_storage)]
 
-    for idx in range(steps + 1):
+    # Pre-extract per-unit constants and output buffers to avoid attribute lookups and helper calls in the hot loop.
+    diesel_specs = [
+        (
+            u_idx,
+            unit.reserve_mw,
+            unit.droop_mw_per_hz,
+            dt_s / unit.time_constant_s,
+            unit.ramp_mw_per_s * dt_s,
+            unit.deadband_hz,
+            diesel_units_power_mw[u_idx],
+        )
+        for u_idx, unit in enumerate(diesel_units)
+    ]
+    storage_specs = [
+        (
+            u_idx,
+            unit.discharge_limit_mw,
+            -unit.charge_limit_mw,
+            unit.droop_mw_per_hz,
+            unit.inertia_mw_s_per_hz,
+            1.0 if dt_s >= unit.response_time_s else dt_s / unit.response_time_s,
+            unit.energy_mwh,
+            unit.energy_mwh / dt_h,
+            dt_h / unit.energy_mwh,
+            unit.min_soc,
+            unit.max_soc,
+            unit.deadband_hz,
+            storage_units_power_mw[u_idx],
+            storage_units_soc[u_idx],
+        )
+        for u_idx, unit in enumerate(storage_units)
+    ]
+
+    total_storage_energy = sum(unit.energy_mwh for unit in storage_units)
+    inv_total_storage_energy = (1.0 / total_storage_energy) if total_storage_energy > 0.0 else 0.0
+
+    diesel_total = 0.0
+    storage_total = 0.0
+    weighted_storage_soc = (
+        sum(soc * unit.energy_mwh for soc, unit in zip(storage_socs, storage_units)) * inv_total_storage_energy
+        if n_storage
+        else 0.0
+    )
+
+    for idx in range(n_points):
         t_s = round(idx * dt_s, 12)
-        deficit = _disturbance_power(disturbance, t_s)
-        diesel_total = sum(diesel_powers)
-        storage_total = sum(storage_powers)
-        weighted_storage_soc = _weighted_storage_soc(storage_socs, storage_units)
+        if t_s < dist_start or (dist_end is not None and t_s >= dist_end):
+            deficit = 0.0
+        else:
+            deficit = dist_deficit
 
-        time_s.append(t_s)
-        frequency_hz.append(f_hz)
-        delta_frequency_hz.append(f_hz - system.f_nom_hz)
-        diesel_power_mw.append(diesel_total)
-        storage_power_mw.append(storage_total)
-        storage_soc_values.append(weighted_storage_soc)
-        power_deficit_mw.append(deficit)
-        for unit_idx, power in enumerate(diesel_powers):
-            diesel_units_power_mw[unit_idx].append(power)
-        for unit_idx, power in enumerate(storage_powers):
-            storage_units_power_mw[unit_idx].append(power)
-            storage_units_soc[unit_idx].append(storage_socs[unit_idx])
+        delta_f = f_hz - f_nom
+        time_s[idx] = t_s
+        frequency_hz[idx] = f_hz
+        delta_frequency_hz[idx] = delta_f
+        diesel_power_mw[idx] = diesel_total
+        storage_power_mw[idx] = storage_total
+        storage_soc_values[idx] = weighted_storage_soc
+        power_deficit_mw[idx] = deficit
+
+        for u_idx in range(n_diesel):
+            diesel_units_power_mw[u_idx][idx] = diesel_powers[u_idx]
+        for u_idx in range(n_storage):
+            storage_units_power_mw[u_idx][idx] = storage_powers[u_idx]
+            storage_units_soc[u_idx][idx] = storage_socs[u_idx]
 
         if idx == steps:
             break
 
-        delta_f = f_hz - system.f_nom_hz
+        abs_df = -delta_f if delta_f < 0.0 else delta_f
 
-        for unit_idx, unit in enumerate(diesel_units):
-            diesel_ref = _clamp(
-                -unit.droop_mw_per_hz * _apply_deadband(delta_f, unit.deadband_hz),
-                0.0,
-                unit.reserve_mw,
-            )
-            diesel_target_delta = (diesel_ref - diesel_powers[unit_idx]) / unit.time_constant_s * dt_s
-            diesel_delta = _clamp(
-                diesel_target_delta,
-                -unit.ramp_mw_per_s * dt_s,
-                unit.ramp_mw_per_s * dt_s,
-            )
-            diesel_powers[unit_idx] = _clamp(diesel_powers[unit_idx] + diesel_delta, 0.0, unit.reserve_mw)
+        new_diesel_total = 0.0
+        for u_idx, reserve, droop, dt_over_tau, max_step, deadband, _out_p in diesel_specs:
+            if abs_df <= deadband:
+                eff_df = 0.0
+            elif delta_f > 0.0:
+                eff_df = delta_f - deadband
+            else:
+                eff_df = delta_f + deadband
+            ref = -droop * eff_df
+            if ref < 0.0:
+                ref = 0.0
+            elif ref > reserve:
+                ref = reserve
+            cur_p = diesel_powers[u_idx]
+            step_p = (ref - cur_p) * dt_over_tau
+            if step_p < -max_step:
+                step_p = -max_step
+            elif step_p > max_step:
+                step_p = max_step
+            new_p = cur_p + step_p
+            if new_p < 0.0:
+                new_p = 0.0
+            elif new_p > reserve:
+                new_p = reserve
+            diesel_powers[u_idx] = new_p
+            new_diesel_total += new_p
+        diesel_total = new_diesel_total
 
-        for unit_idx, unit in enumerate(storage_units):
-            storage_ref = (
-                -unit.droop_mw_per_hz * _apply_deadband(delta_f, unit.deadband_hz)
-                - unit.inertia_mw_s_per_hz * previous_dfdt
-            )
-            response_alpha = min(1.0, dt_s / unit.response_time_s)
-            storage_power = storage_powers[unit_idx] + (storage_ref - storage_powers[unit_idx]) * response_alpha
-            storage_power = _clamp(storage_power, -unit.charge_limit_mw, unit.discharge_limit_mw)
-            storage_power = _apply_storage_energy_limits(storage_power, storage_socs[unit_idx], unit, dt_s)
-            storage_powers[unit_idx] = storage_power
-            storage_socs[unit_idx] = storage_socs[unit_idx] - storage_power * dt_s / 3600.0 / unit.energy_mwh
-            storage_socs[unit_idx] = _clamp(storage_socs[unit_idx], unit.min_soc, unit.max_soc)
+        new_storage_total = 0.0
+        weighted_soc_num = 0.0
+        for (
+            u_idx,
+            discharge_lim,
+            neg_charge_lim,
+            droop,
+            inertia_coeff,
+            alpha,
+            energy_mwh,
+            energy_over_dt_h,
+            dt_h_over_energy,
+            min_soc,
+            max_soc,
+            deadband,
+            _out_p,
+            _out_s,
+        ) in storage_specs:
+            if abs_df <= deadband:
+                eff_df = 0.0
+            elif delta_f > 0.0:
+                eff_df = delta_f - deadband
+            else:
+                eff_df = delta_f + deadband
+            ref = -droop * eff_df - inertia_coeff * previous_dfdt
+            cur_p = storage_powers[u_idx]
+            p = cur_p + (ref - cur_p) * alpha
+            if p < neg_charge_lim:
+                p = neg_charge_lim
+            elif p > discharge_lim:
+                p = discharge_lim
+            soc = storage_socs[u_idx]
+            if p > 0.0:
+                max_dis = (soc - min_soc) * energy_over_dt_h
+                if max_dis < 0.0:
+                    max_dis = 0.0
+                if p > max_dis:
+                    p = max_dis
+            elif p < 0.0:
+                max_chg = (max_soc - soc) * energy_over_dt_h
+                if max_chg < 0.0:
+                    max_chg = 0.0
+                if p < -max_chg:
+                    p = -max_chg
+            storage_powers[u_idx] = p
+            soc = soc - p * dt_h_over_energy
+            if soc < min_soc:
+                soc = min_soc
+            elif soc > max_soc:
+                soc = max_soc
+            storage_socs[u_idx] = soc
+            new_storage_total += p
+            weighted_soc_num += soc * energy_mwh
+        storage_total = new_storage_total
+        weighted_storage_soc = weighted_soc_num * inv_total_storage_energy
 
-        power_balance = sum(diesel_powers) + sum(storage_powers) - deficit - system.damping_mw_per_hz * delta_f
-        previous_dfdt = system.f_nom_hz / (2.0 * system.inertia_s * system.s_base_mw) * power_balance
+        power_balance = diesel_total + storage_total - deficit - damping * delta_f
+        previous_dfdt = dfdt_scale * power_balance
         f_hz = f_hz + previous_dfdt * dt_s
 
     return FrequencyResponseResult(

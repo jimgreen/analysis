@@ -497,6 +497,116 @@ def _grow_measurement_arrays(arrays: Tuple[np.ndarray, ...], new_size: int) -> T
     return tuple(grown)
 
 
+def _try_parse_meas_ppc_bulk_bytes(source: Path, *, include_matrix: bool = True) -> Optional[Dict]:
+    """Fast bulk-token parser for standard unquoted <Measurement> blocks.
+
+    Returns ``None`` to fall back to the line-by-line parser whenever the file
+    contains quotes, a status column, blank/comment lines inside the block,
+    missing headers, or ragged row widths.
+    """
+    try:
+        raw = source.read_bytes()
+    except OSError:
+        return None
+    if b"'" in raw:
+        return None
+    start_tag = raw.find(b"<Measurement>")
+    if start_tag < 0:
+        return None
+    end_tag = raw.find(b"</Measurement>", start_tag + 13)
+    if end_tag < 0:
+        return None
+    body = raw[start_tag + 13 : end_tag]
+    at_pos = body.find(b"@")
+    if at_pos < 0:
+        return None
+    header_end = body.find(b"\n", at_pos)
+    if header_end < 0:
+        return None
+    header = tuple(body[at_pos + 1 : header_end].split())
+    if not header:
+        return None
+    header_index = {name: idx for idx, name in enumerate(header)}
+    if any(name not in header_index for name in _REQUIRED_COLUMNS_BYTES):
+        return None
+    if b"status" in header_index:
+        return None
+    data_bytes = body[header_end + 1 :].strip()
+    if not data_bytes:
+        return _empty_meas_ppc(source, include_matrix=include_matrix)
+    if b"\n\n" in data_bytes or b"\r\n\r\n" in data_bytes or b"//" in data_bytes:
+        return None
+    n_rows = data_bytes.count(b"\n") + 1
+    ncols = len(header) + 1
+    tokens = data_bytes.split()
+    if len(tokens) != n_rows * ncols:
+        return None
+    # Verify every row starts with '#'
+    if set(tokens[0::ncols]) != {b"#"}:
+        return None
+
+    idx_pos = header_index[b"idx"] + 1
+    dev_type_pos = header_index[b"dev_type"] + 1
+    dev_name_pos = header_index[b"dev_name"] + 1
+    meas_type_pos = header_index[b"meas_type"] + 1
+    weight_pos = header_index[b"weight"] + 1
+    valid_pos = header_index[b"valid"] + 1
+    value_pos = header_index[b"value"] + 1
+
+    try:
+        idx_array = np.fromiter(map(int, tokens[idx_pos::ncols]), dtype=np.int64, count=n_rows)
+        weight_values = np.fromiter(map(float, tokens[weight_pos::ncols]), dtype=np.float64, count=n_rows)
+        value_values = np.fromiter(map(float, tokens[value_pos::ncols]), dtype=np.float64, count=n_rows)
+    except ValueError:
+        return None
+
+    valid_values = np.fromiter(map(b"1".__eq__, tokens[valid_pos::ncols]), dtype=bool, count=n_rows)
+    status_values = np.where(valid_values, MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID).astype(np.int16, copy=False)
+
+    dev_get = _DEVICE_TYPE_CODES_BYTES.get
+    dev_toks = tokens[dev_type_pos::ncols]
+    dev_map = {tok: dev_get(tok, 0) for tok in dict.fromkeys(dev_toks)}
+    device_type_code_array = np.fromiter(map(dev_map.__getitem__, dev_toks), dtype=np.int16, count=n_rows)
+
+    meas_get = _MEAS_TYPE_CODES_BYTES.get
+    meas_toks = tokens[meas_type_pos::ncols]
+    meas_map = {tok: meas_get(tok, meas_get(tok.upper(), 0)) for tok in dict.fromkeys(meas_toks)}
+    meas_type_code_array = np.fromiter(map(meas_map.__getitem__, meas_toks), dtype=np.int16, count=n_rows)
+
+    name_toks = tokens[dev_name_pos::ncols]
+    unique_name_bytes = dict.fromkeys(name_toks)
+    name_to_id = {tok: i for i, tok in enumerate(unique_name_bytes)}
+    device_name_id = np.fromiter(map(name_to_id.__getitem__, name_toks), dtype=np.int32, count=n_rows)
+    intern = sys.intern
+    device_names_list = [intern(tok.decode("utf8")) for tok in unique_name_bytes]
+
+    rows_by_code = {
+        int(code): np.flatnonzero(device_type_code_array == int(code)).astype(np.int64, copy=False)
+        for code in np.unique(device_type_code_array)
+    }
+    device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
+    return _build_ppc(
+        source=source,
+        idx=idx_array,
+        name=None,
+        device_type=None,
+        device_name=None,
+        meas_type=None,
+        weight=weight_values,
+        valid=valid_values,
+        value=value_values,
+        status=status_values,
+        include_strings=False,
+        rows_by_device_type_code=rows_by_code,
+        device_type_code=device_type_code_array,
+        meas_type_code=meas_type_code_array,
+        device_name_id=device_name_id,
+        device_names=np.asarray(device_names_list, dtype=object),
+        device_name_id_by_name=device_name_id_by_name,
+        include_matrix=include_matrix,
+    )
+
+
 def _build_meas_ppc_from_measurement_file_array_only(
     source: Path,
     *,
@@ -508,6 +618,9 @@ def _build_meas_ppc_from_measurement_file_array_only(
     NumPy scalar write for every row. Batches bound temporary Python objects;
     no parsed network, measurement result, or previous solve is reused here.
     """
+    bulk_result = _try_parse_meas_ppc_bulk_bytes(source, include_matrix=include_matrix)
+    if bulk_result is not None:
+        return bulk_result
     header = ()
     idx_col = device_type_col = device_name_col = meas_type_col = -1
     weight_col = valid_col = value_col = -1

@@ -864,14 +864,7 @@ def _build_lf_network_from_hybrid_rows(file_name, rows) -> _LightweightHybridNet
     return network
 
 
-def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
-    path = Path(file_name)
-    if path.suffix.lower() in {".m", ".mat"}:
-        ac_ppc = build_ac_ppc_from_mat_file(path)
-        ac_ppc["source"] = str(path.resolve())
-        return _build_lf_network_from_single_ac_ppc(path, ensure_ac_ppc_topology(ac_ppc))
-
-    efile_rows = _read_efile_rows(file_name)
+def _read_lf_network_from_efile_rows(file_name, efile_rows) -> HybridPowerNetwork:
     file_kind = _detect_lf_rows_kind(efile_rows)
     if file_kind == "ac":
         network = _build_lf_network_from_single_ac_file(file_name, efile_rows)
@@ -901,6 +894,17 @@ def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
         else MultiEnergyContext(source=Path(file_name))
     )
     return attach_multi_energy_context(network, context)
+
+
+def _read_lf_network_from_file(file_name) -> HybridPowerNetwork:
+    path = Path(file_name)
+    if path.suffix.lower() in {".m", ".mat"}:
+        ac_ppc = build_ac_ppc_from_mat_file(path)
+        ac_ppc["source"] = str(path.resolve())
+        return _build_lf_network_from_single_ac_ppc(path, ensure_ac_ppc_topology(ac_ppc))
+
+    efile_rows = _read_efile_rows(file_name)
+    return _read_lf_network_from_efile_rows(file_name, efile_rows)
 
 
 @dataclass
@@ -4309,7 +4313,10 @@ class HybridPowerFlowCalc:
             return candidate
 
         for it in range(self.max_iter):
-            F, J = self._build_newton_system(x)
+            if it == 0:
+                F, J = self._build_newton_system(x)
+            else:
+                F, J = self._build_newton_system(x, return_jacobian=False)
             self.iterations = it + 1
             self.normF = np.linalg.norm(F, np.inf)
             merit_norm = float(np.linalg.norm(F))
@@ -4356,6 +4363,9 @@ class HybridPowerFlowCalc:
                 self.x = x
                 self._write_back()
                 return 0
+
+            if J is None:
+                _, J = self._build_newton_system(x, return_jacobian=True)
 
             try:
                 if reusable_factorizer is None:

@@ -20,6 +20,27 @@ def build_compressed_pattern_from_raw_coords(raw_major, raw_minor, n_major: int)
             np.array([], dtype=np.intp),
         )
 
+    if raw_major.min() >= 0 and raw_minor.min() >= 0:
+        keys = (raw_major.astype(np.int64) << 32) | raw_minor.astype(np.int64)
+        order = np.argsort(keys, kind="quicksort")
+        sorted_keys = keys[order]
+
+        is_new = np.empty(raw_count, dtype=bool)
+        is_new[0] = True
+        is_new[1:] = sorted_keys[1:] != sorted_keys[:-1]
+        sorted_group = np.cumsum(is_new, dtype=np.intp) - 1
+        raw_to_pos = np.empty(raw_count, dtype=np.intp)
+        raw_to_pos[order] = sorted_group
+
+        unique_keys = sorted_keys[is_new]
+        indices = (unique_keys & np.int64(0xFFFFFFFF)).astype(np.int32)
+        unique_major = (unique_keys >> 32).astype(np.intp)
+        major_counts = np.bincount(unique_major, minlength=int(n_major))
+        indptr = np.empty(int(n_major) + 1, dtype=np.int32)
+        indptr[0] = 0
+        indptr[1:] = np.cumsum(major_counts, dtype=np.int64)
+        return indices, indptr, raw_to_pos
+
     order = np.lexsort((raw_minor, raw_major))
     sorted_major = raw_major[order]
     sorted_minor = raw_minor[order]

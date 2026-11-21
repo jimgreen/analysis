@@ -1,5 +1,6 @@
 from pathlib import Path
 import math
+import operator
 from typing import Dict, Tuple
 
 import numpy as np
@@ -63,6 +64,37 @@ class EFileTableRows:
         self._matrix = matrix if matrix.ndim == 2 else False
         return self._matrix
 
+    def float_column(self, col: int, default: float = 0.0) -> np.ndarray:
+        n = len(self.rows)
+        if col is None or n == 0:
+            return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+        try:
+            return np.fromiter(
+                map(float, map(operator.itemgetter(int(col)), self.rows)),
+                dtype=np.float64,
+                count=n,
+            )
+        except (IndexError, TypeError, ValueError):
+            return self.raw_column(col, default).astype(np.float64, copy=False)
+
+    def int_column(self, col: int, default: int = 0) -> np.ndarray:
+        n = len(self.rows)
+        if col is None or n == 0:
+            return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+        try:
+            return np.fromiter(
+                map(int, map(operator.itemgetter(int(col)), self.rows)),
+                dtype=np.float64,
+                count=n,
+            )
+        except (IndexError, TypeError, ValueError):
+            return (
+                self.raw_column(col, default)
+                .astype(np.float64, copy=False)
+                .astype(np.int64, copy=False)
+                .astype(np.float64)
+            )
+
     def raw_column(self, col, default="") -> np.ndarray:
         n = len(self.rows)
         if col is None or n == 0:
@@ -72,22 +104,19 @@ class EFileTableRows:
         if cached is not None:
             return cached
 
-        matrix = self._as_matrix()
-        if isinstance(matrix, np.ndarray) and col < matrix.shape[1]:
-            raw = matrix[:, int(col)]
-            missing = (raw == "") | (raw == None)
+        col_idx = int(col)
+        try:
+            values = np.array(list(map(operator.itemgetter(col_idx), self.rows)), dtype=object)
+            missing = (values == "") | (values == None)
             if np.any(missing):
-                values = raw.copy()
                 values[missing] = default
-            else:
-                values = raw
-        else:
+        except IndexError:
             values = np.empty(n, dtype=object)
             for i, row in enumerate(self.rows):
-                if col >= len(row):
+                if col_idx >= len(row):
                     values[i] = default
                 else:
-                    value = row[col]
+                    value = row[col_idx]
                     values[i] = default if value in (None, "") else value
         self._raw_cache[key] = values
         return values
@@ -178,6 +207,8 @@ def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.nd
     n = len(table_rows)
     if col is None or n == 0:
         return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    if hasattr(table_rows, "float_column"):
+        return table_rows.float_column(col, default)
     if hasattr(table_rows, "raw_column"):
         return table_rows.raw_column(col, default).astype(np.float64, copy=False)
     values = [None] * n
@@ -196,6 +227,8 @@ def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
     n = len(table_rows)
     if col is None or n == 0:
         return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    if hasattr(table_rows, "int_column"):
+        return table_rows.int_column(col, default)
     if hasattr(table_rows, "raw_column"):
         return (
             table_rows.raw_column(col, default)
@@ -292,7 +325,12 @@ def _base_from_rows(data: Dict) -> Tuple[float, float, float, float, float]:
 
 
 def _scale_by_node(node_values: np.ndarray, scales_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.asarray([scales_by_idx.get(int(node), 1.0) for node in node_values], dtype=np.float64)
+    nodes = np.asarray(node_values, dtype=np.int64)
+    n = int(nodes.size)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    getter = scales_by_idx.get
+    return np.fromiter((getter(node, 1.0) for node in nodes.tolist()), dtype=np.float64, count=n)
 
 
 def _current_scale_by_node(node_ids, voltage_bases, power_base_kW, i_scale, *, ac=False):
@@ -312,7 +350,12 @@ def _current_scale_by_node(node_ids, voltage_bases, power_base_kW, i_scale, *, a
 
 
 def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.asarray([raw_vbase_by_idx.get(int(node), 0.0) for node in node_values], dtype=np.float64)
+    nodes = np.asarray(node_values, dtype=np.int64)
+    n = int(nodes.size)
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    getter = raw_vbase_by_idx.get
+    return np.fromiter((getter(node, 0.0) for node in nodes.tolist()), dtype=np.float64, count=n)
 
 
 def _assign_power_if_present(out: np.ndarray, col: int, table_rows, columns, attr: str, p_base: float) -> None:

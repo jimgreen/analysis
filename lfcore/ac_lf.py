@@ -2968,8 +2968,10 @@ class ACPowerFlowCalc:
         for it in range(self.max_iter):
             self.iterations += 1
 
-            # 单轮内合并残差和 Jacobian 数值块计算，复用 YV/Sbus 等中间量。
-            F, J = self._build_newton_system(x)
+            # 先计算状态与残差并判收敛，未收敛再复用缓存组装 Jacobian，避免收敛轮多余构造 J。
+            theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+            dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
+            F = self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
             self.normF = np.linalg.norm(F, np.inf)
             if self.verbose:
                 print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
@@ -2982,6 +2984,16 @@ class ACPowerFlowCalc:
                 self.x = x
                 self._write_back()
                 return 0
+
+            J = self._get_jacobi_from_cached_state(
+                theta,
+                V,
+                phi_re,
+                phi_im,
+                Sbus=self._last_Sbus,
+                matrix_format="csc",
+                build_matrix=True,
+            )
 
             try:
                 if reusable_factorizer is None:

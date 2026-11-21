@@ -222,10 +222,11 @@ class SparseJacobianBuilder:
                 copy=False,
             )
             self._cached_duplicate_slots = slot[self._cached_duplicate_data_positions]
+            self._cached_duplicate_dest_slots = np.flatnonzero(counts > 1).astype(np.int64, copy=False)
         else:
             self._cached_duplicate_data_positions = np.array([], dtype=np.int64)
             self._cached_duplicate_slots = np.array([], dtype=np.int64)
-        self._cached_duplicate_dest_slots = np.unique(self._cached_duplicate_slots).astype(np.int64, copy=False)
+            self._cached_duplicate_dest_slots = np.array([], dtype=np.int64)
         self._cached_slots_cover_pattern = (
             self._cached_pattern_linear is not None
             and np.count_nonzero(counts) == int(self._cached_pattern_linear.size)
@@ -640,18 +641,49 @@ class SparseJacobianBuilder:
                     shape=self.shape,
                     copy=False,
                 )
+        n_rows = int(self.shape[0])
+        n_cols = int(self.shape[1])
+        if self._assume_fixed_pattern and rows.size > 0 and n_cols > 0:
+            linear = rows.astype(np.int64, copy=False) * np.int64(n_cols) + cols.astype(np.int64, copy=False)
+            order = np.argsort(linear, kind="quicksort")
+            sorted_linear = linear[order]
+            is_new = np.empty(rows.size, dtype=bool)
+            is_new[0] = True
+            is_new[1:] = sorted_linear[1:] != sorted_linear[:-1]
+            pattern_linear = sorted_linear[is_new]
+            slot = np.empty(rows.size, dtype=np.int64)
+            slot[order] = np.cumsum(is_new, dtype=np.int64) - 1
+            unique_rows = (pattern_linear // np.int64(n_cols)).astype(np.intp, copy=False)
+            indices = (pattern_linear - unique_rows.astype(np.int64, copy=False) * np.int64(n_cols)).astype(
+                np.int32,
+                copy=False,
+            )
+            indptr = np.empty(n_rows + 1, dtype=np.int32)
+            indptr[0] = 0
+            indptr[1:] = np.cumsum(np.bincount(unique_rows, minlength=n_rows), dtype=np.int64)
+            csr_data = np.bincount(slot, weights=data, minlength=indices.size)
+            csr = SP_CSR_MATRIX((csr_data, indices, indptr), shape=self.shape, copy=False)
+            csr.has_sorted_indices = True
+            self._cached_pattern_linear = pattern_linear
+            self._cached_pattern_indptr = indptr
+            self._cached_pattern_indices = indices
+            self._set_cached_slot_positions(slot)
+            self._cached_csr_data = csr_data
+            self._cached_csr_matrix = csr
+            self._data_only_refresh_enabled = True
+            return csr
+
         csr = SP_COO_MATRIX((data, (rows, cols)), shape=self.shape).tocsr(copy=False)
         indptr = csr.indptr.astype(np.int32, copy=True)
         indices = csr.indices.astype(np.int32, copy=True)
-        pattern_rows = np.repeat(np.arange(self.shape[0], dtype=np.int64), np.diff(indptr).astype(np.int64, copy=False))
-        pattern_linear = pattern_rows * np.int64(self.shape[1]) + indices.astype(np.int64, copy=False)
+        pattern_rows = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(indptr).astype(np.int64, copy=False))
+        pattern_linear = pattern_rows * np.int64(n_cols) + indices.astype(np.int64, copy=False)
         self._cached_pattern_linear = pattern_linear
         self._cached_pattern_indptr = indptr
         self._cached_pattern_indices = indices
         self._cached_csr_matrix = None
         if self._assume_fixed_pattern:
-            n_cols = int(self.shape[1])
-            linear = rows.astype(np.int64, copy=False) * n_cols + cols.astype(np.int64, copy=False)
+            linear = rows.astype(np.int64, copy=False) * np.int64(n_cols) + cols.astype(np.int64, copy=False)
             slot = np.searchsorted(pattern_linear, linear)
             if slot.size and int(slot.max()) < pattern_linear.size and np.array_equal(pattern_linear[slot], linear):
                 self._set_cached_slot_positions(slot)

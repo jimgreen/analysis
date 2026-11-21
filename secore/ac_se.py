@@ -7568,6 +7568,7 @@ class ACStateEstimator:
             "power_y_self_conj": np.conj(power_y_self),
             "power_y_mutual_conj": np.conj(power_y_mutual),
             "power_y_third_conj": np.conj(power_y_third),
+            "power_has_third": bool(np.any(power_y_third != 0.0)),
             "current_rows": current_rows,
             "current_own": current_own,
             "current_other": current_other,
@@ -7581,6 +7582,7 @@ class ACStateEstimator:
             "current_y_self": current_y_self,
             "current_y_mutual": current_y_mutual,
             "current_y_third": current_y_third,
+            "current_has_third": bool(np.any(current_y_third != 0.0)),
         }
 
     def _fill_branch_transformer_values_vectorized(
@@ -7599,30 +7601,26 @@ class ACStateEstimator:
         if rows.size:
             own = plan["power_own"]
             other = plan["power_other"]
-            third = plan["power_third"]
-            y_self = plan["power_y_self"]
-            y_mutual = plan["power_y_mutual"]
-            y_third = plan["power_y_third"]
-            power = voltage_complex[own] * np.conj(
-                y_self * voltage_complex[own]
-                + y_mutual * voltage_complex[other]
-                + y_third * voltage_complex[third]
+            v_own = voltage_complex[own]
+            current = (
+                plan["power_y_self"] * v_own
+                + plan["power_y_mutual"] * voltage_complex[other]
             )
+            if plan.get("power_has_third", True):
+                current = current + plan["power_y_third"] * voltage_complex[plan["power_third"]]
+            power = v_own * np.conj(current)
             values[rows] = np.where(plan["power_is_p"], power.real, power.imag)
 
         rows = plan["current_rows"]
         if rows.size:
             own = plan["current_own"]
             other = plan["current_other"]
-            third = plan["current_third"]
-            y_self = plan["current_y_self"]
-            y_mutual = plan["current_y_mutual"]
-            y_third = plan["current_y_third"]
             current = (
-                y_self * voltage_complex[own]
-                + y_mutual * voltage_complex[other]
-                + y_third * voltage_complex[third]
+                plan["current_y_self"] * voltage_complex[own]
+                + plan["current_y_mutual"] * voltage_complex[other]
             )
+            if plan.get("current_has_third", True):
+                current = current + plan["current_y_third"] * voltage_complex[plan["current_third"]]
             values[rows] = np.abs(current)
 
         return plan["handled_mask"]
@@ -8099,49 +8097,61 @@ class ACStateEstimator:
         if rows.size:
             own = plan["power_own"]
             other = plan["power_other"]
-            third = plan["power_third"]
             y_self_conj = plan["power_y_self_conj"]
             y_mutual_conj = plan["power_y_mutual_conj"]
-            y_third_conj = plan["power_y_third_conj"]
-            off_other = y_mutual_conj * voltage_complex[own] * np.conj(voltage_complex[other])
-            off_third = y_third_conj * voltage_complex[own] * np.conj(voltage_complex[third])
-            off = off_other + off_third
-            dtheta_own = 1j * off
-            dtheta_other = -1j * off_other
-            dtheta_third = -1j * off_third
-            dvoltage_own = 2.0 * y_self_conj * voltage[own] + off / voltage[own]
+            v_own = voltage_complex[own]
+            off_other = y_mutual_conj * v_own * np.conj(voltage_complex[other])
+            has_third = plan.get("power_has_third", True)
+            if has_third:
+                third = plan["power_third"]
+                off_third = plan["power_y_third_conj"] * v_own * np.conj(voltage_complex[third])
+                off = off_other + off_third
+            else:
+                off = off_other
+            v_own_mag = voltage[own]
+            dvoltage_own = 2.0 * y_self_conj * v_own_mag + off / v_own_mag
             dvoltage_other = off_other / voltage[other]
-            dvoltage_third = off_third / voltage[third]
             is_p = plan["power_is_p"]
 
             own_angle_cols = plan["power_own_angle_cols"]
             other_angle_cols = plan["power_other_angle_cols"]
-            third_angle_cols = plan["power_third_angle_cols"]
             own_voltage_cols = plan["power_own_voltage_cols"]
             other_voltage_cols = plan["power_other_voltage_cols"]
-            third_voltage_cols = plan["power_third_voltage_cols"]
-            values = (
-                np.where(is_p, dtheta_own.real, dtheta_own.imag),
-                np.where(is_p, dtheta_other.real, dtheta_other.imag),
-                np.where(is_p, dtheta_third.real, dtheta_third.imag),
-                np.where(is_p, dvoltage_own.real, dvoltage_own.imag),
-                np.where(is_p, dvoltage_other.real, dvoltage_other.imag),
-                np.where(is_p, dvoltage_third.real, dvoltage_third.imag),
-            )
-            if hasattr(H, "add_many"):
-                H.add_many(rows, own_angle_cols, values[0])
-                H.add_many(rows, other_angle_cols, values[1])
-                H.add_many(rows, third_angle_cols, values[2])
-                H.add_many(rows, own_voltage_cols, values[3])
-                H.add_many(rows, other_voltage_cols, values[4])
-                H.add_many(rows, third_voltage_cols, values[5])
+            v0 = np.where(is_p, -off.imag, off.real)
+            v1 = np.where(is_p, off_other.imag, -off_other.real)
+            v3 = np.where(is_p, dvoltage_own.real, dvoltage_own.imag)
+            v4 = np.where(is_p, dvoltage_other.real, dvoltage_other.imag)
+            if has_third:
+                dvoltage_third = off_third / voltage[third]
+                third_angle_cols = plan["power_third_angle_cols"]
+                third_voltage_cols = plan["power_third_voltage_cols"]
+                v2 = np.where(is_p, off_third.imag, -off_third.real)
+                v5 = np.where(is_p, dvoltage_third.real, dvoltage_third.imag)
+                if hasattr(H, "add_many"):
+                    H.add_many(rows, own_angle_cols, v0)
+                    H.add_many(rows, other_angle_cols, v1)
+                    H.add_many(rows, third_angle_cols, v2)
+                    H.add_many(rows, own_voltage_cols, v3)
+                    H.add_many(rows, other_voltage_cols, v4)
+                    H.add_many(rows, third_voltage_cols, v5)
+                else:
+                    self._add_indexed_values(H, rows, own_angle_cols, v0)
+                    self._add_indexed_values(H, rows, other_angle_cols, v1)
+                    self._add_indexed_values(H, rows, third_angle_cols, v2)
+                    self._add_indexed_values(H, rows, own_voltage_cols, v3)
+                    self._add_indexed_values(H, rows, other_voltage_cols, v4)
+                    self._add_indexed_values(H, rows, third_voltage_cols, v5)
             else:
-                self._add_indexed_values(H, rows, own_angle_cols, values[0])
-                self._add_indexed_values(H, rows, other_angle_cols, values[1])
-                self._add_indexed_values(H, rows, third_angle_cols, values[2])
-                self._add_indexed_values(H, rows, own_voltage_cols, values[3])
-                self._add_indexed_values(H, rows, other_voltage_cols, values[4])
-                self._add_indexed_values(H, rows, third_voltage_cols, values[5])
+                if hasattr(H, "add_many"):
+                    H.add_many(rows, own_angle_cols, v0)
+                    H.add_many(rows, other_angle_cols, v1)
+                    H.add_many(rows, own_voltage_cols, v3)
+                    H.add_many(rows, other_voltage_cols, v4)
+                else:
+                    self._add_indexed_values(H, rows, own_angle_cols, v0)
+                    self._add_indexed_values(H, rows, other_angle_cols, v1)
+                    self._add_indexed_values(H, rows, own_voltage_cols, v3)
+                    self._add_indexed_values(H, rows, other_voltage_cols, v4)
 
         rows = plan["current_rows"]
         if rows.size:
@@ -9968,18 +9978,20 @@ class ACStateEstimator:
                 "measurement_table",
                 "bad-data identification",
             )
-        if result.H is None or result.gain is None:
-            result.H = self.jacobian_sparse(result.x, plan_tables)
-            weights_for_gain = np.asarray(measurement_table.weight, dtype=np.float64)
-            result.gain, _ = build_normal_equations(
-                result.H,
-                result.residual,
-                weights_for_gain,
-            )
         threshold = self.params.bad_threshold if threshold is None else threshold
         weights = np.asarray(measurement_table.weight, dtype=np.float64)
         R_diag = 1.0 / weights
-        gain_inv = inverse_gain_for_bad_data(result.gain)
+        if self.n_state > 5000 and (result.H is None or result.gain is None):
+            gain_inv = None
+        else:
+            if result.H is None or result.gain is None:
+                result.H = self.jacobian_sparse(result.x, plan_tables)
+                result.gain, _ = build_normal_equations(
+                    result.H,
+                    result.residual,
+                    weights,
+                )
+            gain_inv = inverse_gain_for_bad_data(result.gain)
         if gain_inv is None:
             leverage = np.zeros_like(R_diag)
         else:
