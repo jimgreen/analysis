@@ -146,3 +146,88 @@ def factor_jacobian(matrix, resolved_name, solver_fn):
         if klu_cls is not None:
             return klu_cls(as_solver_csc(matrix))
     return CallableFactor(matrix, solver_fn)
+
+
+class AdaptiveNewtonFactor:
+    """Safe adaptive Shamanskii LU-factor reuse for Newton-Raphson power-flow loops.
+
+    Reuses the cached LU factor for cheap back-solves once the residual is small
+    and contracting rapidly, and automatically invalidates/re-factorizes when
+    contraction slows, a reuse limit is reached, or a reused step fails to reduce
+    the residual norm.
+    """
+
+    __slots__ = (
+        "_factor",
+        "_reuses",
+        "_prev_norm",
+        "_last_was_reuse",
+        "_x_before_reuse",
+        "_norm_before_reuse",
+        "_reuse_threshold",
+        "_contract_ratio",
+        "_max_reuses",
+        "_min_size",
+    )
+
+    def __init__(
+        self,
+        *,
+        reuse_threshold: float = 0.10,
+        contract_ratio: float = 0.50,
+        max_reuses: int = 6,
+        min_size: int = 128,
+    ) -> None:
+        self._factor = None
+        self._reuses = 0
+        self._prev_norm = np.inf
+        self._last_was_reuse = False
+        self._x_before_reuse = None
+        self._norm_before_reuse = np.inf
+        self._reuse_threshold = float(reuse_threshold)
+        self._contract_ratio = float(contract_ratio)
+        self._max_reuses = int(max_reuses)
+        self._min_size = int(min_size)
+
+    def reset(self) -> None:
+        self._factor = None
+        self._reuses = 0
+        self._prev_norm = np.inf
+        self._last_was_reuse = False
+        self._x_before_reuse = None
+        self._norm_before_reuse = np.inf
+
+    def check_rollback(self, norm_f: float):
+        """Return backup x to restore if the previous reused step failed to reduce norm_f."""
+        if self._last_was_reuse and (not np.isfinite(norm_f) or norm_f >= self._norm_before_reuse):
+            backup = self._x_before_reuse
+            self.reset()
+            return backup
+        return None
+
+    def can_reuse(self, norm_f: float, n_vars: int) -> bool:
+        if self._factor is None or n_vars < self._min_size:
+            return False
+        if self._reuses >= self._max_reuses:
+            return False
+        return (
+            np.isfinite(norm_f)
+            and norm_f < self._reuse_threshold
+            and norm_f < self._contract_ratio * self._prev_norm
+        )
+
+    def solve_reused(self, rhs: np.ndarray, x_current: np.ndarray, norm_f: float) -> np.ndarray:
+        self._x_before_reuse = x_current.copy()
+        self._norm_before_reuse = float(norm_f)
+        self._last_was_reuse = True
+        self._reuses += 1
+        self._prev_norm = float(norm_f)
+        return self._factor.solve(rhs)
+
+    def update_factor(self, factor, norm_f: float) -> None:
+        self._factor = None if isinstance(factor, CallableFactor) else factor
+        self._reuses = 0
+        self._prev_norm = float(norm_f)
+        self._last_was_reuse = False
+        self._x_before_reuse = None
+        self._norm_before_reuse = np.inf

@@ -68,9 +68,13 @@ class EFileTableRows:
         n = len(self.rows)
         if col is None or n == 0:
             return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+        col_idx = int(col)
+        col_tokens = self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
         try:
+            if col_tokens is not None:
+                return np.fromiter(map(float, col_tokens), dtype=np.float64, count=n)
             return np.fromiter(
-                map(float, map(operator.itemgetter(int(col)), self.rows)),
+                map(float, map(operator.itemgetter(col_idx), self.rows)),
                 dtype=np.float64,
                 count=n,
             )
@@ -81,9 +85,13 @@ class EFileTableRows:
         n = len(self.rows)
         if col is None or n == 0:
             return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+        col_idx = int(col)
+        col_tokens = self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
         try:
+            if col_tokens is not None:
+                return np.fromiter(map(int, col_tokens), dtype=np.float64, count=n)
             return np.fromiter(
-                map(int, map(operator.itemgetter(int(col)), self.rows)),
+                map(int, map(operator.itemgetter(col_idx), self.rows)),
                 dtype=np.float64,
                 count=n,
             )
@@ -105,6 +113,14 @@ class EFileTableRows:
             return cached
 
         col_idx = int(col)
+        col_tokens = self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
+        if col_tokens is not None:
+            values = np.array(col_tokens, dtype=object)
+            missing = (values == "") | (values == None)
+            if np.any(missing):
+                values[missing] = default
+            self._raw_cache[key] = values
+            return values
         try:
             values = np.array(list(map(operator.itemgetter(col_idx), self.rows)), dtype=object)
             missing = (values == "") | (values == None)

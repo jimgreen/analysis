@@ -1,4 +1,89 @@
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass(slots=True)
+class ACNodeResult:
+    volt: float
+    angle: float
+
+
+@dataclass(slots=True)
+class ACTwoPortResult:
+    i_p: float
+    i_q: float
+    i_c: float
+    i_v: float
+    j_p: float
+    j_q: float
+    j_c: float
+    j_v: float
+
+
+@dataclass(slots=True)
+class ACThreePortResult:
+    i_p: float
+    i_q: float
+    i_c: float
+    i_v: float
+    j_p: float
+    j_q: float
+    j_c: float
+    j_v: float
+    k_p: float
+    k_q: float
+    k_c: float
+    k_v: float
+
+
+@dataclass(slots=True)
+class ACSinglePortResult:
+    i_p: float
+    i_q: float
+    i_c: float
+    i_v: float
+
+
+@dataclass(slots=True)
+class ACSwitchResult:
+    i_p: float
+    i_q: float
+    i_c: float
+    i_v: float
+    closed_status_set: int
+    closed_status: int
+
+
+@dataclass(slots=True)
+class DCNodeResult:
+    volt: float
+
+
+@dataclass(slots=True)
+class DCTwoPortResult:
+    i_p: float
+    i_c: float
+    i_v: float
+    j_p: float
+    j_c: float
+    j_v: float
+
+
+@dataclass(slots=True)
+class DCSinglePortResult:
+    i_p: float
+    i_c: float
+    i_v: float
+
+
+@dataclass(slots=True)
+class DCSwitchResult:
+    i_p: float
+    i_c: float
+    i_v: float
+    closed_status_set: int
+    closed_status: int
 
 
 def build_result_voltage_lookup(bus_rows, idx_col: int, voltage_col: int):

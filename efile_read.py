@@ -200,8 +200,140 @@ class EBook():
             fp.write(''.join(parts))
 
 
+class _FlatTableRows:
+    """Lazy row view backed by a flat token list from bulk block splitting.
+
+    Column readers (EFileTableRows) slice ``tokens[col + 1 :: stride]`` directly
+    in C without constructing per-row Python lists. Any row-level iteration or
+    indexing materializes standard mutable Python row lists once and releases
+    the flat buffer so in-place callers (e.g. contingency mutation) stay exact.
+    """
+
+    __slots__ = ("_tokens", "_stride", "_nrows", "_rows")
+
+    def __init__(self, tokens, stride: int, nrows: int):
+        self._tokens = tokens
+        self._stride = int(stride)
+        self._nrows = int(nrows)
+        self._rows = None
+
+    def _materialize(self):
+        rows = self._rows
+        if rows is None:
+            tokens = self._tokens
+            stride = self._stride
+            rows = [tokens[i + 1 : i + stride] for i in range(0, self._nrows * stride, stride)]
+            self._rows = rows
+            self._tokens = None
+        return rows
+
+    def column_tokens(self, col: int):
+        if self._rows is not None:
+            return None
+        col_idx = int(col)
+        if col_idx < 0 or col_idx + 1 >= self._stride:
+            return None
+        return self._tokens[col_idx + 1 :: self._stride]
+
+    def __len__(self) -> int:
+        return len(self._rows) if self._rows is not None else self._nrows
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+    def __iter__(self):
+        return iter(self._materialize())
+
+    def __getitem__(self, item):
+        return self._materialize()[item]
+
+    def __eq__(self, other):
+        if isinstance(other, _FlatTableRows):
+            return self._materialize() == other._materialize()
+        return self._materialize() == other
+
+
+def _try_read_efile_rows_bulk(text: str):
+    """Fast bulk-token parser for standard unquoted, comment-free E-files."""
+    if "'" in text or "//" in text:
+        return None
+    data = {}
+    pos = 0
+    n = len(text)
+    while pos < n:
+        lt = text.find("<", pos)
+        if lt < 0:
+            if text[pos:].strip():
+                return None
+            break
+        if text[pos:lt].strip():
+            return None
+        gt = text.find(">", lt + 1)
+        if gt < 0:
+            return None
+        block_name = text[lt + 1 : gt]
+        if not block_name or block_name.startswith("/"):
+            return None
+        table_name = block_name
+        lv = 0
+        if " lv " in block_name:
+            key_list = block_name.split(" lv ")
+            table_name = key_list[0]
+            try:
+                lv = int(key_list[1].strip().split("=")[1])
+            except (IndexError, ValueError):
+                return None
+        end_tag = f"</{table_name}>"
+        end_pos = text.find(end_tag, gt + 1)
+        if end_pos < 0:
+            return None
+        body = text[gt + 1 : end_pos]
+        at = body.find("@")
+        if at < 0:
+            header = []
+            data_part = body.strip()
+        else:
+            if body[:at].strip():
+                return None
+            nl = body.find("\n", at)
+            if nl < 0:
+                header = body[at + 1 :].split()
+                data_part = ""
+            else:
+                header = body[at + 1 : nl].split()
+                data_part = body[nl + 1 :].strip()
+        if not data_part:
+            rows = []
+        else:
+            if "\n\n" in data_part or "\r\n\r\n" in data_part:
+                return None
+            nrows = data_part.count("\n") + 1
+            tokens = data_part.split()
+            stride = len(header) + 1
+            if stride <= 1 or len(tokens) != nrows * stride:
+                return None
+            if set(tokens[0::stride]) != {"#"}:
+                return None
+            rows = _FlatTableRows(tokens, stride, nrows)
+        data[table_name] = {
+            "table_name": table_name,
+            "header_list": header,
+            "rows": rows,
+            "lv": lv,
+        }
+        pos = end_pos + len(end_tag)
+    return data
+
+
 def _read_efile_rows(file_path):
     file_path = resolve_project_file(file_path)
+    with open(file_path, mode="rt", encoding="utf8") as fp:
+        text = fp.read()
+
+    bulk = _try_read_efile_rows_bulk(text)
+    if bulk is not None:
+        return bulk
+
     data = {}
     block_name = None
     header = None
@@ -224,9 +356,6 @@ def _read_efile_rows(file_path):
             "rows": rows or [],
             "lv": lv,
         }
-
-    with open(file_path, mode="rt", encoding="utf8") as fp:
-        text = fp.read()
 
     has_quotes = "'" in text
     for idx, raw_line in enumerate(text.splitlines()):

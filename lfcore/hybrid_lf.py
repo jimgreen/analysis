@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover - direct script import path
     )
 try:
     from lfcore.solver_common import (
+        AdaptiveNewtonFactor as _AdaptiveNewtonFactor,
         OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
@@ -56,6 +57,7 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script import path
     from solver_common import (
+        AdaptiveNewtonFactor as _AdaptiveNewtonFactor,
         OPTIONAL_SPARSE_MISSING as _AC_OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _AC_OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
@@ -1022,6 +1024,7 @@ class HybridPowerFlowCalc:
         )
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
+        self.min_voltage = self.params.min_voltage
         self.verbose = verbose
         self.result_mode = self._normalize_result_mode(result_mode)
         self.keep_node_objects = False
@@ -3646,6 +3649,95 @@ class HybridPowerFlowCalc:
         )
         return F, J
 
+    def _build_electric_jacobian_from_cached_state(
+        self,
+        x: np.ndarray,
+        *,
+        jacobian_format="csc",
+    ):
+        """Build the electric Jacobian directly from the AC/DC state cached during residual evaluation."""
+        if self._single_ac_newton_block:
+            ac = self.ac_calc
+            theta, V, phi_re, phi_im = ac._extract_state_vars(x, update_cache=False)
+            J = ac._get_jacobi_from_cached_state(
+                theta,
+                V,
+                phi_re,
+                phi_im,
+                Sbus=ac._last_Sbus,
+                matrix_format=jacobian_format,
+                build_matrix=True,
+            )
+            self.last_jacobian_shape = J.shape
+            return J
+        if self._single_dc_newton_block:
+            dc = self.dc_calc
+            terms = getattr(dc, "_last_terms", None)
+            if terms is None:
+                terms = dc._eval_newton_terms(dc.G, x)
+            J = dc._get_jacobi_from_terms(
+                dc.G,
+                x,
+                terms,
+                matrix_format=jacobian_format,
+                build_matrix=True,
+            )
+            self.last_jacobian_shape = J.shape
+            return J
+
+        ac_x, dc_x, dcac_x = self._split_x(x)
+        ac_j = None
+        dc_j = None
+        if self.ac_calc is not None:
+            ac = self.ac_calc
+            need_matrix = self.global_jac_raw_data.size == 0
+            theta, V, phi_re, phi_im = ac._extract_state_vars(ac_x, update_cache=False)
+            ac_j = ac._get_jacobi_from_cached_state(
+                theta,
+                V,
+                phi_re,
+                phi_im,
+                Sbus=ac._last_Sbus,
+                matrix_format="csc",
+                build_matrix=need_matrix,
+            )
+            if ac_j is None and self._slice_len(self.global_jac_ac_slice):
+                ac_j = self._sub_jacobian_cached_values(ac, is_dc=False)
+            if ac_j is None or (need_matrix and getattr(ac_j, "tocoo", None) is None):
+                ac_j = ac.get_jacobi(ac_x)
+        if self.dc_calc is not None:
+            dc = self.dc_calc
+            need_matrix = self.global_jac_raw_data.size == 0
+            terms = getattr(dc, "_last_terms", None)
+            if terms is None:
+                terms = dc._eval_newton_terms(dc.G, dc_x)
+            dc_j = dc._get_jacobi_from_terms(
+                dc.G,
+                dc_x,
+                terms,
+                matrix_format="csc",
+                build_matrix=need_matrix,
+            )
+            if dc_j is None and self._slice_len(self.global_jac_dc_slice):
+                dc_j = self._sub_jacobian_cached_values(dc, is_dc=True)
+            if dc_j is None or (need_matrix and getattr(dc_j, "tocoo", None) is None):
+                dc_j = dc.get_jacobi(dc_x)
+
+        ac_V = dc_V = None
+        if self.N_dcac:
+            _ac_theta, ac_V, dc_V = self._cached_state_values(ac_x, dc_x)
+
+        return self._assemble_jacobian(
+            ac_x,
+            dc_x,
+            dcac_x,
+            ac_j,
+            dc_j,
+            ac_V,
+            dc_V,
+            matrix_format=jacobian_format,
+        )
+
     def _build_newton_system(self, x: np.ndarray, *, return_jacobian=True, jacobian_format="csc"):
         """Assemble every energy-domain block into one sparse Newton system."""
         if not self.fluid_calcs:
@@ -4312,13 +4404,29 @@ class HybridPowerFlowCalc:
                 )
             return candidate
 
+        adaptive_factor = _AdaptiveNewtonFactor() if not self.fluid_calcs else None
+        n_vars = int(x.size)
+        cached_fluid_f = None
+
         for it in range(self.max_iter):
             if it == 0:
                 F, J = self._build_newton_system(x)
+            elif cached_fluid_f is not None:
+                F = cached_fluid_f
+                cached_fluid_f = None
+                J = None
             else:
                 F, J = self._build_newton_system(x, return_jacobian=False)
             self.iterations = it + 1
-            self.normF = np.linalg.norm(F, np.inf)
+            self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
+
+            if adaptive_factor is not None:
+                rollback_x = adaptive_factor.check_rollback(self.normF)
+                if rollback_x is not None:
+                    x = rollback_x
+                    F, J = self._build_newton_system(x, return_jacobian=False)
+                    self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
+
             merit_norm = float(np.linalg.norm(F))
 
             if it == 0 and not self._validate_initial_jacobian_columns(J):
@@ -4364,8 +4472,21 @@ class HybridPowerFlowCalc:
                 self._write_back()
                 return 0
 
+            if adaptive_factor is not None and adaptive_factor.can_reuse(self.normF, n_vars):
+                try:
+                    delta = adaptive_factor.solve_reused(F, x, self.normF)
+                    if np.all(np.isfinite(delta)):
+                        x -= delta
+                        continue
+                except (RuntimeError, ValueError, ArithmeticError):
+                    pass
+                adaptive_factor.reset()
+
             if J is None:
-                _, J = self._build_newton_system(x, return_jacobian=True)
+                if not self.fluid_calcs:
+                    J = self._build_electric_jacobian_from_cached_state(x, jacobian_format="csc")
+                else:
+                    _, J = self._build_newton_system(x, return_jacobian=True)
 
             try:
                 if reusable_factorizer is None:
@@ -4376,6 +4497,8 @@ class HybridPowerFlowCalc:
                     else _factor_jacobian(J, resolved_name, solver_fn)
                 )
                 delta = factor.solve(F)
+                if adaptive_factor is not None:
+                    adaptive_factor.update_factor(factor, self.normF)
             except (RuntimeError, ValueError, ArithmeticError) as exc:
                 # 可选稀疏求解器失败时, 只在本实例回退到 scipy, 避免污染模块缓存。
                 if resolved_name not in {"scipy", "superlu", "default"}:
@@ -4383,6 +4506,8 @@ class HybridPowerFlowCalc:
                     if self.verbose:
                         print(f"[hybrid_lf] 可选稀疏求解器 {resolved_name!r} 失败，回退到 scipy: {exc}")
                 reusable_factorizer = None
+                if adaptive_factor is not None:
+                    adaptive_factor.reset()
                 resolved_name = "scipy"
                 solver_fn = _scipy_spsolve
                 self._linear_solver_resolved = "scipy"
@@ -4408,6 +4533,7 @@ class HybridPowerFlowCalc:
                 )
                 if np.isfinite(candidate_merit) and candidate_merit < merit_norm:
                     x = candidate
+                    cached_fluid_f = candidate_f
                     accepted = True
                     break
                 step *= 0.5
@@ -4524,14 +4650,25 @@ class HybridPowerFlowCalc:
         }
         self.lf_result = None
 
+    def write_array_result_to_network(self, network=None) -> None:
+        """Copy array results to a hybrid network without rebuilding solver state."""
+        target = self.network if network is None else network
+        if target is None or not self.result:
+            return
+        ac_net = getattr(target, "ac", None)
+        dc_net = getattr(target, "dc", None)
+        if self.ac_calc is not None and ac_net is not None and self.ac_calc.result:
+            self.ac_calc.write_array_result_to_network(ac_net)
+        if self.dc_calc is not None and dc_net is not None and self.dc_calc.result:
+            self.dc_calc.write_array_result_to_network(dc_net)
+        if getattr(target, "_lf_lightweight", False):
+            target.result = self.result
+
     def _write_dc_ppc_result_to_network(self) -> None:
         result = self.dc_calc.result if self.dc_calc is not None else None
         if not result:
             return
-        if getattr(self.network.dc, "_lf_lightweight", False):
-            self.network.dc.result = result
-            return
-        self.dc_calc._write_ppc_result_to_network()
+        self.dc_calc.write_array_result_to_network(self.network.dc)
 
     def _write_ac_ppc_result_to_network(self) -> None:
         """Delegate AC array-result writeback to ACPowerFlowCalc."""

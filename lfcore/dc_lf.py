@@ -98,8 +98,13 @@ from model.switching_status import (
     apply_lf_closed_status_boundaries,
     finalize_lf_closed_status_results,
 )
+from itertools import starmap
 try:
     from lfcore.common import (
+        DCNodeResult,
+        DCSinglePortResult,
+        DCSwitchResult,
+        DCTwoPortResult,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -110,6 +115,10 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
+        DCNodeResult,
+        DCSinglePortResult,
+        DCSwitchResult,
+        DCTwoPortResult,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -120,6 +129,7 @@ except ImportError:  # pragma: no cover - direct script import path
     )
 try:
     from lfcore.solver_common import (
+        AdaptiveNewtonFactor as _AdaptiveNewtonFactor,
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
@@ -128,6 +138,7 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script import path
     from solver_common import (
+        AdaptiveNewtonFactor as _AdaptiveNewtonFactor,
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
@@ -287,6 +298,7 @@ class DCPowerFlowCalc:
         self.converged = False
         self.iterations = 0
         self.normF = np.inf
+        self.failure_reason = ""
         self.verbose = bool(verbose)
         self.result: Dict = {}
         self.lf_result = None
@@ -1547,6 +1559,7 @@ class DCPowerFlowCalc:
                 dcdc_pi2=pi * pi,
                 dcdc_pj2=pj * pj,
             )
+        self._last_terms = terms
         return terms
 
     def _get_jacobi_from_terms(self, G, x, terms, *, matrix_format="csr", build_matrix=True):
@@ -2091,10 +2104,7 @@ class DCPowerFlowCalc:
 
         n_bus = len(bus_rows)
         bus_names = _name_list("bus_name", n_bus)
-        result.nodes = {
-            name: SimpleNamespace(volt=v)
-            for name, v in zip(bus_names, bus_volt.tolist())
-        }
+        result.nodes = dict(zip(bus_names, map(DCNodeResult, bus_volt.tolist())))
 
         def _build_two_port(rows, name_key, p_i, p_j, c_col, n_i, n_j, target, *, neg_j_current=False):
             if rows is None or len(rows) == 0:
@@ -2107,11 +2117,9 @@ class DCPowerFlowCalc:
             j_c = (-currents).tolist() if neg_j_current else currents.tolist()
             i_v = _lookup_voltage(rows[:, n_i]).tolist()
             j_v = _lookup_voltage(rows[:, n_j]).tolist()
-            for name, ip, ic, iv, jp, jc, jv in zip(names, i_p, i_c, i_v, j_p, j_c, j_v):
-                target[name] = SimpleNamespace(
-                    i_p=ip, i_c=ic, i_v=iv,
-                    j_p=jp, j_c=jc, j_v=jv,
-                )
+            target.update(
+                zip(names, starmap(DCTwoPortResult, zip(i_p, i_c, i_v, j_p, j_c, j_v)))
+            )
 
         def _build_two_port_separate_currents(rows, name_key, p_i, p_j, c_i, c_j, n_i, n_j, target):
             if rows is None or len(rows) == 0:
@@ -2123,11 +2131,9 @@ class DCPowerFlowCalc:
             j_c = rows[:, c_j].tolist()
             i_v = _lookup_voltage(rows[:, n_i]).tolist()
             j_v = _lookup_voltage(rows[:, n_j]).tolist()
-            for name, ip, ic, iv, jp, jc, jv in zip(names, i_p, i_c, i_v, j_p, j_c, j_v):
-                target[name] = SimpleNamespace(
-                    i_p=ip, i_c=ic, i_v=iv,
-                    j_p=jp, j_c=jc, j_v=jv,
-                )
+            target.update(
+                zip(names, starmap(DCTwoPortResult, zip(i_p, i_c, i_v, j_p, j_c, j_v)))
+            )
 
         def _build_single_port(
             rows,
@@ -2146,17 +2152,15 @@ class DCPowerFlowCalc:
             i_c = rows[:, c_col].tolist()
             i_v = _lookup_voltage(rows[:, n_col]).tolist()
             if status_cols is None:
-                for name, p, c, v in zip(names, i_p, i_c, i_v):
-                    target[name] = SimpleNamespace(i_p=p, i_c=c, i_v=v)
+                target.update(
+                    zip(names, starmap(DCSinglePortResult, zip(i_p, i_c, i_v)))
+                )
             else:
-                for pos, (name, p, c, v) in enumerate(zip(names, i_p, i_c, i_v)):
-                    target[name] = SimpleNamespace(
-                        i_p=p,
-                        i_c=c,
-                        i_v=v,
-                        closed_status_set=int(rows[pos, status_cols[0]]),
-                        closed_status=int(rows[pos, status_cols[1]]),
-                    )
+                st_set = rows[:, status_cols[0]].astype(np.int64, copy=False).tolist()
+                st_cur = rows[:, status_cols[1]].astype(np.int64, copy=False).tolist()
+                target.update(
+                    zip(names, starmap(DCSwitchResult, zip(i_p, i_c, i_v, st_set, st_cur)))
+                )
 
         _build_two_port(
             self.result.get("branch"), "branch_name",
@@ -2245,6 +2249,22 @@ class DCPowerFlowCalc:
             self.lf_result = None
         return
 
+    def write_array_result_to_network(self, network=None) -> None:
+        """Copy array results to a DC network without rebuilding solver state."""
+        if network is None:
+            network = getattr(self, "_network_writeback", None)
+        if network is None or not self.result:
+            return
+        if getattr(network, "_lf_lightweight", False):
+            network.result = self.result
+            return
+        previous = getattr(self, "_network_writeback", None)
+        self._network_writeback = network
+        try:
+            self._write_ppc_result_to_network()
+        finally:
+            self._network_writeback = previous
+
     def _build_lf_result(self) -> DCLFResult:
         return self._build_lf_result_from_ppc()
 
@@ -2276,6 +2296,7 @@ class DCPowerFlowCalc:
         """执行牛顿-拉夫逊迭代求解。"""
         self.converged = False
         self.iterations = 0
+        self.failure_reason = ""
         x = self.x.copy()
 
         # 若实例级黑名单上仍有非 scipy 求解器,本次迭代直接走 scipy,
@@ -2286,12 +2307,22 @@ class DCPowerFlowCalc:
         resolved_name = self._linear_solver_resolved
         solver_fn = self._linear_solver_fn
         reusable_factorizer = None
+        adaptive_factor = _AdaptiveNewtonFactor()
+        n_vars = int(x.size)
 
         for it in range(self.max_iter):
             self.iterations += 1
             terms = self._eval_newton_terms(self.G, x)
             F = self._get_f_from_terms(x, terms)
-            self.normF = np.linalg.norm(F, np.inf)
+            self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
+
+            rollback_x = adaptive_factor.check_rollback(self.normF)
+            if rollback_x is not None:
+                x = rollback_x
+                terms = self._eval_newton_terms(self.G, x)
+                F = self._get_f_from_terms(x, terms)
+                self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
+
             if self.verbose:
                 print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
 
@@ -2302,6 +2333,16 @@ class DCPowerFlowCalc:
                 self.x = x
                 self._write_back()
                 return 0
+
+            if adaptive_factor.can_reuse(self.normF, n_vars):
+                try:
+                    delta = adaptive_factor.solve_reused(F, x, self.normF)
+                    if np.all(np.isfinite(delta)):
+                        x -= delta
+                        continue
+                except (RuntimeError, ValueError, ArithmeticError):
+                    pass
+                adaptive_factor.reset()
 
             J = self._get_jacobi_from_terms(
                 self.G,
@@ -2320,6 +2361,7 @@ class DCPowerFlowCalc:
                     else _factor_jacobian(J, resolved_name, solver_fn)
                 )
                 delta = factor.solve(F)
+                adaptive_factor.update_factor(factor, self.normF)
             except (RuntimeError, ValueError, ArithmeticError) as exc:
                 # 仅在真正与求解器/数值相关的异常上降级；其他异常继续向上抛。
                 # 不要污染模块级缓存:同一进程内其他 calc 实例仍可继续使用
@@ -2329,6 +2371,7 @@ class DCPowerFlowCalc:
                     if self.verbose:
                         print(f"[dc_lf] 可选稀疏求解器 {resolved_name!r} 失败，回退到 scipy: {exc}")
                 reusable_factorizer = None
+                adaptive_factor.reset()
                 resolved_name, solver_fn = "scipy", spsolve
                 self._linear_solver_resolved = "scipy"
                 self._linear_solver_fn = spsolve
@@ -2337,6 +2380,7 @@ class DCPowerFlowCalc:
             # 与 AC 潮流一致：方程定义为 F(x)=0，使用 x_new = x - J^{-1}F。
             x -= delta
 
+        self.failure_reason = f"未在最大迭代次数 {self.max_iter} 内收敛 (|F|={self.normF:.2e})"
         if self.verbose:
             print(f"达到最大迭代次数 {self.max_iter}，未收敛")
         self.x = x

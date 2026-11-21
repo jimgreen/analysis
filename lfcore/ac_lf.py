@@ -72,9 +72,15 @@ from model.switching_status import (
     apply_lf_closed_status_boundaries,
     finalize_lf_closed_status_results,
 )
+from itertools import starmap
 from model.topology import build_lf_control_bus_groups
 try:
     from lfcore.common import (
+        ACNodeResult,
+        ACSinglePortResult,
+        ACSwitchResult,
+        ACThreePortResult,
+        ACTwoPortResult,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -85,6 +91,11 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
+        ACNodeResult,
+        ACSinglePortResult,
+        ACSwitchResult,
+        ACThreePortResult,
+        ACTwoPortResult,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -95,6 +106,7 @@ except ImportError:  # pragma: no cover - direct script import path
     )
 try:
     from lfcore.solver_common import (
+        AdaptiveNewtonFactor as _AdaptiveNewtonFactor,
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
@@ -103,6 +115,7 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script import path
     from solver_common import (
+        AdaptiveNewtonFactor as _AdaptiveNewtonFactor,
         OPTIONAL_SPARSE_MISSING as _OPTIONAL_SPARSE_MISSING,
         OPTIONAL_SPARSE_SOLVERS as _OPTIONAL_SPARSE_SOLVERS,
         factor_jacobian as _factor_jacobian,
@@ -486,6 +499,7 @@ class ACPowerFlowCalc:
         self.converged: bool = False
         self.iterations: int = 0
         self.normF: float = np.inf
+        self.failure_reason: str = ""
 
         # 核心变量初始化（精简合并）
         self.N: int = 0
@@ -2956,6 +2970,7 @@ class ACPowerFlowCalc:
         """执行牛顿-拉夫逊迭代求解"""
         self.converged = False
         self.iterations = 0
+        self.failure_reason = ""
         x = self.x.copy()
 
         # 若本实例已把 KLU/UMFPACK 加入黑名单, 直接走 scipy, 避免重复触发失败路径。
@@ -2964,15 +2979,26 @@ class ACPowerFlowCalc:
         resolved_name = self._linear_solver_resolved
         solver_fn = self._linear_solver_fn
         reusable_factorizer = None
+        adaptive_factor = _AdaptiveNewtonFactor()
+        n_vars = int(x.size)
 
         for it in range(self.max_iter):
             self.iterations += 1
 
-            # 先计算状态与残差并判收敛，未收敛再复用缓存组装 Jacobian，避免收敛轮多余构造 J。
+            # 先计算状态与残差并判收敛，未收敛再视收缩情况复用 LU 或组装 Jacobian。
             theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
             dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
             F = self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
-            self.normF = np.linalg.norm(F, np.inf)
+            self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
+
+            rollback_x = adaptive_factor.check_rollback(self.normF)
+            if rollback_x is not None:
+                x = rollback_x
+                theta, V, phi_re, phi_im = self._extract_state_vars(x, update_cache=True)
+                dP, dQ = self._calc_power_balance(theta, V, phi_re, phi_im)
+                F = self._fill_residual(theta, V, phi_re, phi_im, dP, dQ)
+                self.normF = float(np.linalg.norm(F, np.inf)) if F.size else 0.0
+
             if self.verbose:
                 print(f"Iter {it + 1}: |F| = {self.normF:.2e}")
 
@@ -2984,6 +3010,16 @@ class ACPowerFlowCalc:
                 self.x = x
                 self._write_back()
                 return 0
+
+            if adaptive_factor.can_reuse(self.normF, n_vars):
+                try:
+                    delta = adaptive_factor.solve_reused(F, x, self.normF)
+                    if np.all(np.isfinite(delta)):
+                        x -= delta
+                        continue
+                except (RuntimeError, ValueError, ArithmeticError):
+                    pass
+                adaptive_factor.reset()
 
             J = self._get_jacobi_from_cached_state(
                 theta,
@@ -3004,6 +3040,7 @@ class ACPowerFlowCalc:
                     else _factor_jacobian(J, resolved_name, solver_fn)
                 )
                 delta = factor.solve(F)
+                adaptive_factor.update_factor(factor, self.normF)
             except (RuntimeError, ValueError, ArithmeticError) as exc:
                 # 因子分解或解算失败时, 仅本实例回退到 SuperLU spsolve 单步路径,
                 # 避免污染模块级缓存 (同进程内其他 calc 仍可继续尝试 KLU)。
@@ -3012,6 +3049,7 @@ class ACPowerFlowCalc:
                     if self.verbose:
                         print(f"[ac_lf] 可选稀疏求解器 {resolved_name!r} 失败，回退到 scipy: {exc}")
                 reusable_factorizer = None
+                adaptive_factor.reset()
                 resolved_name, solver_fn = "scipy", spsolve
                 self._linear_solver_resolved, self._linear_solver_fn = "scipy", spsolve
                 delta = spsolve(J, F)
@@ -3019,6 +3057,7 @@ class ACPowerFlowCalc:
             x -= delta
 
         # 未收敛
+        self.failure_reason = f"未在最大迭代次数 {self.max_iter} 内收敛 (|F|={self.normF:.2e})"
         if self.verbose:
             print(f"达到最大迭代次数 {self.max_iter}，未收敛")
         self.x = x
@@ -3087,10 +3126,9 @@ class ACPowerFlowCalc:
 
         n_bus = len(bus)
         bus_names = _name_list("bus_name", n_bus)
-        result.nodes = {
-            name: SimpleNamespace(volt=v, angle=a)
-            for name, v, a in zip(bus_names, bus_volt.tolist(), bus_angle.tolist())
-        }
+        result.nodes = dict(
+            zip(bus_names, starmap(ACNodeResult, zip(bus_volt.tolist(), bus_angle.tolist())))
+        )
 
         def _build_two_port(rows, name_key, cols, target):
             if rows is None or len(rows) == 0:
@@ -3104,13 +3142,15 @@ class ACPowerFlowCalc:
             j_c = rows[:, cols["j_c"]].tolist()
             i_v = _lookup_voltage(rows[:, cols["i_node"]]).tolist()
             j_v = _lookup_voltage(rows[:, cols["j_node"]]).tolist()
-            for name, ip, iq, ic, iv, jp, jq, jc, jv in zip(
-                names, i_p, i_q, i_c, i_v, j_p, j_q, j_c, j_v
-            ):
-                target[name] = SimpleNamespace(
-                    i_p=ip, i_q=iq, i_c=ic, i_v=iv,
-                    j_p=jp, j_q=jq, j_c=jc, j_v=jv,
+            target.update(
+                zip(
+                    names,
+                    starmap(
+                        ACTwoPortResult,
+                        zip(i_p, i_q, i_c, i_v, j_p, j_q, j_c, j_v),
+                    ),
                 )
+            )
 
         _build_two_port(self.result.get("branch"), "branch_name", BRANCH_COLS, result.branches)
         _build_two_port(self.result.get("transformer"), "transformer_name", TRANSFORMER_COLS, result.transformers)
@@ -3121,37 +3161,51 @@ class ACPowerFlowCalc:
             i_v = _lookup_voltage(three_rows[:, cols3["i_node"]]).tolist()
             j_v = _lookup_voltage(three_rows[:, cols3["j_node"]]).tolist()
             k_v = _lookup_voltage(three_rows[:, cols3["k_node"]]).tolist()
-            for name, row, iv, jv, kv in zip(names, three_rows, i_v, j_v, k_v):
-                result.three_winding_transformers[name] = SimpleNamespace(
-                    i_p=float(row[cols3["i_p"]]),
-                    i_q=float(row[cols3["i_q"]]),
-                    i_c=float(row[cols3["i_c"]]),
-                    i_v=iv,
-                    j_p=float(row[cols3["j_p"]]),
-                    j_q=float(row[cols3["j_q"]]),
-                    j_c=float(row[cols3["j_c"]]),
-                    j_v=jv,
-                    k_p=float(row[cols3["k_p"]]),
-                    k_q=float(row[cols3["k_q"]]),
-                    k_c=float(row[cols3["k_c"]]),
-                    k_v=kv,
+            result.three_winding_transformers.update(
+                zip(
+                    names,
+                    starmap(
+                        ACThreePortResult,
+                        zip(
+                            three_rows[:, cols3["i_p"]].tolist(),
+                            three_rows[:, cols3["i_q"]].tolist(),
+                            three_rows[:, cols3["i_c"]].tolist(),
+                            i_v,
+                            three_rows[:, cols3["j_p"]].tolist(),
+                            three_rows[:, cols3["j_q"]].tolist(),
+                            three_rows[:, cols3["j_c"]].tolist(),
+                            j_v,
+                            three_rows[:, cols3["k_p"]].tolist(),
+                            three_rows[:, cols3["k_q"]].tolist(),
+                            three_rows[:, cols3["k_c"]].tolist(),
+                            k_v,
+                        ),
+                    ),
                 )
+            )
         acac_rows = self.result.get("acac")
         if acac_rows is not None and len(acac_rows):
             names = _name_list("acac_name", len(acac_rows))
             i_v = _lookup_voltage(acac_rows[:, ACAC_COLS["i_node"]]).tolist()
             j_v = _lookup_voltage(acac_rows[:, ACAC_COLS["j_node"]]).tolist()
-            for name, row, iv, jv in zip(names, acac_rows, i_v, j_v):
-                result.acac_converters[name] = SimpleNamespace(
-                    i_p=float(row[ACAC_COLS["i_p"]]),
-                    i_q=float(row[ACAC_COLS["i_q"]]),
-                    i_c=float(row[ACAC_COLS["i_i"]]),
-                    i_v=iv,
-                    j_p=float(row[ACAC_COLS["j_p"]]),
-                    j_q=float(row[ACAC_COLS["j_q"]]),
-                    j_c=float(row[ACAC_COLS["j_i"]]),
-                    j_v=jv,
+            result.acac_converters.update(
+                zip(
+                    names,
+                    starmap(
+                        ACTwoPortResult,
+                        zip(
+                            acac_rows[:, ACAC_COLS["i_p"]].tolist(),
+                            acac_rows[:, ACAC_COLS["i_q"]].tolist(),
+                            acac_rows[:, ACAC_COLS["i_i"]].tolist(),
+                            i_v,
+                            acac_rows[:, ACAC_COLS["j_p"]].tolist(),
+                            acac_rows[:, ACAC_COLS["j_q"]].tolist(),
+                            acac_rows[:, ACAC_COLS["j_i"]].tolist(),
+                            j_v,
+                        ),
+                    ),
                 )
+            )
 
         def _build_single_port(
             rows,
@@ -3172,18 +3226,18 @@ class ACPowerFlowCalc:
             i_c = rows[:, c_col].tolist()
             i_v = _lookup_voltage(rows[:, node_col]).tolist()
             if status_cols is None:
-                for name, p, q, c, v in zip(names, i_p, i_q, i_c, i_v):
-                    target[name] = SimpleNamespace(i_p=p, i_q=q, i_c=c, i_v=v)
+                target.update(
+                    zip(names, starmap(ACSinglePortResult, zip(i_p, i_q, i_c, i_v)))
+                )
             else:
-                for pos, (name, p, q, c, v) in enumerate(zip(names, i_p, i_q, i_c, i_v)):
-                    target[name] = SimpleNamespace(
-                        i_p=p,
-                        i_q=q,
-                        i_c=c,
-                        i_v=v,
-                        closed_status_set=int(rows[pos, status_cols[0]]),
-                        closed_status=int(rows[pos, status_cols[1]]),
+                st_set = rows[:, status_cols[0]].astype(np.int64, copy=False).tolist()
+                st_cur = rows[:, status_cols[1]].astype(np.int64, copy=False).tolist()
+                target.update(
+                    zip(
+                        names,
+                        starmap(ACSwitchResult, zip(i_p, i_q, i_c, i_v, st_set, st_cur)),
                     )
+                )
 
         _build_single_port(
             self.result.get("zero_branch"), "zero_branch_name",
