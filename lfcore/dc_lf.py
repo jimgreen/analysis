@@ -105,6 +105,7 @@ try:
         DCSinglePortResult,
         DCSwitchResult,
         DCTwoPortResult,
+        LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -119,6 +120,7 @@ except ImportError:  # pragma: no cover - direct script import path
         DCSinglePortResult,
         DCSwitchResult,
         DCTwoPortResult,
+        LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -2118,118 +2120,154 @@ class DCPowerFlowCalc:
         )
 
     def _build_lf_result_from_ppc(self) -> DCLFResult:
-        # 与 ac_lf 同构：按列向量化抽取 + 单次 searchsorted 做节点电压查表，
-        # 避免每行 Python float/int 转换与 dict 查询。
+        """基于 PPC 结果数组构建按需物化的 DCLFResult（全部字段保持 dict 兼容）。"""
         result = DCLFResult()
         result.arrays = dict(self.result)
-        bus_rows = self.result.get("bus")
+        bus_rows = result.arrays.get("bus")
         if bus_rows is None or len(bus_rows) == 0:
             return result
 
-        bus_volt = bus_rows[:, DC_BUS_COLS["voltage"]]
-        _lookup_voltage = build_result_voltage_lookup(
-            bus_rows, DC_BUS_COLS["idx"], DC_BUS_COLS["voltage"]
-        )
+        ppc = self.ppc
+        voltage_lookup_box = [None]
 
-        def _name_list(key, n):
-            return result_name_list(self.ppc.get(key), n)
+        def _get_voltage_lookup():
+            fn = voltage_lookup_box[0]
+            if fn is None:
+                fn = build_result_voltage_lookup(bus_rows, DC_BUS_COLS["idx"], DC_BUS_COLS["voltage"])
+                voltage_lookup_box[0] = fn
+            return fn
 
-        n_bus = len(bus_rows)
-        bus_names = _name_list("bus_name", n_bus)
-        result.nodes = dict(zip(bus_names, map(DCNodeResult, bus_volt.tolist())))
+        bus_names_ref = ppc.get("bus_name")
 
-        def _build_two_port(rows, name_key, p_i, p_j, c_col, n_i, n_j, target, *, neg_j_current=False):
+        def _build_nodes():
+            names = result_name_list(bus_names_ref, len(bus_rows))
+            return zip(names, map(DCNodeResult, bus_rows[:, DC_BUS_COLS["voltage"]].tolist()))
+
+        result.nodes = LazyResultDict(_build_nodes, len(bus_rows))
+
+        def _make_two_port_dict(rows, name_key, p_i, p_j, c_col, n_i, n_j, *, neg_j_current=False):
             if rows is None or len(rows) == 0:
-                return
-            names = _name_list(name_key, len(rows))
-            i_p = rows[:, p_i].tolist()
-            j_p = rows[:, p_j].tolist()
-            currents = rows[:, c_col]
-            i_c = currents.tolist()
-            j_c = (-currents).tolist() if neg_j_current else currents.tolist()
-            i_v = _lookup_voltage(rows[:, n_i]).tolist()
-            j_v = _lookup_voltage(rows[:, n_j]).tolist()
-            target.update(
-                zip(names, starmap(DCTwoPortResult, zip(i_p, i_c, i_v, j_p, j_c, j_v)))
-            )
+                return {}
+            raw_names = ppc.get(name_key)
 
-        def _build_two_port_separate_currents(rows, name_key, p_i, p_j, c_i, c_j, n_i, n_j, target):
-            if rows is None or len(rows) == 0:
-                return
-            names = _name_list(name_key, len(rows))
-            i_p = rows[:, p_i].tolist()
-            j_p = rows[:, p_j].tolist()
-            i_c = rows[:, c_i].tolist()
-            j_c = rows[:, c_j].tolist()
-            i_v = _lookup_voltage(rows[:, n_i]).tolist()
-            j_v = _lookup_voltage(rows[:, n_j]).tolist()
-            target.update(
-                zip(names, starmap(DCTwoPortResult, zip(i_p, i_c, i_v, j_p, j_c, j_v)))
-            )
-
-        def _build_single_port(
-            rows,
-            name_key,
-            p_col,
-            c_col,
-            n_col,
-            target,
-            *,
-            status_cols=None,
-        ):
-            if rows is None or len(rows) == 0:
-                return
-            names = _name_list(name_key, len(rows))
-            i_p = rows[:, p_col].tolist()
-            i_c = rows[:, c_col].tolist()
-            i_v = _lookup_voltage(rows[:, n_col]).tolist()
-            if status_cols is None:
-                target.update(
-                    zip(names, starmap(DCSinglePortResult, zip(i_p, i_c, i_v)))
+            def _builder():
+                lookup = _get_voltage_lookup()
+                names = result_name_list(raw_names, len(rows))
+                currents = rows[:, c_col]
+                i_c = currents.tolist()
+                j_c = (-currents).tolist() if neg_j_current else i_c
+                return zip(
+                    names,
+                    starmap(
+                        DCTwoPortResult,
+                        zip(
+                            rows[:, p_i].tolist(),
+                            i_c,
+                            lookup(rows[:, n_i]).tolist(),
+                            rows[:, p_j].tolist(),
+                            j_c,
+                            lookup(rows[:, n_j]).tolist(),
+                        ),
+                    ),
                 )
-            else:
+
+            return LazyResultDict(_builder, len(rows))
+
+        def _make_two_port_separate_dict(rows, name_key, p_i, p_j, c_i, c_j, n_i, n_j):
+            if rows is None or len(rows) == 0:
+                return {}
+            raw_names = ppc.get(name_key)
+
+            def _builder():
+                lookup = _get_voltage_lookup()
+                names = result_name_list(raw_names, len(rows))
+                return zip(
+                    names,
+                    starmap(
+                        DCTwoPortResult,
+                        zip(
+                            rows[:, p_i].tolist(),
+                            rows[:, c_i].tolist(),
+                            lookup(rows[:, n_i]).tolist(),
+                            rows[:, p_j].tolist(),
+                            rows[:, c_j].tolist(),
+                            lookup(rows[:, n_j]).tolist(),
+                        ),
+                    ),
+                )
+
+            return LazyResultDict(_builder, len(rows))
+
+        def _make_single_port_dict(rows, name_key, p_col, c_col, n_col, *, status_cols=None):
+            if rows is None or len(rows) == 0:
+                return {}
+            raw_names = ppc.get(name_key)
+
+            def _builder():
+                lookup = _get_voltage_lookup()
+                names = result_name_list(raw_names, len(rows))
+                i_p = rows[:, p_col].tolist()
+                i_c = rows[:, c_col].tolist()
+                i_v = lookup(rows[:, n_col]).tolist()
+                if status_cols is None:
+                    return zip(names, starmap(DCSinglePortResult, zip(i_p, i_c, i_v)))
                 st_set = rows[:, status_cols[0]].astype(np.int64, copy=False).tolist()
                 st_cur = rows[:, status_cols[1]].astype(np.int64, copy=False).tolist()
-                target.update(
-                    zip(names, starmap(DCSwitchResult, zip(i_p, i_c, i_v, st_set, st_cur)))
-                )
+                return zip(names, starmap(DCSwitchResult, zip(i_p, i_c, i_v, st_set, st_cur)))
 
-        _build_two_port(
-            self.result.get("branch"), "branch_name",
-            DC_BRANCH_COLS["i_p"], DC_BRANCH_COLS["j_p"], DC_BRANCH_COLS["current"],
-            DC_BRANCH_COLS["i_node"], DC_BRANCH_COLS["j_node"], result.branches,
+            return LazyResultDict(_builder, len(rows))
+
+        result.branches = _make_two_port_dict(
+            result.arrays.get("branch"),
+            "branch_name",
+            DC_BRANCH_COLS["i_p"],
+            DC_BRANCH_COLS["j_p"],
+            DC_BRANCH_COLS["current"],
+            DC_BRANCH_COLS["i_node"],
+            DC_BRANCH_COLS["j_node"],
             neg_j_current=True,
         )
-        # DC/DC has separate i_c / j_c columns and i_p / j_p.
-        _build_two_port_separate_currents(
-            self.result.get("dcdc"), "dcdc_name",
-            DC_DCDC_COLS["i_p"], DC_DCDC_COLS["j_p"],
-            DC_DCDC_COLS["i_c"], DC_DCDC_COLS["j_c"],
-            DC_DCDC_COLS["i_node"], DC_DCDC_COLS["j_node"], result.dcdc_converters,
+        result.dcdc_converters = _make_two_port_separate_dict(
+            result.arrays.get("dcdc"),
+            "dcdc_name",
+            DC_DCDC_COLS["i_p"],
+            DC_DCDC_COLS["j_p"],
+            DC_DCDC_COLS["i_c"],
+            DC_DCDC_COLS["j_c"],
+            DC_DCDC_COLS["i_node"],
+            DC_DCDC_COLS["j_node"],
         )
-        _build_single_port(
-            self.result.get("zero_branch"), "zero_branch_name",
-            DC_ZERO_BRANCH_COLS["p"], DC_ZERO_BRANCH_COLS["current"],
-            DC_ZERO_BRANCH_COLS["i_node"], result.zero_branches,
+        result.zero_branches = _make_single_port_dict(
+            result.arrays.get("zero_branch"),
+            "zero_branch_name",
+            DC_ZERO_BRANCH_COLS["p"],
+            DC_ZERO_BRANCH_COLS["current"],
+            DC_ZERO_BRANCH_COLS["i_node"],
         )
-        _build_single_port(
-            self.result.get("break"), "break_name",
-            DC_BREAK_COLS["p"], DC_BREAK_COLS["current"],
-            DC_BREAK_COLS["i_node"], result.breakers,
+        result.breakers = _make_single_port_dict(
+            result.arrays.get("break"),
+            "break_name",
+            DC_BREAK_COLS["p"],
+            DC_BREAK_COLS["current"],
+            DC_BREAK_COLS["i_node"],
             status_cols=(
                 DC_BREAK_COLS["closed_status_set"],
                 DC_BREAK_COLS["closed_status"],
             ),
         )
-        _build_single_port(
-            self.result.get("gen"), "gen_name",
-            DC_GEN_COLS["p"], DC_GEN_COLS["current"],
-            DC_GEN_COLS["node"], result.generators,
+        result.generators = _make_single_port_dict(
+            result.arrays.get("gen"),
+            "gen_name",
+            DC_GEN_COLS["p"],
+            DC_GEN_COLS["current"],
+            DC_GEN_COLS["node"],
         )
-        _build_single_port(
-            self.result.get("load"), "load_name",
-            DC_LOAD_COLS["p"], DC_LOAD_COLS["current"],
-            DC_LOAD_COLS["node"], result.loads,
+        result.loads = _make_single_port_dict(
+            result.arrays.get("load"),
+            "load_name",
+            DC_LOAD_COLS["p"],
+            DC_LOAD_COLS["current"],
+            DC_LOAD_COLS["node"],
         )
         return result
 

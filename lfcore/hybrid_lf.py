@@ -34,14 +34,19 @@ except ImportError:  # pragma: no cover - direct script import path
         csc_matrix,
         csr_matrix,
     )
+from itertools import starmap
 try:
     from lfcore.common import (
+        DCACPortResult,
+        LazyResultDict,
         device_key as _lf_device_key,
         normalize_result_mode as _normalize_lf_result_mode,
         result_name_list,
     )
 except ImportError:  # pragma: no cover - direct script import path
     from common import (
+        DCACPortResult,
+        LazyResultDict,
         device_key as _lf_device_key,
         normalize_result_mode as _normalize_lf_result_mode,
         result_name_list,
@@ -4961,41 +4966,38 @@ class HybridPowerFlowCalc:
             active_rows = np.flatnonzero(active)
             if active_rows.size == 0:
                 return
-            if names is not None and len(names) == dcac_table.shape[0]:
-                row_names = result_name_list(names, dcac_table.shape[0])
-                keys = [
-                    row_names[pos] or str(int(dcac_table[pos, DCAC_COLS["idx"]]))
-                    for pos in active_rows
-                ]
-            else:
-                keys = [str(int(dcac_table[pos, DCAC_COLS["idx"]])) for pos in active_rows]
+            # 拷贝活动换流器快照数组并延迟构造结果对象字典
+            active_table = dcac_table[active_rows].copy()
+            dc_v_active = dc_v_by_row[active_rows].copy()
+            ac_v_active = ac_v_by_row[active_rows].copy()
+            total_rows = int(dcac_table.shape[0])
 
-            dc_p = dcac_table[active, DCAC_COLS["dc_p"]].tolist()
-            dc_i = dcac_table[active, DCAC_COLS["dc_i"]].tolist()
-            ac_p = dcac_table[active, DCAC_COLS["ac_p"]].tolist()
-            ac_q = dcac_table[active, DCAC_COLS["ac_q"]].tolist()
-            ac_i = dcac_table[active, DCAC_COLS["ac_i"]].tolist()
-            dc_v = dc_v_by_row[active].tolist()
-            ac_v = ac_v_by_row[active].tolist()
-            result.dcac.dcac_converters.update(
-                zip(
+            def _build_dcac_dict():
+                if names is not None and len(names) == total_rows:
+                    row_names = result_name_list(names, total_rows)
+                    keys = [
+                        row_names[pos] or str(int(active_table[k, DCAC_COLS["idx"]]))
+                        for k, pos in enumerate(active_rows.tolist())
+                    ]
+                else:
+                    keys = [str(int(val)) for val in active_table[:, DCAC_COLS["idx"]].tolist()]
+                return zip(
                     keys,
-                    [
-                        SimpleNamespace(
-                            i_p=p_dc,
-                            i_c=i_dc,
-                            i_v=v_dc,
-                            j_p=p_ac,
-                            j_q=q_ac,
-                            j_c=i_ac,
-                            j_v=v_ac,
-                        )
-                        for p_dc, i_dc, v_dc, p_ac, q_ac, i_ac, v_ac in zip(
-                            dc_p, dc_i, dc_v, ac_p, ac_q, ac_i, ac_v
-                        )
-                    ],
+                    starmap(
+                        DCACPortResult,
+                        zip(
+                            active_table[:, DCAC_COLS["dc_p"]].tolist(),
+                            active_table[:, DCAC_COLS["dc_i"]].tolist(),
+                            dc_v_active.tolist(),
+                            active_table[:, DCAC_COLS["ac_p"]].tolist(),
+                            active_table[:, DCAC_COLS["ac_q"]].tolist(),
+                            active_table[:, DCAC_COLS["ac_i"]].tolist(),
+                            ac_v_active.tolist(),
+                        ),
+                    ),
                 )
-            )
+
+            result.dcac.dcac_converters = LazyResultDict(_build_dcac_dict, int(active_rows.size))
 
     def _build_lf_result(self, ac_V=None, dc_V=None) -> HybridLFResult:
         ac_result = self.ac_calc._build_lf_result_from_ppc() if self.ac_calc is not None else None

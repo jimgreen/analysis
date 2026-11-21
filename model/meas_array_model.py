@@ -510,12 +510,35 @@ def _grow_measurement_arrays(arrays: Tuple[np.ndarray, ...], new_size: int) -> T
     return tuple(grown)
 
 
-def _try_parse_meas_ppc_bulk_bytes(source: Path, *, include_matrix: bool = True) -> Optional[Dict]:
-    """Fast bulk-token parser for standard unquoted <Measurement> blocks.
+def _rows_by_device_type_code_fast(device_type_code_array: np.ndarray) -> Dict[int, np.ndarray]:
+    """一次分组构造按设备类型码划分的行号索引，避免多类型时反复全表扫描。"""
+    n = int(device_type_code_array.size)
+    if n == 0:
+        return {}
+    order = np.argsort(device_type_code_array, kind="stable").astype(np.int64, copy=False)
+    sorted_codes = device_type_code_array[order]
+    change = np.flatnonzero(sorted_codes[1:] != sorted_codes[:-1]) + 1
+    starts = np.empty(change.size + 1, dtype=np.int64)
+    starts[0] = 0
+    starts[1:] = change
+    stops = np.empty(change.size + 1, dtype=np.int64)
+    stops[:-1] = change
+    stops[-1] = n
+    return {
+        int(sorted_codes[int(s)]): order[int(s) : int(e)]
+        for s, e in zip(starts.tolist(), stops.tolist())
+    }
 
-    Returns ``None`` to fall back to the line-by-line parser whenever the file
-    contains quotes, a status column, blank/comment lines inside the block,
-    missing headers, or ragged row widths.
+
+def _try_parse_meas_ppc_bulk_bytes(
+    source: Path,
+    *,
+    include_strings: bool = False,
+    include_matrix: bool = True,
+) -> Optional[Dict]:
+    """标准无引号 <Measurement> 块的高速字节批量解析器（同时支持数组模式与全字符串模式）。
+
+    当文件含单引号、status 列、块内空行/注释或列宽不一致时返回 None 并回退逐行解析器。
     """
     try:
         raw = source.read_bytes()
@@ -542,6 +565,8 @@ def _try_parse_meas_ppc_bulk_bytes(source: Path, *, include_matrix: bool = True)
     header_index = {name: idx for idx, name in enumerate(header)}
     if any(name not in header_index for name in _REQUIRED_COLUMNS_BYTES):
         return None
+    if include_strings and b"name" not in header_index:
+        return None
     if b"status" in header_index:
         return None
     data_bytes = body[header_end + 1 :].strip()
@@ -554,8 +579,8 @@ def _try_parse_meas_ppc_bulk_bytes(source: Path, *, include_matrix: bool = True)
     tokens = data_bytes.split()
     if len(tokens) != n_rows * ncols:
         return None
-    # Verify every row starts with '#'
-    if set(tokens[0::ncols]) != {b"#"}:
+    # 直接计数 '#' 校验行首标记，避免构造临时 set
+    if tokens[0::ncols].count(b"#") != n_rows:
         return None
 
     idx_pos = header_index[b"idx"] + 1
@@ -568,53 +593,77 @@ def _try_parse_meas_ppc_bulk_bytes(source: Path, *, include_matrix: bool = True)
 
     try:
         idx_array = np.fromiter(map(int, tokens[idx_pos::ncols]), dtype=np.int64, count=n_rows)
-        weight_values = np.fromiter(map(float, tokens[weight_pos::ncols]), dtype=np.float64, count=n_rows)
+        weight_toks = tokens[weight_pos::ncols]
+        first_weight = weight_toks[0]
+        if weight_toks.count(first_weight) == n_rows:
+            weight_values = np.full(n_rows, float(first_weight), dtype=np.float64)
+        else:
+            weight_values = np.fromiter(map(float, weight_toks), dtype=np.float64, count=n_rows)
         value_values = np.fromiter(map(float, tokens[value_pos::ncols]), dtype=np.float64, count=n_rows)
     except ValueError:
         return None
 
-    valid_values = np.fromiter(map(b"1".__eq__, tokens[valid_pos::ncols]), dtype=bool, count=n_rows)
-    status_values = np.where(valid_values, MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID).astype(np.int16, copy=False)
+    valid_toks = tokens[valid_pos::ncols]
+    if valid_toks.count(b"1") == n_rows:
+        valid_values = np.ones(n_rows, dtype=bool)
+        status_values = np.full(n_rows, MEAS_STATUS_NORMAL, dtype=np.int16)
+    else:
+        valid_values = np.fromiter(map(b"1".__eq__, valid_toks), dtype=bool, count=n_rows)
+        status_values = np.where(valid_values, MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID).astype(np.int16, copy=False)
 
     dev_get = _DEVICE_TYPE_CODES_BYTES.get
     dev_toks = tokens[dev_type_pos::ncols]
-    dev_map = {tok: dev_get(tok, 0) for tok in dict.fromkeys(dev_toks)}
+    dev_uniq = list(dict.fromkeys(dev_toks))
+    dev_map = {tok: dev_get(tok, 0) for tok in dev_uniq}
     device_type_code_array = np.fromiter(map(dev_map.__getitem__, dev_toks), dtype=np.int16, count=n_rows)
 
     meas_get = _MEAS_TYPE_CODES_BYTES.get
     meas_toks = tokens[meas_type_pos::ncols]
-    meas_map = {tok: meas_get(tok, meas_get(tok.upper(), 0)) for tok in dict.fromkeys(meas_toks)}
+    meas_uniq = list(dict.fromkeys(meas_toks))
+    meas_map = {tok: meas_get(tok, meas_get(tok.upper(), 0)) for tok in meas_uniq}
     meas_type_code_array = np.fromiter(map(meas_map.__getitem__, meas_toks), dtype=np.int16, count=n_rows)
 
     name_toks = tokens[dev_name_pos::ncols]
-    unique_name_bytes = dict.fromkeys(name_toks)
-    name_to_id = {tok: i for i, tok in enumerate(unique_name_bytes)}
+    unique_name_bytes = list(dict.fromkeys(name_toks))
+    name_to_id = dict(zip(unique_name_bytes, range(len(unique_name_bytes))))
     device_name_id = np.fromiter(map(name_to_id.__getitem__, name_toks), dtype=np.int32, count=n_rows)
-    intern = sys.intern
-    device_names_list = [intern(tok.decode("utf8")) for tok in unique_name_bytes]
+    # 所有 token 经 bytes.split() 切分，必定不含换行符，可整块一次性 UTF-8 解码
+    device_names_list = b"\n".join(unique_name_bytes).decode("utf8").split("\n")
+    device_names_arr = np.asarray(device_names_list, dtype=object)
 
-    rows_by_code = {
-        int(code): np.flatnonzero(device_type_code_array == int(code)).astype(np.int64, copy=False)
-        for code in np.unique(device_type_code_array)
-    }
+    if include_strings:
+        name_col_pos = header_index[b"name"] + 1
+        name_arr = np.asarray(b"\n".join(tokens[name_col_pos::ncols]).decode("utf8").split("\n"), dtype=object)
+        dev_str_map = {tok: tok.decode("utf8") for tok in dev_uniq}
+        device_type_arr = np.asarray(list(map(dev_str_map.__getitem__, dev_toks)), dtype=object)
+        device_name_arr = device_names_arr[device_name_id]
+        meas_str_map = {}
+        for tok in meas_uniq:
+            text_tok = tok.decode("utf8")
+            meas_str_map[tok] = text_tok if dev_get is not None and meas_get(tok, 0) != 0 else text_tok.upper()
+        meas_type_arr = np.asarray(list(map(meas_str_map.__getitem__, meas_toks)), dtype=object)
+    else:
+        name_arr = device_type_arr = device_name_arr = meas_type_arr = None
+
+    rows_by_code = _rows_by_device_type_code_fast(device_type_code_array)
     device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
     return _build_ppc(
         source=source,
         idx=idx_array,
-        name=None,
-        device_type=None,
-        device_name=None,
-        meas_type=None,
+        name=name_arr,
+        device_type=device_type_arr,
+        device_name=device_name_arr,
+        meas_type=meas_type_arr,
         weight=weight_values,
         valid=valid_values,
         value=value_values,
         status=status_values,
-        include_strings=False,
+        include_strings=include_strings,
         rows_by_device_type_code=rows_by_code,
         device_type_code=device_type_code_array,
         meas_type_code=meas_type_code_array,
         device_name_id=device_name_id,
-        device_names=np.asarray(device_names_list, dtype=object),
+        device_names=device_names_arr,
         device_name_id_by_name=device_name_id_by_name,
         include_matrix=include_matrix,
     )
@@ -920,6 +969,13 @@ def _build_meas_ppc_from_measurement_file(
 ) -> Dict:
     if not include_strings:
         return _build_meas_ppc_from_measurement_file_array_only(source, include_matrix=include_matrix)
+    bulk_result = _try_parse_meas_ppc_bulk_bytes(
+        source,
+        include_strings=True,
+        include_matrix=include_matrix,
+    )
+    if bulk_result is not None:
+        return bulk_result
     header = ()
     idx_col = name_col = device_type_col = device_name_col = meas_type_col = -1
     weight_col = valid_col = value_col = -1
@@ -1110,12 +1166,12 @@ def build_meas_ppc_from_e_file(
     source = resolve_project_file(file_path).resolve()
     include_strings = bool(include_strings)
     include_matrix = bool(include_matrix)
-    parsed = _build_meas_ppc_from_measurement_file(
+    # 全新解析结果已拥有独立数组，无需再次深拷贝
+    return _build_meas_ppc_from_measurement_file(
         source,
         include_strings=include_strings,
         include_matrix=include_matrix,
     )
-    return copy_meas_ppc(parsed)
 
 
 def copy_meas_ppc(ppc: Dict) -> Dict:

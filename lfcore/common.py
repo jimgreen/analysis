@@ -86,6 +86,149 @@ class DCSwitchResult:
     closed_status: int
 
 
+@dataclass(slots=True)
+class DCACPortResult:
+    i_p: float
+    i_c: float
+    i_v: float
+    j_p: float
+    j_q: float
+    j_c: float
+    j_v: float
+
+
+class LazyResultDict(dict):
+    """按需物化的 dict 子类，兼容 isinstance(..., dict) 与全部字典操作。
+
+    在 result_mode='full' 构建结果对象时仅保存数组快照与构造闭包，首次访问某张
+    设备表时一次性批量物化，避免为未读取的设备表创建数十万个 Python 对象。
+    """
+
+    __slots__ = ("_builder", "_count", "_materialized")
+
+    def __init__(self, builder, count: int) -> None:
+        super().__init__()
+        self._count = int(count)
+        if self._count <= 0 or builder is None:
+            self._builder = None
+            self._materialized = True
+        else:
+            self._builder = builder
+            self._materialized = False
+
+    def _ensure(self) -> None:
+        if not self._materialized:
+            builder = self._builder
+            self._builder = None
+            self._materialized = True
+            if builder is not None:
+                super().update(builder())
+
+    def __bool__(self) -> bool:
+        if not self._materialized:
+            return self._count > 0
+        return super().__len__() > 0
+
+    def __len__(self) -> int:
+        self._ensure()
+        return super().__len__()
+
+    def __getitem__(self, key):
+        self._ensure()
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value) -> None:
+        self._ensure()
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key) -> None:
+        self._ensure()
+        super().__delitem__(key)
+
+    def __contains__(self, key) -> bool:
+        self._ensure()
+        return super().__contains__(key)
+
+    def __iter__(self):
+        self._ensure()
+        return super().__iter__()
+
+    def __reversed__(self):
+        self._ensure()
+        return super().__reversed__()
+
+    def get(self, key, default=None):
+        self._ensure()
+        return super().get(key, default)
+
+    def keys(self):
+        self._ensure()
+        return super().keys()
+
+    def values(self):
+        self._ensure()
+        return super().values()
+
+    def items(self):
+        self._ensure()
+        return super().items()
+
+    def pop(self, *args):
+        self._ensure()
+        return super().pop(*args)
+
+    def popitem(self):
+        self._ensure()
+        return super().popitem()
+
+    def clear(self) -> None:
+        self._builder = None
+        self._count = 0
+        self._materialized = True
+        super().clear()
+
+    def update(self, *args, **kwargs) -> None:
+        self._ensure()
+        super().update(*args, **kwargs)
+
+    def setdefault(self, key, default=None):
+        self._ensure()
+        return super().setdefault(key, default)
+
+    def copy(self) -> dict:
+        self._ensure()
+        return super().copy()
+
+    def __repr__(self) -> str:
+        self._ensure()
+        return super().__repr__()
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, LazyResultDict):
+            other._ensure()
+        self._ensure()
+        return super().__eq__(other)
+
+    def __ne__(self, other) -> bool:
+        return not self.__eq__(other)
+
+    def __or__(self, other):
+        if isinstance(other, LazyResultDict):
+            other._ensure()
+        self._ensure()
+        return super().__or__(other)
+
+    def __ror__(self, other):
+        self._ensure()
+        return super().__ror__(other)
+
+    def __ior__(self, other):
+        if isinstance(other, LazyResultDict):
+            other._ensure()
+        self._ensure()
+        return super().__ior__(other)
+
+
 def build_result_voltage_lookup(bus_rows, idx_col: int, voltage_col: int):
     """Build a local node-id to voltage lookup for full LF result assembly.
 
@@ -149,12 +292,20 @@ def build_result_voltage_lookup(bus_rows, idx_col: int, voltage_col: int):
 def result_name_list(names, count: int):
     """Return result keys as Python strings without needless dtype conversion."""
     if names is None or len(names) != count:
-        return np.arange(count).astype(str).tolist()
+        return [str(i) for i in range(count)]
     if isinstance(names, np.ndarray):
+        if names.dtype == object:
+            vals = names.tolist()
+            if all(type(v) is str for v in vals):
+                return vals
+            return [str(v) for v in vals]
         return names.astype(str).tolist()
     from model.array_common import LazyNameArray
 
     if isinstance(names, LazyNameArray):
+        raw_list = names.raw_str_list()
+        if raw_list is not None:
+            return raw_list
         return names.tolist()
     values = names.tolist() if hasattr(names, "tolist") else list(names)
     return [str(value) for value in values]

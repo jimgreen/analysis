@@ -974,10 +974,10 @@ def build_ac_ppc_from_e_file(file_path) -> Dict:
     return build_ac_ppc_from_efile_rows(source, _read_efile_rows(source))
 
 
-def build_ac_ppc_from_efile_rows(file_path, rows) -> Dict:
+def build_ac_ppc_from_efile_rows(file_path, rows, *, run_states_propagated: bool = False) -> Dict:
     """Build AC ppc from E rows that are already loaded in memory."""
     source = resolve_project_file(file_path).resolve()
-    effective_rows, overrides = propagate_composite_run_states(rows)
+    effective_rows, overrides = (rows, []) if run_states_propagated else propagate_composite_run_states(rows)
     ppc = _build_ac_ppc_from_rows_dict(effective_rows, source)
     ppc["source"] = str(source)
     ppc["_effective_run_state_overrides"] = overrides

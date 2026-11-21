@@ -121,6 +121,21 @@ def propagate_composite_run_states(rows):
     if not isinstance(rows, Mapping):
         return rows, []
 
+    # 快速检查：若所有表头均不包含 idx_* 复合外键列，则无需构建别名表与关系图
+    has_idx_ref = False
+    for table in rows.values():
+        if not isinstance(table, Mapping):
+            continue
+        for column_name in table.get("header_list", ()):
+            name_str = str(column_name)
+            if len(name_str) > 4 and name_str[:4].lower() == "idx_":
+                has_idx_ref = True
+                break
+        if has_idx_ref:
+            break
+    if not has_idx_ref:
+        return rows, []
+
     aliases = _table_aliases(rows)
     relation_columns: Dict[str, Tuple[Tuple[int, str], ...]] = {}
     relevant_tables = set()

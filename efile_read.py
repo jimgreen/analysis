@@ -312,7 +312,8 @@ def _try_read_efile_rows_bulk(text: str):
             stride = len(header) + 1
             if stride <= 1 or len(tokens) != nrows * stride:
                 return None
-            if set(tokens[0::stride]) != {"#"}:
+            # 直接统计首列 '#' 个数，避免构造临时集合与字符串哈希
+            if tokens[0::stride].count("#") != nrows:
                 return None
             rows = _FlatTableRows(tokens, stride, nrows)
         data[table_name] = {

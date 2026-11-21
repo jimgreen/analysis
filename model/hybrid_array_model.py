@@ -26,7 +26,21 @@ from dc_array_model import (
 )
 from efile_read import _read_efile_rows, efile_factory_from_file, efile_factory_from_rows
 from model.effective_state import propagate_composite_run_states
-from model.array_common import _current_scale_by_node
+from model.array_common import (
+    _build_node_float_lookup,
+    _cell,
+    _code_column,
+    _current_scale_by_node,
+    _empty,
+    _float_cell,
+    _float_column,
+    _int_cell,
+    _int_column,
+    _names_from_rows,
+    _raw_vbase_by_node,
+    _rows_for,
+    _scale_by_node,
+)
 from model.setpoint_validation import (
     append_setpoint_corrections,
     sanitize_fixed_setpoints,
@@ -198,89 +212,8 @@ def _int_attr(obj, attr: str, default: int = 0) -> int:
     return default if value in (None, "") else int(float(value))
 
 
-def _empty(width: int) -> np.ndarray:
-    return np.zeros((0, width), dtype=np.float64)
-
-
-def _rows_for(data: Dict, table_name: str):
-    table = data.get(table_name)
-    if not table:
-        return {}, []
-    return {str(name): pos for pos, name in enumerate(table.get("header_list", []))}, table.get("rows", [])
-
-
-def _cell(row, col, default=""):
-    if col is None or col >= len(row):
-        return default
-    value = row[col]
-    return default if value in (None, "") else value
-
-
-def _float_cell(row, col, default: float = 0.0) -> float:
-    return float(_cell(row, col, default))
-
-
-def _int_cell(row, col, default: int = 0) -> int:
-    return int(float(_cell(row, col, default)))
-
-
-def _float_column(table_rows, columns, attr: str, default: float = 0.0) -> np.ndarray:
-    col = columns.get(attr)
-    n = len(table_rows)
-    if col is None or n == 0:
-        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
-    values = [None] * n
-    for i in range(n):
-        row = table_rows[i]
-        if col >= len(row):
-            values[i] = default
-        else:
-            v = row[col]
-            values[i] = default if v in (None, "") else float(v)
-    return np.asarray(values, dtype=np.float64)
-
-
-def _int_column(table_rows, columns, attr: str, default: int = 0) -> np.ndarray:
-    col = columns.get(attr)
-    n = len(table_rows)
-    if col is None or n == 0:
-        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
-    values = [None] * n
-    for i in range(n):
-        row = table_rows[i]
-        if col >= len(row):
-            values[i] = default
-        else:
-            v = row[col]
-            values[i] = default if v in (None, "") else int(float(v))
-    return np.asarray(values, dtype=np.float64)
-
-
-def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:
-    col = columns.get(attr)
-    default = mapping[default_label]
-    if col is None:
-        return np.full(len(table_rows), float(default), dtype=np.float64)
-    return np.asarray(
-        [mapping.get(str(_cell(row, col, default_label)).upper(), default) for row in table_rows],
-        dtype=np.float64,
-    )
-
-
-def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -> np.ndarray:
-    name_col = columns.get("name")
-    if name_col is None:
-        return np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
-    return np.asarray(
-        [
-            str(_cell(row, name_col, "") or f"{prefix}_{int(idx_values[pos])}")
-            for pos, row in enumerate(table_rows)
-        ],
-        dtype=object,
-    )
-
-
-def _raw_vbase_maps(ac_ppc: Dict, dc_ppc: Dict) -> Tuple[Dict[int, float], Dict[int, float], Dict[int, float], Dict[int, float]]:
+def _raw_vbase_maps(ac_ppc: Dict, dc_ppc: Dict):
+    """构建交直流节点电压基准向量化查找表；电流基准表按需懒构造。"""
     ac_base = ac_ppc["base"]
     p_base_kW = float(ac_base["p_base_kW"])
     ac_u_scale = float(ac_base["u_scale"])
@@ -292,29 +225,36 @@ def _raw_vbase_maps(ac_ppc: Dict, dc_ppc: Dict) -> Tuple[Dict[int, float], Dict[
     dc_ids = dc_ppc["bus"][:, DC_BUS_COLS["idx"]]
     ac_vbase = ac_ppc["bus"][:, AC_BUS_COLS["vbase"]]
     dc_vbase = dc_ppc["bus"][:, DC_BUS_COLS["vbase"]]
-    ac_raw_vbase = dict(zip(map(int, ac_ids.tolist()), (ac_vbase * ac_u_scale).tolist()))
-    dc_raw_vbase = dict(zip(map(int, dc_ids.tolist()), (dc_vbase * dc_u_scale).tolist()))
-    ac_current = _current_scale_by_node(ac_ids, ac_vbase, p_base_kW, ac_i_scale, ac=True)
-    dc_current = _current_scale_by_node(dc_ids, dc_vbase, p_base_kW, dc_i_scale)
-    return ac_raw_vbase, dc_raw_vbase, ac_current, dc_current
+    ac_raw_vbase = _build_node_float_lookup(ac_ids, ac_vbase * ac_u_scale, 0.0)
+    dc_raw_vbase = _build_node_float_lookup(dc_ids, dc_vbase * dc_u_scale, 0.0)
+    ac_current_cache = [None]
+    dc_current_cache = [None]
 
+    def get_ac_current():
+        if ac_current_cache[0] is None:
+            ac_current_cache[0] = _current_scale_by_node(ac_ids, ac_vbase, p_base_kW, ac_i_scale, ac=True)
+        return ac_current_cache[0]
 
-def _scale_by_node(node_values: np.ndarray, scales_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.asarray([scales_by_idx.get(int(node), 1.0) for node in node_values], dtype=np.float64)
+    def get_dc_current():
+        if dc_current_cache[0] is None:
+            dc_current_cache[0] = _current_scale_by_node(dc_ids, dc_vbase, p_base_kW, dc_i_scale)
+        return dc_current_cache[0]
 
-
-def _raw_vbase_by_node(node_values: np.ndarray, raw_vbase_by_idx: Dict[int, float]) -> np.ndarray:
-    return np.asarray([raw_vbase_by_idx.get(int(node), 0.0) for node in node_values], dtype=np.float64)
+    return ac_raw_vbase, dc_raw_vbase, get_ac_current, get_dc_current
 
 
 def _ppc_bus_value_by_node(ppc: Dict, node_values: np.ndarray, col: int, default: float = 0.0) -> np.ndarray:
     bus = np.asarray(ppc.get("bus", np.zeros((0, 0))), dtype=np.float64)
     if bus.size == 0:
         return np.full(node_values.shape, default, dtype=np.float64)
-    idx = bus[:, 0].astype(np.int64, copy=False)
-    values = bus[:, col].astype(np.float64, copy=False)
-    value_by_idx = {int(node_id): float(value) for node_id, value in zip(idx, values)}
-    return np.asarray([value_by_idx.get(int(node), default) for node in node_values], dtype=np.float64)
+    lookup = _build_node_float_lookup(bus[:, 0], bus[:, col], default)
+    if hasattr(lookup, "lookup_array"):
+        return lookup.lookup_array(node_values, default)
+    getter = lookup.get
+    nodes = np.asarray(node_values, dtype=np.int64).reshape(-1)
+    return np.fromiter((getter(node, default) for node in nodes.tolist()), dtype=np.float64, count=nodes.size).reshape(
+        node_values.shape
+    )
 
 
 def _voltage_set_column(
@@ -322,7 +262,7 @@ def _voltage_set_column(
     columns,
     attr: str,
     node_values: np.ndarray,
-    raw_vbase_by_idx: Dict[int, float],
+    raw_vbase_by_idx,
     *,
     default: float = 1.0,
 ) -> np.ndarray:
@@ -342,8 +282,10 @@ def _current_column(
     columns,
     attr: str,
     node_values: np.ndarray,
-    current_scale_by_node: Dict[int, float],
+    current_scale_by_node,
 ) -> np.ndarray:
+    if callable(current_scale_by_node):
+        current_scale_by_node = current_scale_by_node()
     raw = _float_column(table_rows, columns, attr)
     scales = _scale_by_node(node_values.astype(np.int64, copy=False), current_scale_by_node)
     return np.divide(raw, scales, out=np.zeros_like(raw), where=np.abs(scales) > 1e-12)
@@ -509,21 +451,40 @@ def _build_dcac_from_rows(
     out[:, DCAC_COLS["dc_node"]] = _int_column(table_rows, columns, "dc_node")
     out[:, DCAC_COLS["r1"]] = _float_column(table_rows, columns, "r1")
     out[:, DCAC_COLS["r2"]] = _float_column(table_rows, columns, "r2")
-    control_pairs = [
-        validate_dcac_control_types(
-            _cell(row, columns["ac_control_type"], "NONE"),
-            _cell(row, columns["dc_control_type"], "NONE"),
+    n_conv = len(table_rows)
+    ac_ctrl_toks = table_rows.flat_str_column(columns["ac_control_type"]) if hasattr(table_rows, "flat_str_column") else None
+    dc_ctrl_toks = table_rows.flat_str_column(columns["dc_control_type"]) if hasattr(table_rows, "flat_str_column") else None
+    if ac_ctrl_toks is not None and dc_ctrl_toks is not None:
+        # 仅对唯一控制模式组合做一次合法性校验，避免逐行物化扁平表
+        pair_cache = {}
+        ac_codes = np.empty(n_conv, dtype=np.float64)
+        dc_codes = np.empty(n_conv, dtype=np.float64)
+        for pos, pair in enumerate(zip(ac_ctrl_toks, dc_ctrl_toks)):
+            coded = pair_cache.get(pair)
+            if coded is None:
+                ac_c, dc_c = validate_dcac_control_types(pair[0], pair[1])
+                coded = (float(DCAC_AC_CONTROL_CODE[ac_c]), float(DCAC_DC_CONTROL_CODE[dc_c]))
+                pair_cache[pair] = coded
+            ac_codes[pos] = coded[0]
+            dc_codes[pos] = coded[1]
+        out[:, DCAC_COLS["ac_control_type"]] = ac_codes
+        out[:, DCAC_COLS["dc_control_type"]] = dc_codes
+    else:
+        control_pairs = [
+            validate_dcac_control_types(
+                _cell(row, columns["ac_control_type"], "NONE"),
+                _cell(row, columns["dc_control_type"], "NONE"),
+            )
+            for row in table_rows
+        ]
+        out[:, DCAC_COLS["ac_control_type"]] = np.asarray(
+            [DCAC_AC_CONTROL_CODE[ac_control] for ac_control, _dc_control in control_pairs],
+            dtype=np.float64,
         )
-        for row in table_rows
-    ]
-    out[:, DCAC_COLS["ac_control_type"]] = np.asarray(
-        [DCAC_AC_CONTROL_CODE[ac_control] for ac_control, _dc_control in control_pairs],
-        dtype=np.float64,
-    )
-    out[:, DCAC_COLS["dc_control_type"]] = np.asarray(
-        [DCAC_DC_CONTROL_CODE[dc_control] for _ac_control, dc_control in control_pairs],
-        dtype=np.float64,
-    )
+        out[:, DCAC_COLS["dc_control_type"]] = np.asarray(
+            [DCAC_DC_CONTROL_CODE[dc_control] for _ac_control, dc_control in control_pairs],
+            dtype=np.float64,
+        )
     out[:, DCAC_COLS["p_ac_set"]] = _power_column(table_rows, columns, "p_ac_set", p_base)
     out[:, DCAC_COLS["p_dc_set"]] = _power_column(table_rows, columns, "p_dc_set", p_base)
     out[:, DCAC_COLS["q_ac_set"]] = _power_column(table_rows, columns, "q_ac_set", p_base)
@@ -567,14 +528,25 @@ def _build_dcac_from_rows(
     if "ac_i" in columns:
         out[:, DCAC_COLS["ac_i"]] = _current_column(table_rows, columns, "ac_i", out[:, DCAC_COLS["ac_node"]], ac_current)
     dev_type_col = columns.get("dev_type")
-    dev_type_labels = [
-        normalize_dcac_device_type(_cell(row, dev_type_col, "DCACConverter"))
-        for row in table_rows
-    ]
-    out[:, DCAC_COLS["dev_type"]] = np.asarray(
-        [DCAC_DEVICE_TYPE_CODE[label] for label in dev_type_labels],
-        dtype=np.float64,
-    )
+    if dev_type_col is None:
+        dev_type_labels = ["DCACConverter"] * n_conv
+        out[:, DCAC_COLS["dev_type"]] = float(DCAC_DEVICE_TYPE_CODE["DCACConverter"])
+    else:
+        dev_toks = table_rows.flat_str_column(dev_type_col) if hasattr(table_rows, "flat_str_column") else None
+        if dev_toks is not None:
+            norm_map = {tok: normalize_dcac_device_type(tok) for tok in dict.fromkeys(dev_toks)}
+            code_map = {tok: float(DCAC_DEVICE_TYPE_CODE[label]) for tok, label in norm_map.items()}
+            out[:, DCAC_COLS["dev_type"]] = np.fromiter(map(code_map.__getitem__, dev_toks), dtype=np.float64, count=n_conv)
+            dev_type_labels = [norm_map[tok] for tok in dev_toks] if build_objects else []
+        else:
+            dev_type_labels = [
+                normalize_dcac_device_type(_cell(row, dev_type_col, "DCACConverter"))
+                for row in table_rows
+            ]
+            out[:, DCAC_COLS["dev_type"]] = np.asarray(
+                [DCAC_DEVICE_TYPE_CODE[label] for label in dev_type_labels],
+                dtype=np.float64,
+            )
 
     names = _names_from_rows(table_rows, columns, "dcac", out[:, DCAC_COLS["idx"]])
     if not build_objects:
@@ -618,13 +590,12 @@ def build_hybrid_ppc_from_e_file(file_path):
 
 def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
     effective_rows, overrides = propagate_composite_run_states(rows)
-    ac_ppc = build_ac_ppc_from_efile_rows(file_path, effective_rows)
-    dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows)
+    ac_ppc = build_ac_ppc_from_efile_rows(file_path, effective_rows, run_states_propagated=True)
+    dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows, run_states_propagated=True)
     ac_ppc["source"] = str(file_path)
     dc_ppc["source"] = str(file_path)
-    vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
     dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(
-        effective_rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
+        effective_rows, ac_ppc, dc_ppc, build_objects=False
     )
     acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
     acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
@@ -650,8 +621,8 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
 
 def build_hybrid_ppc_from_efile_rows(file_path, rows):
     effective_rows, overrides = propagate_composite_run_states(rows)
-    ac_ppc = build_ac_ppc_from_efile_rows(file_path, effective_rows)
-    dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows)
+    ac_ppc = build_ac_ppc_from_efile_rows(file_path, effective_rows, run_states_propagated=True)
+    dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows, run_states_propagated=True)
     ac_network = _build_ac_network_from_ppc(ac_ppc)
     dc_network = _build_dc_network_from_ppc(dc_ppc)
     ac_ppc["source"] = str(file_path)

@@ -718,7 +718,7 @@ def build_ac_ppc_with_topology_from_e_file(file_path) -> Dict:
 
 def build_ac_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
     """Build AC PPC from already loaded E rows and attach topology arrays."""
-    source = Path(file_path).resolve()
+    source = file_path if isinstance(file_path, Path) and file_path.is_absolute() else Path(file_path).resolve()
     ppc = build_ac_ppc_from_efile_rows(source, rows)
     ppc["source"] = str(source)
     return ensure_ac_ppc_topology(ppc)
@@ -732,7 +732,7 @@ def build_dc_ppc_with_topology_from_e_file(file_path) -> Dict:
 
 def build_dc_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
     """Build DC PPC from already loaded E rows and attach topology arrays."""
-    source = Path(file_path).resolve()
+    source = file_path if isinstance(file_path, Path) and file_path.is_absolute() else Path(file_path).resolve()
     ppc = build_dc_ppc_from_efile_rows(source, rows)
     ppc["source"] = str(source)
     return ensure_dc_ppc_topology(ppc)
@@ -740,7 +740,7 @@ def build_dc_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
 
 def build_hybrid_ppc_with_topology_from_efile_rows(file_path, rows) -> Dict:
     """Build hybrid PPC from already loaded E rows and attach AC/DC topology arrays."""
-    source = Path(file_path).resolve()
+    source = file_path if isinstance(file_path, Path) and file_path.is_absolute() else Path(file_path).resolve()
     ppc = build_hybrid_ppc_only_from_efile_rows(source, rows)
     ppc["source"] = str(source)
     if ppc.get("ac") is not None:

@@ -216,6 +216,12 @@ class LazyNameArray:
             return list(self._raw_list)
         return self._materialize().tolist()
 
+    def raw_str_list(self):
+        """返回只读底层字符串列表（若已就绪），供内部只读装配避免额外拷贝。"""
+        if self._raw_list is not None and self._array is None:
+            return self._raw_list
+        return None
+
 
 def _rows_for(data: Dict, table_name: str):
     table = data.get(table_name)
@@ -297,12 +303,21 @@ def _code_value(value, mapping: Dict[str, int], default_label: str) -> int:
 
 def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:
     col = columns.get(attr)
+    n = len(table_rows)
     default = mapping[default_label]
-    if col is None:
-        return np.full(len(table_rows), float(default), dtype=np.float64)
+    if col is None or n == 0:
+        return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    if hasattr(table_rows, "flat_str_column"):
+        flat_tokens = table_rows.flat_str_column(col)
+        if flat_tokens is not None:
+            # 仅对列中极少数唯一字符串做一次归一化映射，避免数万次重复 .upper() 与类型判断
+            val_map = {tok: float(_code_value(tok, mapping, default_label)) for tok in dict.fromkeys(flat_tokens)}
+            return np.fromiter(map(val_map.__getitem__, flat_tokens), dtype=np.float64, count=n)
     if hasattr(table_rows, "raw_column"):
         raw = table_rows.raw_column(col, default_label)
-        return np.asarray([_code_value(value, mapping, default_label) for value in raw], dtype=np.float64)
+        raw_list = raw.tolist()
+        val_map = {tok: float(_code_value(tok, mapping, default_label)) for tok in dict.fromkeys(raw_list)}
+        return np.fromiter(map(val_map.__getitem__, raw_list), dtype=np.float64, count=n)
     return np.asarray(
         [_code_value(_cell(row, col, default_label), mapping, default_label) for row in table_rows],
         dtype=np.float64,

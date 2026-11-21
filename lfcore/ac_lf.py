@@ -81,6 +81,7 @@ try:
         ACSwitchResult,
         ACThreePortResult,
         ACTwoPortResult,
+        LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -96,6 +97,7 @@ except ImportError:  # pragma: no cover - direct script import path
         ACSwitchResult,
         ACThreePortResult,
         ACTwoPortResult,
+        LazyResultDict,
         allocate_grouped_residual,
         allocate_limited_residual,
         build_result_voltage_lookup,
@@ -3161,63 +3163,76 @@ class ACPowerFlowCalc:
         return self._build_lf_result_from_ppc()
 
     def _build_lf_result_from_ppc(self) -> ACLFResult:
-        # 后处理：把 ppc 风格的 numpy 结果数组转成 dict[name]->SimpleNamespace。
-        # 之前是逐行 Python 循环（30k 节点时占总耗时 ~33%），改成
-        # 按列向量化抽取 + 单次 searchsorted 做节点电压查表。
+        """基于 PPC 结果数组构建按需物化的 ACLFResult（全部字段保持 dict 兼容）。"""
         result = ACLFResult()
         result.arrays = dict(self.result)
-        bus = self.result.get("bus")
+        bus = result.arrays.get("bus")
         if bus is None or len(bus) == 0:
             return result
 
-        bus_volt = bus[:, BUS_COLS["voltage"]]
-        bus_angle = bus[:, BUS_COLS["angle"]]
-        _lookup_voltage = build_result_voltage_lookup(
-            bus, BUS_COLS["idx"], BUS_COLS["voltage"]
-        )
+        ppc = self.ppc
+        voltage_lookup_box = [None]
 
-        def _name_list(key, n):
-            return result_name_list(self.ppc.get(key), n)
+        def _get_voltage_lookup():
+            fn = voltage_lookup_box[0]
+            if fn is None:
+                fn = build_result_voltage_lookup(bus, BUS_COLS["idx"], BUS_COLS["voltage"])
+                voltage_lookup_box[0] = fn
+            return fn
 
-        n_bus = len(bus)
-        bus_names = _name_list("bus_name", n_bus)
-        result.nodes = dict(
-            zip(bus_names, starmap(ACNodeResult, zip(bus_volt.tolist(), bus_angle.tolist())))
-        )
+        bus_names_ref = ppc.get("bus_name")
 
-        def _build_two_port(rows, name_key, cols, target):
+        def _build_nodes():
+            names = result_name_list(bus_names_ref, len(bus))
+            return zip(
+                names,
+                starmap(
+                    ACNodeResult,
+                    zip(bus[:, BUS_COLS["voltage"]].tolist(), bus[:, BUS_COLS["angle"]].tolist()),
+                ),
+            )
+
+        result.nodes = LazyResultDict(_build_nodes, len(bus))
+
+        def _make_two_port_dict(rows, name_key, cols):
             if rows is None or len(rows) == 0:
-                return
-            names = _name_list(name_key, len(rows))
-            i_p = rows[:, cols["i_p"]].tolist()
-            i_q = rows[:, cols["i_q"]].tolist()
-            i_c = rows[:, cols["i_c"]].tolist()
-            j_p = rows[:, cols["j_p"]].tolist()
-            j_q = rows[:, cols["j_q"]].tolist()
-            j_c = rows[:, cols["j_c"]].tolist()
-            i_v = _lookup_voltage(rows[:, cols["i_node"]]).tolist()
-            j_v = _lookup_voltage(rows[:, cols["j_node"]]).tolist()
-            target.update(
-                zip(
+                return {}
+            raw_names = ppc.get(name_key)
+
+            def _builder():
+                lookup = _get_voltage_lookup()
+                names = result_name_list(raw_names, len(rows))
+                return zip(
                     names,
                     starmap(
                         ACTwoPortResult,
-                        zip(i_p, i_q, i_c, i_v, j_p, j_q, j_c, j_v),
+                        zip(
+                            rows[:, cols["i_p"]].tolist(),
+                            rows[:, cols["i_q"]].tolist(),
+                            rows[:, cols["i_c"]].tolist(),
+                            lookup(rows[:, cols["i_node"]]).tolist(),
+                            rows[:, cols["j_p"]].tolist(),
+                            rows[:, cols["j_q"]].tolist(),
+                            rows[:, cols["j_c"]].tolist(),
+                            lookup(rows[:, cols["j_node"]]).tolist(),
+                        ),
                     ),
                 )
-            )
 
-        _build_two_port(self.result.get("branch"), "branch_name", BRANCH_COLS, result.branches)
-        _build_two_port(self.result.get("transformer"), "transformer_name", TRANSFORMER_COLS, result.transformers)
-        three_rows = self.result.get("three_winding_transformer")
+            return LazyResultDict(_builder, len(rows))
+
+        result.branches = _make_two_port_dict(result.arrays.get("branch"), "branch_name", BRANCH_COLS)
+        result.transformers = _make_two_port_dict(result.arrays.get("transformer"), "transformer_name", TRANSFORMER_COLS)
+
+        three_rows = result.arrays.get("three_winding_transformer")
         if three_rows is not None and len(three_rows):
-            cols3 = THREE_WINDING_TRANSFORMER_COLS
-            names = _name_list("three_winding_transformer_name", len(three_rows))
-            i_v = _lookup_voltage(three_rows[:, cols3["i_node"]]).tolist()
-            j_v = _lookup_voltage(three_rows[:, cols3["j_node"]]).tolist()
-            k_v = _lookup_voltage(three_rows[:, cols3["k_node"]]).tolist()
-            result.three_winding_transformers.update(
-                zip(
+            three_names_ref = ppc.get("three_winding_transformer_name")
+
+            def _build_three_winding():
+                cols3 = THREE_WINDING_TRANSFORMER_COLS
+                lookup = _get_voltage_lookup()
+                names = result_name_list(three_names_ref, len(three_rows))
+                return zip(
                     names,
                     starmap(
                         ACThreePortResult,
@@ -3225,26 +3240,29 @@ class ACPowerFlowCalc:
                             three_rows[:, cols3["i_p"]].tolist(),
                             three_rows[:, cols3["i_q"]].tolist(),
                             three_rows[:, cols3["i_c"]].tolist(),
-                            i_v,
+                            lookup(three_rows[:, cols3["i_node"]]).tolist(),
                             three_rows[:, cols3["j_p"]].tolist(),
                             three_rows[:, cols3["j_q"]].tolist(),
                             three_rows[:, cols3["j_c"]].tolist(),
-                            j_v,
+                            lookup(three_rows[:, cols3["j_node"]]).tolist(),
                             three_rows[:, cols3["k_p"]].tolist(),
                             three_rows[:, cols3["k_q"]].tolist(),
                             three_rows[:, cols3["k_c"]].tolist(),
-                            k_v,
+                            lookup(three_rows[:, cols3["k_node"]]).tolist(),
                         ),
                     ),
                 )
-            )
-        acac_rows = self.result.get("acac")
+
+            result.three_winding_transformers = LazyResultDict(_build_three_winding, len(three_rows))
+
+        acac_rows = result.arrays.get("acac")
         if acac_rows is not None and len(acac_rows):
-            names = _name_list("acac_name", len(acac_rows))
-            i_v = _lookup_voltage(acac_rows[:, ACAC_COLS["i_node"]]).tolist()
-            j_v = _lookup_voltage(acac_rows[:, ACAC_COLS["j_node"]]).tolist()
-            result.acac_converters.update(
-                zip(
+            acac_names_ref = ppc.get("acac_name")
+
+            def _build_acac():
+                lookup = _get_voltage_lookup()
+                names = result_name_list(acac_names_ref, len(acac_rows))
+                return zip(
                     names,
                     starmap(
                         ACTwoPortResult,
@@ -3252,75 +3270,72 @@ class ACPowerFlowCalc:
                             acac_rows[:, ACAC_COLS["i_p"]].tolist(),
                             acac_rows[:, ACAC_COLS["i_q"]].tolist(),
                             acac_rows[:, ACAC_COLS["i_i"]].tolist(),
-                            i_v,
+                            lookup(acac_rows[:, ACAC_COLS["i_node"]]).tolist(),
                             acac_rows[:, ACAC_COLS["j_p"]].tolist(),
                             acac_rows[:, ACAC_COLS["j_q"]].tolist(),
                             acac_rows[:, ACAC_COLS["j_i"]].tolist(),
-                            j_v,
+                            lookup(acac_rows[:, ACAC_COLS["j_node"]]).tolist(),
                         ),
                     ),
                 )
-            )
 
-        def _build_single_port(
-            rows,
-            name_key,
-            p_col,
-            q_col,
-            c_col,
-            node_col,
-            target,
-            *,
-            status_cols=None,
-        ):
+            result.acac_converters = LazyResultDict(_build_acac, len(acac_rows))
+
+        def _make_single_port_dict(rows, name_key, p_col, q_col, c_col, node_col, *, status_cols=None):
             if rows is None or len(rows) == 0:
-                return
-            names = _name_list(name_key, len(rows))
-            i_p = rows[:, p_col].tolist()
-            i_q = rows[:, q_col].tolist()
-            i_c = rows[:, c_col].tolist()
-            i_v = _lookup_voltage(rows[:, node_col]).tolist()
-            if status_cols is None:
-                target.update(
-                    zip(names, starmap(ACSinglePortResult, zip(i_p, i_q, i_c, i_v)))
-                )
-            else:
+                return {}
+            raw_names = ppc.get(name_key)
+
+            def _builder():
+                lookup = _get_voltage_lookup()
+                names = result_name_list(raw_names, len(rows))
+                i_p = rows[:, p_col].tolist()
+                i_q = rows[:, q_col].tolist()
+                i_c = rows[:, c_col].tolist()
+                i_v = lookup(rows[:, node_col]).tolist()
+                if status_cols is None:
+                    return zip(names, starmap(ACSinglePortResult, zip(i_p, i_q, i_c, i_v)))
                 st_set = rows[:, status_cols[0]].astype(np.int64, copy=False).tolist()
                 st_cur = rows[:, status_cols[1]].astype(np.int64, copy=False).tolist()
-                target.update(
-                    zip(
-                        names,
-                        starmap(ACSwitchResult, zip(i_p, i_q, i_c, i_v, st_set, st_cur)),
-                    )
-                )
+                return zip(names, starmap(ACSwitchResult, zip(i_p, i_q, i_c, i_v, st_set, st_cur)))
 
-        _build_single_port(
-            self.result.get("zero_branch"), "zero_branch_name",
-            ZERO_BRANCH_COLS["p"], ZERO_BRANCH_COLS["q"],
-            ZERO_BRANCH_COLS["current"], ZERO_BRANCH_COLS["i_node"],
-            result.zero_branches,
+            return LazyResultDict(_builder, len(rows))
+
+        result.zero_branches = _make_single_port_dict(
+            result.arrays.get("zero_branch"),
+            "zero_branch_name",
+            ZERO_BRANCH_COLS["p"],
+            ZERO_BRANCH_COLS["q"],
+            ZERO_BRANCH_COLS["current"],
+            ZERO_BRANCH_COLS["i_node"],
         )
-        _build_single_port(
-            self.result.get("break"), "break_name",
-            SWITCH_COLS["p"], SWITCH_COLS["q"],
-            SWITCH_COLS["current"], SWITCH_COLS["i_node"],
-            result.breakers,
+        result.breakers = _make_single_port_dict(
+            result.arrays.get("break"),
+            "break_name",
+            SWITCH_COLS["p"],
+            SWITCH_COLS["q"],
+            SWITCH_COLS["current"],
+            SWITCH_COLS["i_node"],
             status_cols=(
                 SWITCH_COLS["closed_status_set"],
                 SWITCH_COLS["closed_status"],
             ),
         )
-        _build_single_port(
-            self.result.get("gen"), "gen_name",
-            GEN_COLS["p"], GEN_COLS["q"],
-            GEN_COLS["current"], GEN_COLS["node"],
-            result.generators,
+        result.generators = _make_single_port_dict(
+            result.arrays.get("gen"),
+            "gen_name",
+            GEN_COLS["p"],
+            GEN_COLS["q"],
+            GEN_COLS["current"],
+            GEN_COLS["node"],
         )
-        _build_single_port(
-            self.result.get("load"), "load_name",
-            LOAD_COLS["p"], LOAD_COLS["q"],
-            LOAD_COLS["current"], LOAD_COLS["node"],
-            result.loads,
+        result.loads = _make_single_port_dict(
+            result.arrays.get("load"),
+            "load_name",
+            LOAD_COLS["p"],
+            LOAD_COLS["q"],
+            LOAD_COLS["current"],
+            LOAD_COLS["node"],
         )
         return result
 

@@ -82,20 +82,173 @@ def build_seresult_summary(
     return se_result
 
 
+def _sanitize_e_text(text: str) -> str:
+    """将字符串转换为 E 文件单个 token（空串转 '-'，含空白符时以 '_' 连接）。"""
+    if not text:
+        return "-"
+    if " " not in text and "\t" not in text and "\n" not in text and "\r" not in text:
+        return text
+    return "_".join(text.split())
+
+
+def _extract_table_columns_chunk(
+    table: MeasurementTable,
+    positions: np.ndarray,
+    *,
+    estimated: Optional[np.ndarray],
+    residual: Optional[np.ndarray],
+    normalized: Optional[np.ndarray],
+):
+    """按批抽取测量结果表各列 Python 列表，供行物化、to_dicts 与 E 文本导出共享。"""
+    device_pos = getattr(table, "device_pos", None)
+    meas_codes = getattr(table, "meas_type_code", None)
+    max_pos = int(positions[-1])
+
+    def text_column(values, fallback):
+        if values.size > max_pos:
+            selected = values[positions]
+            if values.dtype.kind in "OUS":
+                selected = selected.tolist()
+                # 绝大多数元素已经是 str，避免不必要的逐个 str() 调用
+                if all(type(x) is str for x in selected):
+                    return selected
+            return list(map(str, selected))
+        return [str(values[p]) if p < values.size else fallback(int(p)) for p in positions.tolist()]
+
+    def coded_text(values, codes, names_map):
+        if values.size == 0 and codes is not None and len(codes) > max_pos:
+            lookup = names_map.get
+            return [lookup(code, "") for code in codes[positions].tolist()]
+        return text_column(
+            values,
+            lambda p: names_map.get(int(codes[p]), "") if codes is not None and len(codes) > p else "",
+        )
+
+    def optional_column(values):
+        if values is None or values.size == 0:
+            return None
+        if values.size > max_pos:
+            return values[positions].tolist()
+        n_val = int(values.size)
+        return [float(values[p]) if p < n_val else None for p in positions.tolist()]
+
+    def missing_device_name(p):
+        return f"pos:{int(device_pos[p])}" if device_pos is not None and len(device_pos) > p and int(device_pos[p]) >= 0 else ""
+
+    ids = table.idx[positions].astype(np.int64, copy=False).tolist()
+    if table.name.size == 0:
+        names = [f"m{idx}" for idx in ids]
+    else:
+        names = text_column(table.name, lambda p: f"m{int(table.idx[p])}")
+    device_types = coded_text(table.device_type, table.device_type_code, DEVICE_TYPE_NAMES)
+    if table.device_name.size == 0 and device_pos is not None and len(device_pos) > max_pos:
+        device_names = [f"pos:{pos}" if pos >= 0 else "" for pos in device_pos[positions].tolist()]
+    else:
+        device_names = text_column(table.device_name, missing_device_name)
+    meas_types = coded_text(table.meas_type, meas_codes, MEAS_TYPE_NAMES)
+    weights = table.weight[positions].astype(np.float64, copy=False).tolist()
+    valid = table.valid[positions].astype(bool, copy=False).tolist()
+    values = table.value[positions].astype(np.float64, copy=False).tolist()
+    estimates = optional_column(estimated)
+    residuals = optional_column(residual)
+    normalized_values = optional_column(normalized)
+    return (
+        ids,
+        names,
+        device_types,
+        device_names,
+        meas_types,
+        weights,
+        valid,
+        values,
+        estimates,
+        residuals,
+        normalized_values,
+    )
+
+
+class _ColumnarMeasurementBatch:
+    """不可变列式测量结果视图，延迟物化 SEResult.MeasurementRow 对象。"""
+
+    __slots__ = ("table", "positions", "estimated", "residual", "normalized", "source", "reasons")
+
+    def __init__(
+        self,
+        table: MeasurementTable,
+        positions: np.ndarray,
+        *,
+        estimated: Optional[np.ndarray] = None,
+        residual: Optional[np.ndarray] = None,
+        normalized: Optional[np.ndarray] = None,
+        source: str = "",
+        reasons: Optional[List[str]] = None,
+    ) -> None:
+        self.table = table
+        self.positions = np.asarray(positions, dtype=np.intp)
+        self.estimated = None if estimated is None else np.asarray(estimated, dtype=np.float64)
+        self.residual = None if residual is None else np.asarray(residual, dtype=np.float64)
+        self.normalized = None if normalized is None else np.asarray(normalized, dtype=np.float64)
+        self.source = str(source)
+        self.reasons = reasons
+
+
 class _MeasurementResultTable:
-    __slots__ = ("rows",)
+    __slots__ = ("_rows", "_columnar")
 
     def __init__(self, rows: Optional[Iterable["SEResult.MeasurementRow"]] = None) -> None:
-        self.rows = list(rows or ())
+        self._rows: Optional[List["SEResult.MeasurementRow"]] = list(rows or ())
+        self._columnar: Optional[_ColumnarMeasurementBatch] = None
+
+    @classmethod
+    def _from_columnar(cls, batch: _ColumnarMeasurementBatch):
+        inst = cls.__new__(cls)
+        if batch.positions.size == 0:
+            inst._rows = []
+            inst._columnar = None
+        else:
+            inst._rows = None
+            inst._columnar = batch
+        return inst
+
+    def _materialize(self) -> List["SEResult.MeasurementRow"]:
+        rows = self._rows
+        if rows is None:
+            batch = self._columnar
+            if batch is None or batch.positions.size == 0:
+                rows = []
+            else:
+                rows = _measurement_rows_from_table(
+                    batch.table,
+                    batch.positions,
+                    estimated=batch.estimated,
+                    residual=batch.residual,
+                    normalized=batch.normalized,
+                    source=batch.source,
+                    reasons=batch.reasons,
+                )
+            self._rows = rows
+            self._columnar = None
+        return rows
+
+    @property
+    def rows(self) -> List["SEResult.MeasurementRow"]:
+        return self._materialize()
+
+    @rows.setter
+    def rows(self, value: Iterable["SEResult.MeasurementRow"]) -> None:
+        self._rows = list(value)
+        self._columnar = None
 
     def __len__(self) -> int:
-        return len(self.rows)
+        if self._rows is not None:
+            return len(self._rows)
+        return int(self._columnar.positions.size) if self._columnar is not None else 0
 
     def __iter__(self):
-        return iter(self.rows)
+        return iter(self._materialize())
 
     def __getitem__(self, index: int):
-        return self.rows[index]
+        return self._materialize()[index]
 
     def append(
         self,
@@ -107,7 +260,7 @@ class _MeasurementResultTable:
         reason: str = "",
         source: str = "",
     ) -> None:
-        self.rows.append(
+        self._materialize().append(
             SEResult.MeasurementRow.from_measurement(
                 measurement,
                 estimated_value=estimated_value,
@@ -119,13 +272,99 @@ class _MeasurementResultTable:
         )
 
     def append_row(self, row: "SEResult.MeasurementRow") -> None:
-        self.rows.append(row)
+        self._materialize().append(row)
 
     def extend(self, rows: Iterable["SEResult.MeasurementRow"]) -> None:
-        self.rows.extend(rows)
+        self._materialize().extend(rows)
 
     def to_dicts(self) -> List[dict]:
-        return [asdict(row) for row in self.rows]
+        """高速导出字典列表（跳过 dataclasses.asdict 的递归 deepcopy 开销）。"""
+        if self._columnar is not None and self._rows is None:
+            batch = self._columnar
+            positions_all = batch.positions
+            n_total = int(positions_all.size)
+            if n_total == 0:
+                return []
+            src = batch.source
+            reasons_all = batch.reasons
+            out: List[dict] = []
+            out_extend = out.extend
+            for start in range(0, n_total, 16384):
+                pos_chunk = positions_all[start : start + 16384]
+                chunk_len = int(pos_chunk.size)
+                (
+                    ids,
+                    names,
+                    device_types,
+                    device_names,
+                    meas_types,
+                    weights,
+                    valid,
+                    values,
+                    estimates,
+                    residuals,
+                    normalized_values,
+                ) = _extract_table_columns_chunk(
+                    batch.table,
+                    pos_chunk,
+                    estimated=batch.estimated,
+                    residual=batch.residual,
+                    normalized=batch.normalized,
+                )
+                est_iter = repeat(None, chunk_len) if estimates is None else estimates
+                res_iter = repeat(None, chunk_len) if residuals is None else residuals
+                nrm_iter = repeat(None, chunk_len) if normalized_values is None else normalized_values
+                rsn_iter = repeat("", chunk_len) if reasons_all is None else reasons_all[start : start + chunk_len]
+                out_extend(
+                    {
+                        "idx": idx,
+                        "name": name,
+                        "device_type": dt,
+                        "device_name": dn,
+                        "meas_type": mt,
+                        "weight": w,
+                        "valid": vld,
+                        "value": val,
+                        "estimated_value": est,
+                        "residual": res,
+                        "normalized_residual": nrm,
+                        "reason": rsn,
+                        "source": src,
+                    }
+                    for idx, name, dt, dn, mt, w, vld, val, est, res, nrm, rsn in zip(
+                        ids,
+                        names,
+                        device_types,
+                        device_names,
+                        meas_types,
+                        weights,
+                        valid,
+                        values,
+                        est_iter,
+                        res_iter,
+                        nrm_iter,
+                        rsn_iter,
+                    )
+                )
+            return out
+        return [
+            {
+                "idx": r.idx,
+                "name": r.name,
+                "device_type": r.device_type,
+                "device_name": r.device_name,
+                "meas_type": r.meas_type,
+                "weight": r.weight,
+                "valid": r.valid,
+                "value": r.value,
+                "estimated_value": r.estimated_value,
+                "residual": r.residual,
+                "normalized_residual": r.normalized_residual,
+                "reason": r.reason,
+                "source": r.source,
+            }
+            for r in self._rows
+        ]
 
 
 @dataclass
@@ -434,21 +673,153 @@ class SEResult:
         return "\n\n".join(blocks) + "\n"
 
     def write_e_file(self, file_path: Path) -> None:
+        """分块高速写入 E 格式状态估计结果文件，避免超大结果单字符串峰值拷贝。"""
         path = Path(file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_e_text(), encoding="utf-8")
+        table_specs = (
+            ("SEResultPrefilteredMeasurement", self.prefiltered_measurements),
+            ("SEResultPseudoMeasurement", self.pseudo_measurements),
+            ("SEResultBadData", self.bad_data),
+            ("SEResultNormalMeasurement", self.normal_measurements),
+        )
+        with open(path, mode="wt", encoding="utf-8", buffering=1024 * 1024) as fp:
+            fp.write(self._statistics_block_to_e())
+            for block_name, table in table_specs:
+                fp.write("\n\n")
+                for chunk in self._iter_measurement_block_e_chunks(block_name, table):
+                    fp.write(chunk)
+            fp.write("\n")
 
     def _statistics_block_to_e(self) -> str:
         columns = self._STATISTICS_COLUMNS
         values = [getattr(self.statistics, name) for name in columns]
         return self._block_to_e("SEResultStatistics", columns, [values])
 
+    @classmethod
+    def _iter_measurement_block_e_chunks(cls, block_name: str, table: _MeasurementResultTable):
+        header_line = f"<{block_name}>\n@ " + " ".join(cls._MEASUREMENT_COLUMNS)
+        n_rows = len(table)
+        if n_rows == 0:
+            yield f"{header_line}\n</{block_name}>"
+            return
+        yield header_line + "\n"
+        sanitize = _sanitize_e_text
+        if table._columnar is not None and table._rows is None:
+            batch = table._columnar
+            positions_all = batch.positions
+            src_tok = sanitize(batch.source)
+            reasons_all = batch.reasons
+            # 预先对固定枚举映射表做清洗，避免在几十万行内重复判断空白符
+            for start in range(0, n_rows, 16384):
+                pos_chunk = positions_all[start : start + 16384]
+                chunk_len = int(pos_chunk.size)
+                (
+                    ids,
+                    names,
+                    device_types,
+                    device_names,
+                    meas_types,
+                    weights,
+                    valid,
+                    values,
+                    estimates,
+                    residuals,
+                    normalized_values,
+                ) = _extract_table_columns_chunk(
+                    batch.table,
+                    pos_chunk,
+                    estimated=batch.estimated,
+                    residual=batch.residual,
+                    normalized=batch.normalized,
+                )
+                # 对字符串列做轻量清洗：仅当出现空串或空白符时才替换
+                names_s = [sanitize(s) for s in names]
+                dt_map = {s: sanitize(s) for s in dict.fromkeys(device_types)}
+                dt_s = list(map(dt_map.__getitem__, device_types))
+                dn_map = {s: sanitize(s) for s in dict.fromkeys(device_names)}
+                dn_s = list(map(dn_map.__getitem__, device_names))
+                mt_map = {s: sanitize(s) for s in dict.fromkeys(meas_types)}
+                mt_s = list(map(mt_map.__getitem__, meas_types))
+
+                all_est = estimates is not None and (batch.estimated is not None and batch.estimated.size > int(pos_chunk[-1]))
+                all_res = residuals is not None and (batch.residual is not None and batch.residual.size > int(pos_chunk[-1]))
+                all_nrm = normalized_values is not None and (batch.normalized is not None and batch.normalized.size > int(pos_chunk[-1]))
+
+                if reasons_all is None and all_est and all_res and all_nrm:
+                    lines = [
+                        f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} {est:.12g} {res:.12g} {nrm:.12g} - {src_tok}"
+                        for idx, nm, dt, dn, mt, w, vld, val, est, res, nrm in zip(
+                            ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, estimates, residuals, normalized_values
+                        )
+                    ]
+                elif reasons_all is None and all_est and all_res and normalized_values is None:
+                    lines = [
+                        f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} {est:.12g} {res:.12g} - - {src_tok}"
+                        for idx, nm, dt, dn, mt, w, vld, val, est, res in zip(
+                            ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, estimates, residuals
+                        )
+                    ]
+                elif estimates is None and residuals is None and normalized_values is None:
+                    if reasons_all is None:
+                        lines = [
+                            f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - - {src_tok}"
+                            for idx, nm, dt, dn, mt, w, vld, val in zip(
+                                ids, names_s, dt_s, dn_s, mt_s, weights, valid, values
+                            )
+                        ]
+                    else:
+                        rsn_chunk = [sanitize(s) for s in reasons_all[start : start + chunk_len]]
+                        lines = [
+                            f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - {rsn} {src_tok}"
+                            for idx, nm, dt, dn, mt, w, vld, val, rsn in zip(
+                                ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, rsn_chunk
+                            )
+                        ]
+                else:
+                    est_iter = repeat(None, chunk_len) if estimates is None else estimates
+                    res_iter = repeat(None, chunk_len) if residuals is None else residuals
+                    nrm_iter = repeat(None, chunk_len) if normalized_values is None else normalized_values
+                    rsn_iter = (
+                        repeat("-", chunk_len)
+                        if reasons_all is None
+                        else [sanitize(s) for s in reasons_all[start : start + chunk_len]]
+                    )
+                    lines = [
+                        (
+                            f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} "
+                            f"{'-' if est is None else format(est, '.12g')} "
+                            f"{'-' if res is None else format(res, '.12g')} "
+                            f"{'-' if nrm is None else format(nrm, '.12g')} {rsn} {src_tok}"
+                        )
+                        for idx, nm, dt, dn, mt, w, vld, val, est, res, nrm, rsn in zip(
+                            ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, est_iter, res_iter, nrm_iter, rsn_iter
+                        )
+                    ]
+                yield "\n".join(lines) + "\n"
+            yield f"</{block_name}>"
+            return
+
+        # 已物化 MeasurementRow 列表同样走直接属性访问 + f-string 快速路径
+        rows_list = table._rows or ()
+        for start in range(0, len(rows_list), 16384):
+            chunk_rows = rows_list[start : start + 16384]
+            lines = [
+                (
+                    f"# {int(r.idx)} {sanitize(str(r.name))} {sanitize(str(r.device_type))} "
+                    f"{sanitize(str(r.device_name))} {sanitize(str(r.meas_type))} "
+                    f"{float(r.weight):.12g} {'1' if r.valid else '0'} {float(r.value):.12g} "
+                    f"{'-' if r.estimated_value is None else format(float(r.estimated_value), '.12g')} "
+                    f"{'-' if r.residual is None else format(float(r.residual), '.12g')} "
+                    f"{'-' if r.normalized_residual is None else format(float(r.normalized_residual), '.12g')} "
+                    f"{sanitize(str(r.reason))} {sanitize(str(r.source))}"
+                )
+                for r in chunk_rows
+            ]
+            yield "\n".join(lines) + "\n"
+        yield f"</{block_name}>"
+
     def _measurement_block_to_e(self, block_name: str, table: _MeasurementResultTable) -> str:
-        rows = [
-            [getattr(row, name) for name in self._MEASUREMENT_COLUMNS]
-            for row in table
-        ]
-        return self._block_to_e(block_name, self._MEASUREMENT_COLUMNS, rows)
+        return "".join(self._iter_measurement_block_e_chunks(block_name, table))
 
     @classmethod
     def _block_to_e(cls, block_name: str, columns: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
@@ -663,18 +1034,20 @@ def build_seresult_full_from_table(
     all_measurement_table: Optional[MeasurementTable] = None,
     active_source_rows: Optional[Sequence[int]] = None,
 ) -> "SEResult":
-    """Build a full SEResult from array-backed measurement tables."""
+    """Build a full SEResult from array-backed measurement tables with lazy row materialization."""
     table = result.measurement_table
     if table is None:
         raise RuntimeError("SEResult full output requires result.measurement_table")
     se_result = SEResult()
     bad_items = list(bad_items or ())
     normalized = np.asarray(normalized_residual, dtype=np.float64) if normalized_residual is not None else None
-    bad_positions = _bad_row_positions(bad_items, int(table.idx.size))
+    n_active = int(table.idx.size)
+    bad_positions = _bad_row_positions(bad_items, n_active)
     status_code = measurement_table_status_code(table)
 
+    prefiltered_count = 0
     if all_measurement_table is not None:
-        if active_source_rows is None and int(all_measurement_table.idx.size) == int(table.idx.size):
+        if active_source_rows is None and int(all_measurement_table.idx.size) == n_active:
             active_mask = np.ones(int(all_measurement_table.idx.size), dtype=bool)
         else:
             active_mask = _active_source_mask(all_measurement_table, active_source_rows)
@@ -685,23 +1058,52 @@ def build_seresult_full_from_table(
                 | (np.asarray(all_measurement_table.weight, dtype=np.float64) <= 0.0)
             )
         )
-        reasons = np.where(all_measurement_table.valid[prefiltered], "zero weight", "invalid").tolist()
-        se_result.prefiltered_measurements.extend(_measurement_rows_from_table(
-            all_measurement_table, prefiltered, reasons=reasons, source="prefiltered"))
+        prefiltered_count = int(prefiltered.size)
+        if prefiltered_count:
+            reasons = np.where(all_measurement_table.valid[prefiltered], "zero weight", "invalid").tolist()
+            se_result.prefiltered_measurements = SEResult.PrefilteredMeasurementTable._from_columnar(
+                _ColumnarMeasurementBatch(
+                    all_measurement_table,
+                    prefiltered,
+                    source="prefiltered",
+                    reasons=reasons,
+                )
+            )
 
     pseudo_mask = status_code == MEAS_STATUS_PSEUDO
+    pseudo_rows = np.flatnonzero(pseudo_mask)
+    pseudo_count = int(pseudo_rows.size)
     normal_mask = ~pseudo_mask
     if bad_positions:
         normal_mask[list(bad_positions)] = False
-    for target, mask, source in ((se_result.pseudo_measurements, pseudo_mask, "pseudo"),
-                                 (se_result.normal_measurements, normal_mask, "normal")):
-        target.extend(_measurement_rows_from_table(
-            table, np.flatnonzero(mask), estimated=result.z_est, residual=result.residual,
-            normalized=normalized, source=source))
+    normal_rows = np.flatnonzero(normal_mask)
+
+    if pseudo_count:
+        se_result.pseudo_measurements = SEResult.PseudoMeasurementTable._from_columnar(
+            _ColumnarMeasurementBatch(
+                table,
+                pseudo_rows,
+                estimated=result.z_est,
+                residual=result.residual,
+                normalized=normalized,
+                source="pseudo",
+            )
+        )
+    if normal_rows.size:
+        se_result.normal_measurements = SEResult.NormalMeasurementTable._from_columnar(
+            _ColumnarMeasurementBatch(
+                table,
+                normal_rows,
+                estimated=result.z_est,
+                residual=result.residual,
+                normalized=normalized,
+                source="normal",
+            )
+        )
 
     for item in bad_items:
         row_pos = int(getattr(item, "row_pos", -1))
-        if 0 <= row_pos < int(table.idx.size):
+        if 0 <= row_pos < n_active:
             row = SEResult.MeasurementRow.from_table_row(
                 table,
                 row_pos,
@@ -714,10 +1116,24 @@ def build_seresult_full_from_table(
         elif getattr(item, "measurement", None) is not None:
             se_result.bad_data.append_bad_data_item(item)
 
-    se_result.statistics = _seresult_statistics_from_table(
-        result,
-        bad_items=bad_items,
-        all_measurement_table=all_measurement_table,
-        active_source_rows=active_source_rows,
+    # 直接复用上面已计算的掩码计数，避免重复扫描整张量测表
+    bad_count = len(bad_items)
+    normal_count = max(0, n_active - pseudo_count - bad_count)
+    obs = result.observability
+    se_result.statistics = SEResult.StatisticsTable(
+        converged=bool(result.converged),
+        iterations=int(result.iterations),
+        objective=float(result.objective),
+        max_correction=float(result.max_correction),
+        residual_inf=float(result.residual_inf),
+        observable=bool(obs.observable),
+        rank=int(obs.rank),
+        state_count=int(obs.state_count),
+        measurement_count=int(obs.measurement_count),
+        deficiency=int(obs.deficiency),
+        prefiltered_measurement_count=prefiltered_count,
+        pseudo_measurement_count=pseudo_count,
+        bad_data_count=bad_count,
+        normal_measurement_count=normal_count,
     )
     return se_result
