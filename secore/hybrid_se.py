@@ -174,15 +174,22 @@ from secore.se_array_plan import (
 )
 from secore.se_math import (
     ANGLE_MEASUREMENT_TYPES,
+    CHOLMOD_ANALYZE_AAT,
+    CHOLMOD_CHOLESKY_AAT,
+    CholmodAAtNormalEquationPlan,
+    CholmodAAtNormalEquationSolver,
+    LowerNormalEquationCscPlan,
     NormalEquationSolver,
     SparseJacobianBuilder,
     _normal_equation_structural_pattern,
     angle_residual_mask,
     build_normal_equations,
+    full_normal_equation_from_lower,
     is_sparse_matrix,
     inverse_gain_for_bad_data,
     matrix_is_empty,
     measurement_leverage,
+    measurement_leverage_for_bad_data,
     observability_rank_details,
     observability_weak_direction,
     sparse_structural_rank,
@@ -1011,14 +1018,13 @@ class HybridStateEstimator:
         parameter_file: Path = DEFAULT_SE_PARAMETER_FILE,
         parameters: Optional[StateEstimationParameters] = None,
         profile: bool = False,
-        auto_prepare: bool = True,
-        power_flow_linear_solver: Optional[str] = None,
-        *,
         network: Optional[object] = None,
         measurements: Optional[object] = None,
         prepare_active_measurements: bool = True,
         defer_prepare_finalize: bool = False,
+        auto_prepare: bool = True,
         matrix_dump_dir: Optional[Path] = None,
+        power_flow_linear_solver: Optional[str] = None,
     ):
         self.profile_enabled = bool(profile)
         self.profile_times: Dict[str, float] = {}
@@ -7663,42 +7669,19 @@ class HybridStateEstimator:
         if delegate is not None:
             return 0
         existing_keys = set(self._active_measurement_keys())
-        required_specs = []
-        power_codes_by_device = {
-            DEVICE_TYPE_ACGenerator: {MEAS_TYPE_P_GEN, MEAS_TYPE_Q_GEN},
-            DEVICE_TYPE_ACLoad: {MEAS_TYPE_P_LOAD, MEAS_TYPE_Q_LOAD},
-            DEVICE_TYPE_ACZeroBranch: {MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM},
-            DEVICE_TYPE_ACBreak: {MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM},
-            DEVICE_TYPE_DCGenerator: {MEAS_TYPE_P_GEN},
-            DEVICE_TYPE_DCLoad: {MEAS_TYPE_P_LOAD},
-            DEVICE_TYPE_DCZeroBranch: {MEAS_TYPE_P_FROM},
-            DEVICE_TYPE_DCBreak: {MEAS_TYPE_P_FROM},
-            DEVICE_TYPE_DCACConverter: {MEAS_TYPE_P_DC, MEAS_TYPE_P_AC, MEAS_TYPE_Q_AC},
+        allowed_codes_by_device = {
+            DEVICE_TYPE_ACGenerator: (MEAS_TYPE_P_GEN, MEAS_TYPE_Q_GEN),
+            DEVICE_TYPE_ACLoad: (MEAS_TYPE_P_LOAD, MEAS_TYPE_Q_LOAD),
+            DEVICE_TYPE_ACZeroBranch: (MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM),
+            DEVICE_TYPE_ACBreak: (MEAS_TYPE_P_FROM, MEAS_TYPE_Q_FROM),
+            DEVICE_TYPE_DCGenerator: (MEAS_TYPE_P_GEN,),
+            DEVICE_TYPE_DCLoad: (MEAS_TYPE_P_LOAD,),
+            DEVICE_TYPE_DCZeroBranch: (MEAS_TYPE_P_FROM,),
+            DEVICE_TYPE_DCBreak: (MEAS_TYPE_P_FROM,),
+            DEVICE_TYPE_DCACConverter: (MEAS_TYPE_P_DC, MEAS_TYPE_P_AC, MEAS_TYPE_Q_AC),
+            DEVICE_TYPE_ACNode: (MEAS_TYPE_V,),
+            DEVICE_TYPE_DCNode: (MEAS_TYPE_V,),
         }
-        voltage_codes_by_device = {
-            DEVICE_TYPE_ACNode: {MEAS_TYPE_V},
-            DEVICE_TYPE_DCNode: {MEAS_TYPE_V},
-        }
-
-        def accept(spec) -> bool:
-            device_type_code = int(spec.device_type_code)
-            meas_type_code = int(spec.meas_type_code)
-            return (
-                meas_type_code in power_codes_by_device.get(device_type_code, set())
-                or meas_type_code in voltage_codes_by_device.get(device_type_code, set())
-            )
-
-        for spec in self._side_observability_pseudo_specs("ac"):
-            if accept(spec):
-                required_specs.append(spec)
-        for spec in self._side_observability_pseudo_specs("dc"):
-            if accept(spec):
-                required_specs.append(spec)
-        for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
-            if accept(spec):
-                required_specs.append(spec)
-        if not required_specs:
-            return 0
 
         idx_values = []
         device_type_codes = []
@@ -7706,16 +7689,72 @@ class HybridStateEstimator:
         meas_type_codes = []
         values = []
         next_idx = self._next_measurement_idx()
-        for spec in required_specs:
+        pack_key = self._packed_measurement_key
+        voltage_covered = self._voltage_pseudo_is_covered_by_code
+
+        def append_from_side_estimator(side: str, estimator) -> None:
+            nonlocal next_idx
+            if estimator is None:
+                return
+            candidates = estimator._observability_pseudo_candidate_measurements()
+            table = getattr(candidates, "table", None)
+            if table is None:
+                raise RuntimeError(f"{side.upper()} observability candidates must expose an array measurement table")
+            row_count = int(table.idx.size)
+            if row_count == 0:
+                return
+            dt_arr = np.asarray(table.device_type_code, dtype=np.int16)
+            dp_arr = np.asarray(table.device_pos, dtype=np.int64)
+            mt_arr = np.asarray(table.meas_type_code, dtype=np.int16)
+            val_arr = np.asarray(table.value, dtype=np.float64)
+            if not (dt_arr.size == dp_arr.size == mt_arr.size == val_arr.size == row_count):
+                raise RuntimeError(f"{side.upper()} observability candidate arrays have inconsistent sizes")
+            keep = np.zeros(row_count, dtype=bool)
+            for dt_code, mt_codes in allowed_codes_by_device.items():
+                dt_mask = dt_arr == dt_code
+                if not np.any(dt_mask):
+                    continue
+                mt_mask = np.zeros(row_count, dtype=bool)
+                for mt_code in mt_codes:
+                    mt_mask |= mt_arr == mt_code
+                keep |= dt_mask & mt_mask
+            keep &= (dt_arr > 0) & (mt_arr > 0) & (dp_arr >= 0)
+            selected = np.flatnonzero(keep)
+            if selected.size == 0:
+                return
+            sel_dt = dt_arr[selected].tolist()
+            sel_dp = dp_arr[selected].tolist()
+            sel_mt = mt_arr[selected].tolist()
+            sel_val = val_arr[selected].tolist()
+            for dt_code, dp_val, mt_code, fval in zip(sel_dt, sel_dp, sel_mt, sel_val):
+                key = pack_key(dt_code, dp_val, mt_code)
+                if key < 0 or key in existing_keys:
+                    continue
+                if mt_code == MEAS_TYPE_V and voltage_covered(dt_code, dp_val, mt_code):
+                    continue
+                idx_values.append(next_idx)
+                next_idx += 1
+                device_type_codes.append(dt_code)
+                device_positions.append(dp_val)
+                meas_type_codes.append(mt_code)
+                values.append(fval)
+                existing_keys.add(key)
+
+        append_from_side_estimator("ac", self._ac_sub_estimator)
+        append_from_side_estimator("dc", self._dc_sub_estimator)
+
+        for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
             device_type_code = int(spec.device_type_code)
             meas_type_code = int(spec.meas_type_code)
+            if meas_type_code not in allowed_codes_by_device.get(device_type_code, ()):
+                continue
             device_pos = int(spec.device_pos)
             if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
                 continue
-            key = self._packed_measurement_key(device_type_code, device_pos, meas_type_code)
+            key = pack_key(device_type_code, device_pos, meas_type_code)
             if key < 0 or key in existing_keys:
                 continue
-            if self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code):
+            if meas_type_code == MEAS_TYPE_V and voltage_covered(device_type_code, device_pos, meas_type_code):
                 continue
             idx_values.append(next_idx)
             next_idx += 1
@@ -9101,13 +9140,25 @@ class HybridStateEstimator:
         observability_cache = self._observability_matrix_cache_for(observability, measurements, x)
         cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
         z, weight = self._measurement_vectors(measurements)
-        uniform_weight = self.active_uniform_weight if measurements is self.active_measurements else self._uniform_weight(weight)
-        weights_are_uniform = self.active_weights_are_uniform if measurements is self.active_measurements else uniform_weight is not None
+        active_measurement_run = measurements is self.active_measurements
+        uniform_weight = self.active_uniform_weight if active_measurement_run else self._uniform_weight(weight)
+        weights_are_uniform = self.active_weights_are_uniform if active_measurement_run else uniform_weight is not None
         weighted_residual = None if weights_are_uniform else np.empty_like(weight)
-        normal_solver = NormalEquationSolver(assume_fixed_pattern=measurements is self.active_measurements)
-        normal_pattern = self._active_normal_pattern if measurements is self.active_measurements else None
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=active_measurement_run)
+        normal_pattern = self._active_normal_pattern if active_measurement_run else None
         if observability_cache is not None and observability_cache.get("normal_pattern") is not None:
             normal_pattern = observability_cache["normal_pattern"]
+        use_aat_normal_solver = (
+            getattr(self, "matrix_dump_dir", None) is None
+            and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None)
+            and self.n_state > 128
+        )
+        aat_solver = (
+            CholmodAAtNormalEquationSolver(assume_fixed_pattern=active_measurement_run)
+            if use_aat_normal_solver
+            else None
+        )
+        aat_plan = None
         if verbose:
             _print_iteration_header()
         converged = False
@@ -9127,81 +9178,142 @@ class HybridStateEstimator:
         cand_z_est = np.empty(n_meas, dtype=np.float64)
         cand_residual = np.empty(n_meas, dtype=np.float64)
         z_est_dirty = True
+        final_quantities_current = False
 
         for iteration in range(1, self.max_iter + 1):
             # An accepted line-search candidate already contains h(x) and its
             # residual. Re-evaluate only after an untested fallback step.
             if z_est_dirty:
+                start = time.perf_counter() if self.profile_enabled else None
                 self.evaluate(x, measurements, out=z_est)
+                if start is not None:
+                    self._record_profile_time("solve.evaluate", time.perf_counter() - start)
+                start = time.perf_counter() if self.profile_enabled else None
                 self._measurement_residual(z, z_est, measurements, out=residual)
                 objective = self._weighted_objective(weight, residual)
+                if start is not None:
+                    self._record_profile_time("solve.residual_objective", time.perf_counter() - start)
                 z_est_dirty = False
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if iteration == 1 and cached_initial_H is not None:
                 H = cached_initial_H
                 cached_initial_H = None
             else:
+                start = time.perf_counter() if self.profile_enabled else None
                 H = self.jacobian_sparse(x, measurements)
-            if normal_pattern is None and is_sparse_matrix(H):
-                normal_pattern = _normal_equation_structural_pattern(H)
-                if measurements is self.active_measurements:
-                    self._active_normal_pattern = normal_pattern
-                if observability_cache is not None:
-                    observability_cache["normal_pattern"] = normal_pattern
-            if weighted_residual is not None:
-                np.multiply(weight, residual, out=weighted_residual)
-            gain, rhs = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=measurements is self.active_measurements,
-            )
-            if getattr(self, "matrix_dump_dir", None) is not None:
-                self._dump_iteration_matrices(iteration, H, weight, gain)
-            dx, normal_factor_diag = normal_solver.solve(gain, rhs, return_factor_diag=final_diagnostics)
-            if dx.size and not np.all(np.isfinite(dx)):
-                diag_scale = 1.0
-                if is_sparse_matrix(gain):
-                    diag_values = np.asarray(gain.diagonal(), dtype=np.float64)
-                    finite_diag = diag_values[np.isfinite(diag_values) & (diag_values > 0.0)]
-                    if finite_diag.size:
-                        diag_scale = float(np.median(finite_diag))
-                    identity = sparse_eye(gain.shape[0], format="csc", dtype=np.float64)
-                    for damping_factor in (1e-10, 1e-8, 1e-6, 1e-4):
-                        damped_gain = gain + identity * (diag_scale * damping_factor)
-                        dx_candidate, normal_factor_diag = NormalEquationSolver().solve(
-                            damped_gain,
-                            rhs,
-                            return_factor_diag=final_diagnostics,
-                        )
-                        if dx_candidate.size == 0 or np.all(np.isfinite(dx_candidate)):
-                            dx = dx_candidate
-                            self._record_profile_time("solve.damped_normal_fallback", damping_factor)
-                            break
-                else:
-                    diag_values = np.diag(gain)
-                    finite_diag = diag_values[np.isfinite(diag_values) & (diag_values > 0.0)]
-                    if finite_diag.size:
-                        diag_scale = float(np.median(finite_diag))
-                    for damping_factor in (1e-10, 1e-8, 1e-6, 1e-4):
-                        damped_gain = np.array(gain, dtype=np.float64, copy=True)
-                        damped_gain[np.diag_indices_from(damped_gain)] += diag_scale * damping_factor
-                        dx_candidate, normal_factor_diag = NormalEquationSolver().solve(
-                            damped_gain,
-                            rhs,
-                            return_factor_diag=final_diagnostics,
-                        )
-                        if dx_candidate.size == 0 or np.all(np.isfinite(dx_candidate)):
-                            dx = dx_candidate
-                            self._record_profile_time("solve.damped_normal_fallback", damping_factor)
-                            break
+                if start is not None:
+                    self._record_profile_time("solve.jacobian", time.perf_counter() - start)
+
+            solved_via_aat = False
+            if use_aat_normal_solver and aat_solver is not None and is_sparse_matrix(H):
+                start = time.perf_counter() if self.profile_enabled else None
+                if aat_plan is not None and not active_measurement_run and not aat_plan.matches(H):
+                    aat_plan = None
+                if aat_plan is not None and active_measurement_run and (
+                    tuple(H.shape) != aat_plan.shape or int(H.nnz) != int(aat_plan.h_indices.size)
+                ):
+                    aat_plan = None
+                if aat_plan is None:
+                    aat_plan = CholmodAAtNormalEquationPlan.from_jacobian(H)
+                    aat_plan.prepare_fixed_weights(weight)
+                normal_operand, rhs = aat_plan.assemble(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=None,
+                    assume_fixed_weights=active_measurement_run,
+                    copy_rhs=False,
+                    assume_pattern_matches=active_measurement_run,
+                )
+                gain = None
+                if start is not None:
+                    self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
+                start = time.perf_counter() if self.profile_enabled else None
+                try:
+                    dx, normal_factor_diag = aat_solver.solve(
+                        normal_operand,
+                        rhs,
+                        return_factor_diag=False,
+                    )
+                    if dx.size == 0 or np.all(np.isfinite(dx)):
+                        solved_via_aat = True
+                except Exception:
+                    use_aat_normal_solver = False
+                    aat_solver = None
+                    aat_plan = None
+                if start is not None:
+                    self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
+
+            if not solved_via_aat:
+                if normal_pattern is None and is_sparse_matrix(H):
+                    normal_pattern = _normal_equation_structural_pattern(H)
+                    if active_measurement_run:
+                        self._active_normal_pattern = normal_pattern
+                    if observability_cache is not None:
+                        observability_cache["normal_pattern"] = normal_pattern
+                if weighted_residual is not None:
+                    np.multiply(weight, residual, out=weighted_residual)
+                start = time.perf_counter() if self.profile_enabled else None
+                gain, rhs = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    assume_normal_pattern_matches=active_measurement_run,
+                )
+                if start is not None:
+                    self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
+                if getattr(self, "matrix_dump_dir", None) is not None:
+                    self._dump_iteration_matrices(iteration, H, weight, gain)
+                start = time.perf_counter() if self.profile_enabled else None
+                dx, normal_factor_diag = normal_solver.solve(gain, rhs, return_factor_diag=final_diagnostics)
+                if start is not None:
+                    self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
+                if dx.size and not np.all(np.isfinite(dx)):
+                    diag_scale = 1.0
+                    if is_sparse_matrix(gain):
+                        diag_values = np.asarray(gain.diagonal(), dtype=np.float64)
+                        finite_diag = diag_values[np.isfinite(diag_values) & (diag_values > 0.0)]
+                        if finite_diag.size:
+                            diag_scale = float(np.median(finite_diag))
+                        identity = sparse_eye(gain.shape[0], format="csc", dtype=np.float64)
+                        for damping_factor in (1e-10, 1e-8, 1e-6, 1e-4):
+                            damped_gain = gain + identity * (diag_scale * damping_factor)
+                            dx_candidate, normal_factor_diag = NormalEquationSolver().solve(
+                                damped_gain,
+                                rhs,
+                                return_factor_diag=final_diagnostics,
+                            )
+                            if dx_candidate.size == 0 or np.all(np.isfinite(dx_candidate)):
+                                dx = dx_candidate
+                                self._record_profile_time("solve.damped_normal_fallback", damping_factor)
+                                break
+                    else:
+                        diag_values = np.diag(gain)
+                        finite_diag = diag_values[np.isfinite(diag_values) & (diag_values > 0.0)]
+                        if finite_diag.size:
+                            diag_scale = float(np.median(finite_diag))
+                        for damping_factor in (1e-10, 1e-8, 1e-6, 1e-4):
+                            damped_gain = np.array(gain, dtype=np.float64, copy=True)
+                            damped_gain[np.diag_indices_from(damped_gain)] += diag_scale * damping_factor
+                            dx_candidate, normal_factor_diag = NormalEquationSolver().solve(
+                                damped_gain,
+                                rhs,
+                                return_factor_diag=final_diagnostics,
+                            )
+                            if dx_candidate.size == 0 or np.all(np.isfinite(dx_candidate)):
+                                dx = dx_candidate
+                                self._record_profile_time("solve.damped_normal_fallback", damping_factor)
+                                break
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
             if max_correction < self.tol:
                 converged = True
+                final_quantities_current = True
                 if verbose:
                     _print_iteration(iteration, objective, residual_inf, max_correction, None, True)
                 break
@@ -9212,9 +9324,15 @@ class HybridStateEstimator:
                 candidate = x + step_scale * dx
                 if self.voltage_cols.size:
                     candidate[self.voltage_cols] = np.maximum(candidate[self.voltage_cols], self.voltage_floor)
+                start = time.perf_counter() if self.profile_enabled else None
                 self.evaluate(candidate, measurements, out=cand_z_est)
+                if start is not None:
+                    self._record_profile_time("solve.evaluate", time.perf_counter() - start)
+                start = time.perf_counter() if self.profile_enabled else None
                 self._measurement_residual(z, cand_z_est, measurements, out=cand_residual)
                 candidate_objective = self._weighted_objective(weight, cand_residual)
+                if start is not None:
+                    self._record_profile_time("solve.residual_objective", time.perf_counter() - start)
                 if np.isfinite(candidate_objective) and candidate_objective <= objective + 1e-12:
                     x = candidate
                     objective = candidate_objective
@@ -9231,6 +9349,7 @@ class HybridStateEstimator:
                 step_scale *= 0.5
             if not accepted:
                 if nonfinite_candidates:
+                    final_quantities_current = True
                     if verbose:
                         _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, False)
                     break
@@ -9241,19 +9360,31 @@ class HybridStateEstimator:
             if verbose:
                 _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, False)
 
-        if z_est_dirty or H is None or gain is None:
+        if z_est_dirty:
+            start = time.perf_counter() if self.profile_enabled else None
             self.evaluate(x, measurements, out=z_est)
+            if start is not None:
+                self._record_profile_time("solve.evaluate", time.perf_counter() - start)
+            start = time.perf_counter() if self.profile_enabled else None
             self._measurement_residual(z, z_est, measurements, out=residual)
             objective = self._weighted_objective(weight, residual)
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            if final_diagnostics:
+            if start is not None:
+                self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        if final_diagnostics:
+            if not final_quantities_current or H is None:
+                start = time.perf_counter() if self.profile_enabled else None
                 H = self.jacobian_sparse(x, measurements)
+                if start is not None:
+                    self._record_profile_time("solve.jacobian", time.perf_counter() - start)
+            if gain is None and self.n_state <= 5000:
                 if normal_pattern is None and is_sparse_matrix(H):
                     normal_pattern = _normal_equation_structural_pattern(H)
-                    if measurements is self.active_measurements:
+                    if active_measurement_run:
                         self._active_normal_pattern = normal_pattern
                 if weighted_residual is not None:
                     np.multiply(weight, residual, out=weighted_residual)
+                start = time.perf_counter() if self.profile_enabled else None
                 gain, _rhs = build_normal_equations(
                     H,
                     residual,
@@ -9262,9 +9393,11 @@ class HybridStateEstimator:
                     weights_are_uniform=weights_are_uniform,
                     weighted_residual=weighted_residual,
                     normal_pattern=normal_pattern,
-                    assume_normal_pattern_matches=measurements is self.active_measurements,
+                    assume_normal_pattern_matches=active_measurement_run,
                 )
-        if not final_diagnostics:
+                if start is not None:
+                    self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
+        else:
             H = None
             gain = None
         if solve_profile_start is not None:
@@ -9315,21 +9448,27 @@ class HybridStateEstimator:
             weights = np.asarray(table_weight, dtype=np.float64)
         else:
             _z, weights = self._measurement_vectors(result.measurements)
-        jacobian_measurements = (
-            result.measurements
-            if len(result.measurements) == result.residual.size
-            else getattr(self, "active_measurements", result.measurements)
-        )
-        H = result.H if result.H is not None else self.jacobian_sparse(result.x, jacobian_measurements)
-        gain = result.gain
-        if gain is None:
-            gain, _rhs = build_normal_equations(H, result.residual, weights)
-        gain_inv = inverse_gain_for_bad_data(gain)
-        if gain_inv is None:
-            omega_diag = 1.0 / np.maximum(weights, 1e-12)
+        R_diag = 1.0 / np.maximum(weights, 1e-12)
+        if self.n_state > 5000 and (result.H is None or result.gain is None):
+            leverage = None
         else:
-            leverage = measurement_leverage(H, gain_inv)
-            omega_diag = np.maximum(1.0 / np.maximum(weights, 1e-12) - leverage, 1e-12)
+            jacobian_measurements = (
+                result.measurements
+                if len(result.measurements) == result.residual.size
+                else getattr(self, "active_measurements", result.measurements)
+            )
+            H = result.H if result.H is not None else self.jacobian_sparse(result.x, jacobian_measurements)
+            gain = result.gain
+            if gain is None:
+                gain, _rhs = build_normal_equations(H, result.residual, weights)
+            gain_inverse_start = time.perf_counter() if self.profile_enabled else None
+            leverage = measurement_leverage_for_bad_data(H, gain)
+            if gain_inverse_start is not None:
+                self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
+        if leverage is None:
+            omega_diag = R_diag
+        else:
+            omega_diag = np.maximum(R_diag - leverage, 1e-12)
         normalized = np.abs(result.residual) / np.sqrt(omega_diag)
         bad_items: List[BadDataItem] = []
         for idx in np.where(normalized > threshold)[0]:
@@ -9407,6 +9546,46 @@ class HybridStateEstimator:
             all_measurement_table=getattr(self.measurements, "table", None),
         )
         return self.se_result
+
+    def apply_state(self, x: np.ndarray) -> None:
+        """Apply an estimated hybrid state vector back to the underlying network arrays."""
+        if not self._prepared:
+            self.prepare()
+        x_arr = np.asarray(x, dtype=np.float64)
+        delegate = self._delegate()
+        if delegate is not None:
+            delegate.apply_state(x_arr)
+            return
+        if self._ac_sub_estimator is not None and self.ac_n_state > 0:
+            self._ac_sub_estimator.apply_state(x_arr[: self.ac_n_state])
+        if self._dc_sub_estimator is not None and self.dc_n_state > 0:
+            self._dc_sub_estimator.apply_state(
+                x_arr[self.dc_state_start : self.dc_state_start + self.dc_n_state]
+            )
+
+    def measurement_device_counts(self) -> Dict[int, int]:
+        """Return measurement device counts keyed by device_type_code, matching AC/DC SE."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.measurement_device_counts()
+        counts: Dict[int, int] = {}
+        if self._ac_sub_estimator is not None:
+            counts.update(self._ac_sub_estimator.measurement_device_counts())
+        if self._dc_sub_estimator is not None:
+            counts.update(self._dc_sub_estimator.measurement_device_counts())
+        counts[DEVICE_TYPE_DCACConverter] = int(getattr(self, "n_dcac", 0))
+        return counts
+
+    def measurement_device_names(self, requested_codes=None) -> Dict[int, np.ndarray]:
+        """Return measurement device name arrays keyed by device_type_code, matching AC/DC SE."""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.measurement_device_names(requested_codes)
+        if requested_codes is None:
+            codes = list(self.measurement_device_counts().keys())
+        else:
+            codes = [int(code) for code in requested_codes]
+        return self._measurement_name_arrays_by_type_code(codes)
 
     def write_back(
         self,

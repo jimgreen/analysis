@@ -7,8 +7,10 @@ import numpy as np
 
 from scipy.linalg import cho_factor as CHO_FACTOR
 from scipy.linalg import cho_solve as CHO_SOLVE
+from scipy.linalg import solve_triangular as SOLVE_TRIANGULAR
 from scipy.linalg.lapack import dposv as DPOSV
 from scipy.linalg.lapack import dpotrf as DPOTRF
+from scipy.linalg.lapack import dpotri as DPOTRI
 from scipy.sparse import coo_matrix as SP_COO_MATRIX
 from scipy.sparse import csc_matrix as SP_CSC_MATRIX
 from scipy.sparse import csr_matrix as SP_CSR_MATRIX
@@ -1567,6 +1569,230 @@ class CholmodAAtNormalEquationSolver:
         return self.solve(A, rhs, return_factor_diag=return_factor_diag)
 
 
+def _supernodal_selected_inverse_from_cholmod(factor):
+    """Compute exact entries of (P G P^T)^-1 on the L+L^T sparsity pattern via supernodal Takahashi recursion."""
+    L, D = factor.L_D()
+    L = L.tocsc()
+    L.sort_indices()
+    n = int(L.shape[0])
+    if n == 0:
+        empty = SP_CSC_MATRIX((0, 0), dtype=np.float64)
+        return empty, np.empty(0, dtype=np.int32)
+
+    indptr = L.indptr
+    indices = L.indices
+    ldata = L.data
+    d_diag = np.asarray(D.diagonal(), dtype=np.float64)
+    if np.any(d_diag <= 0.0) or not np.all(np.isfinite(d_diag)):
+        return None, None
+    d_inv = 1.0 / d_diag
+
+    # Group consecutive columns with identical trailing sparsity patterns into supernodes.
+    sn_starts = []
+    j = 0
+    while j < n:
+        s0 = int(indptr[j])
+        e0 = int(indptr[j + 1])
+        pat0 = indices[s0:e0]
+        len0 = e0 - s0
+        k = 1
+        while j + k < n:
+            sk = int(indptr[j + k])
+            ek = int(indptr[j + k + 1])
+            if (ek - sk) == (len0 - k) and np.array_equal(indices[sk:ek], pat0[k:]):
+                k += 1
+            else:
+                break
+        sn_starts.append(j)
+        j += k
+    sn_starts.append(n)
+    n_sn = len(sn_starts) - 1
+
+    col_to_sn = np.empty(n, dtype=np.int32)
+    col_to_off = np.empty(n, dtype=np.int32)
+    for sid in range(n_sn):
+        a = sn_starts[sid]
+        b = sn_starts[sid + 1]
+        col_to_sn[a:b] = sid
+        col_to_off[a:b] = np.arange(b - a, dtype=np.int32)
+
+    z_blocks = [None] * n_sn
+    sn_rows = [None] * n_sn
+    searchsorted = np.searchsorted
+
+    for sid in range(n_sn - 1, -1, -1):
+        a = sn_starts[sid]
+        b = sn_starts[sid + 1]
+        w = b - a
+        s0 = int(indptr[a])
+        e0 = int(indptr[a + 1])
+        rows = indices[s0:e0]
+        m = int(rows.size)
+        u = m - w
+        sn_rows[sid] = rows
+
+        if w == 1:
+            if u == 0:
+                z_blocks[sid] = np.array([[d_inv[a]]], dtype=np.float64)
+                continue
+            l_21 = ldata[s0 + 1 : e0]
+            upd_rows = rows[1:]
+            Z_22 = np.empty((u, u), dtype=np.float64)
+            u_sn = col_to_sn[upd_rows]
+            rs = 0
+            while rs < u:
+                target_sid = int(u_sn[rs])
+                re = rs + 1
+                while re < u and int(u_sn[re]) == target_sid:
+                    re += 1
+                t_rows = sn_rows[target_sid]
+                t_Z = z_blocks[target_sid]
+                t_cols = col_to_off[upd_rows[rs:re]]
+                query = upd_rows[rs:]
+                if query.size == t_rows.size and query[0] == t_rows[0]:
+                    sub = t_Z[:, t_cols]
+                else:
+                    r_pos = searchsorted(t_rows, query)
+                    sub = t_Z[r_pos][:, t_cols]
+                Z_22[rs:, rs:re] = sub
+                if re < u:
+                    Z_22[rs:re, re:] = sub[re - rs :, :].T
+                rs = re
+            z_21 = -(Z_22 @ l_21)
+            z_11 = d_inv[a] - float(np.dot(l_21, z_21))
+            Z_blk = np.empty((m, 1), dtype=np.float64)
+            Z_blk[0, 0] = z_11
+            Z_blk[1:, 0] = z_21
+            z_blocks[sid] = Z_blk
+            continue
+
+        L_blk = np.zeros((m, w), dtype=np.float64)
+        for col_off in range(w):
+            cs = int(indptr[a + col_off])
+            ce = int(indptr[a + col_off + 1])
+            L_blk[col_off:, col_off] = ldata[cs:ce]
+        L_11 = L_blk[:w, :]
+        L_21 = L_blk[w:, :]
+        L11_inv = SOLVE_TRIANGULAR(
+            L_11,
+            np.eye(w, dtype=np.float64),
+            lower=True,
+            unit_diagonal=True,
+            check_finite=False,
+        )
+        Z_blk = np.empty((m, w), dtype=np.float64)
+        if u > 0:
+            L21_eff = L_21 @ L11_inv
+            upd_rows = rows[w:]
+            Z_22 = np.empty((u, u), dtype=np.float64)
+            u_sn = col_to_sn[upd_rows]
+            rs = 0
+            while rs < u:
+                target_sid = int(u_sn[rs])
+                re = rs + 1
+                while re < u and int(u_sn[re]) == target_sid:
+                    re += 1
+                t_rows = sn_rows[target_sid]
+                t_Z = z_blocks[target_sid]
+                t_cols = col_to_off[upd_rows[rs:re]]
+                query = upd_rows[rs:]
+                if query.size == t_rows.size and query[0] == t_rows[0]:
+                    sub = t_Z[:, t_cols]
+                else:
+                    r_pos = searchsorted(t_rows, query)
+                    sub = t_Z[r_pos][:, t_cols]
+                Z_22[rs:, rs:re] = sub
+                if re < u:
+                    Z_22[rs:re, re:] = sub[re - rs :, :].T
+                rs = re
+            Z_21 = -(Z_22 @ L21_eff)
+            Z_11 = (L11_inv.T * d_inv[a:b]) @ L11_inv - L21_eff.T @ Z_21
+            Z_blk[:w, :] = Z_11
+            Z_blk[w:, :] = Z_21
+        else:
+            Z_blk[:w, :] = (L11_inv.T * d_inv[a:b]) @ L11_inv
+        z_blocks[sid] = Z_blk
+
+    zdata = np.empty_like(ldata)
+    for sid in range(n_sn):
+        a = sn_starts[sid]
+        b = sn_starts[sid + 1]
+        Z_blk = z_blocks[sid]
+        for col_off in range(b - a):
+            cs = int(indptr[a + col_off])
+            ce = int(indptr[a + col_off + 1])
+            zdata[cs:ce] = Z_blk[col_off:, col_off]
+
+    Z_low = SP_CSC_MATRIX((zdata, indices, indptr), shape=(n, n), copy=False)
+    Z_low.has_sorted_indices = True
+    return Z_low, factor.P()
+
+
+def _measurement_leverage_from_selected_inv(H, Z_low, P) -> Optional[np.ndarray]:
+    """Compute exact diag(H G^-1 H^T) using lower-triangular selected inverse Z_low on permutation P."""
+    H_csr = H.tocsr() if getattr(H, "format", None) != "csr" else H
+    inv_P = np.empty(P.size, dtype=np.int32)
+    inv_P[P] = np.arange(P.size, dtype=np.int32)
+    hp_indices = inv_P[H_csr.indices]
+    # Copy data/indptr so sort_indices() never mutates caller's H in place.
+    H_p = SP_CSR_MATRIX(
+        (H_csr.data.copy(), hp_indices, H_csr.indptr.copy()),
+        shape=H_csr.shape,
+        copy=False,
+    )
+    H_p.sort_indices()
+
+    indptr = H_p.indptr
+    indices = H_p.indices
+    hdata = H_p.data
+    row_nnz = np.diff(indptr)
+    max_nnz = int(row_nnz.max()) if row_nnz.size else 0
+
+    lev = np.zeros(H_p.shape[0], dtype=np.float64)
+    z_diag = Z_low.diagonal()
+    pair_rows_list = []
+    pair_ca_list = []
+    pair_cb_list = []
+    pair_prod_list = []
+    for k in range(1, min(max_nnz + 1, 16)):
+        r_idx = np.flatnonzero(row_nnz == k)
+        if r_idx.size == 0:
+            continue
+        starts = indptr[r_idx]
+        pos = starts[:, None] + np.arange(k, dtype=np.intp)[None, :]
+        cols = indices[pos]
+        vals = hdata[pos]
+        lev[r_idx] = np.sum((vals * vals) * z_diag[cols], axis=1)
+        if k >= 2:
+            ia, ib = np.triu_indices(k, k=1)
+            pair_rows_list.append(np.repeat(r_idx, ia.size))
+            pair_ca_list.append(cols[:, ia].ravel())
+            pair_cb_list.append(cols[:, ib].ravel())
+            pair_prod_list.append((2.0 * vals[:, ia] * vals[:, ib]).ravel())
+
+    if pair_rows_list:
+        p_r = np.concatenate(pair_rows_list)
+        p_ca = np.concatenate(pair_ca_list)
+        p_cb = np.concatenate(pair_cb_list)
+        p_prod = np.concatenate(pair_prod_list)
+        n = Z_low.shape[0]
+        z_cols = np.repeat(np.arange(n, dtype=np.int64), np.diff(Z_low.indptr))
+        z_keys = (z_cols << 32) | Z_low.indices.astype(np.int64)
+        q_keys = (p_ca.astype(np.int64) << 32) | p_cb.astype(np.int64)
+        q_pos = np.searchsorted(z_keys, q_keys)
+        if np.any(q_pos >= z_keys.size) or not np.array_equal(z_keys[q_pos], q_keys):
+            return None
+        np.add.at(lev, p_r, p_prod * Z_low.data[q_pos])
+
+    big_rows = np.flatnonzero(row_nnz >= 16)
+    if big_rows.size:
+        Z_sym = (Z_low + SP_TRIL(Z_low, k=-1).T).tocsr()
+        H_big = H_p[big_rows]
+        proj_big = H_big @ Z_sym
+        lev[big_rows] = np.asarray(H_big.multiply(proj_big).sum(axis=1)).ravel()
+    return lev
+
+
 def measurement_leverage(H, gain_inv: np.ndarray) -> np.ndarray:
     """Compute diag(H gain_inv H.T) for dense or sparse measurement Jacobians."""
     projected = H @ gain_inv
@@ -1587,10 +1813,62 @@ def inverse_gain_for_bad_data(gain: np.ndarray, dense_state_limit: int = 5000):
         if gain.shape[0] > dense_state_limit:
             return None
         gain = gain.toarray()
+    else:
+        gain = np.asarray(gain, dtype=np.float64)
+    if gain.ndim == 2 and gain.shape[0] == gain.shape[1] and gain.shape[0] > 0:
+        try:
+            chol, info = DPOTRF(gain, lower=1, overwrite_a=0)
+            if info == 0:
+                inv_l, info2 = DPOTRI(chol, lower=1, overwrite_c=1)
+                if info2 == 0:
+                    iu = np.triu_indices(inv_l.shape[0], k=1)
+                    inv_l[iu] = inv_l[(iu[1], iu[0])]
+                    return inv_l
+        except Exception:
+            pass
     try:
         return np.linalg.inv(gain)
     except np.linalg.LinAlgError:
         return np.linalg.pinv(gain)
+
+
+def measurement_leverage_for_bad_data(
+    H,
+    gain,
+    *,
+    cholmod_factor=None,
+    dense_state_limit: int = 5000,
+    sparse_threshold: int = 250,
+) -> Optional[np.ndarray]:
+    """Compute exact diag(H G^-1 H^T) using sparse selected inversion for medium/large sparse SPD gains.
+
+    Returns ``None`` when ``n_state > dense_state_limit`` so callers fall back
+    consistently to residual-only normalized scores on very large networks.
+    """
+    n_state = int(H.shape[1])
+    if n_state == 0:
+        return np.zeros(int(H.shape[0]), dtype=np.float64)
+    if n_state > dense_state_limit:
+        return None
+    if is_sparse_matrix(H) and n_state > sparse_threshold and (
+        cholmod_factor is not None or CHOLMOD_CHOLESKY is not None
+    ):
+        try:
+            factor = cholmod_factor
+            if factor is None:
+                gain_csc = gain if getattr(gain, "format", None) == "csc" else gain.tocsc()
+                factor = CHOLMOD_CHOLESKY(gain_csc)
+            Z_low, P = _supernodal_selected_inverse_from_cholmod(factor)
+            if Z_low is not None and P is not None:
+                leverage = _measurement_leverage_from_selected_inv(H, Z_low, P)
+                if leverage is not None and np.all(np.isfinite(leverage)):
+                    return leverage
+        except Exception:
+            pass
+    gain_inv = inverse_gain_for_bad_data(gain, dense_state_limit=dense_state_limit)
+    if gain_inv is None:
+        return None
+    return measurement_leverage(H, gain_inv)
 
 
 def _rank_from_singular_values(singular_values: np.ndarray, shape: Tuple[int, int]) -> Tuple[int, float]:

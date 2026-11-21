@@ -101,6 +101,7 @@ from secore.se_math import (
     inverse_gain_for_bad_data,
     matrix_is_empty,
     measurement_leverage,
+    measurement_leverage_for_bad_data,
     observability_rank_details,
     observability_weak_direction,
     sparse_structural_rank,
@@ -199,8 +200,7 @@ class _PackedMeasurementKeyCache:
         keys = self._keys
         if keys is not None:
             return int(key) in keys
-        probe = np.asarray([int(key)], dtype=np.int64)
-        return bool(self.estimator._active_measurement_key_membership(probe)[0])
+        return int(key) in self.estimator._active_measurement_key_set_ref()
 
     def __bool__(self) -> bool:
         keys = self._keys
@@ -3295,6 +3295,18 @@ class DCStateEstimator:
         self._active_measurement_key_sorted_array_cache = (cache_key, sorted_keys)
         return sorted_keys
 
+    def _active_measurement_key_set_ref(self) -> set:
+        """Return active measurement keys as a Python set for O(1) single-key membership probes."""
+        key_array = self._active_measurement_key_array_ref()
+        cache_key = (id(key_array), int(np.asarray(key_array).size))
+        cached = getattr(self, "_active_measurement_key_set_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == cache_key:
+            return cached[1]
+        keys = np.asarray(key_array, dtype=np.int64).reshape(-1)
+        key_set = set(keys.tolist())
+        self._active_measurement_key_set_cache = (cache_key, key_set)
+        return key_set
+
     def _active_measurement_key_membership(self, keys: np.ndarray) -> np.ndarray:
         """Vectorized membership against active packed measurement keys without np.isin uniquing."""
         probe = np.asarray(keys, dtype=np.int64).reshape(-1)
@@ -5759,7 +5771,7 @@ class DCStateEstimator:
                 return [], normalized_upper_bound
         R_diag = 1.0 / weights
         if self.n_state > 5000 and (result.H is None or result.gain is None):
-            gain_inv = None
+            leverage = None
         else:
             if result.H is None or result.gain is None:
                 result.H = self.jacobian_sparse(result.x, plan_tables)
@@ -5768,17 +5780,12 @@ class DCStateEstimator:
                     result.residual,
                     weights,
                 )
-            if self.profile_enabled:
-                gain_inverse_start = time.perf_counter()
-            else:
-                gain_inverse_start = None
-            gain_inv = inverse_gain_for_bad_data(result.gain)
+            gain_inverse_start = time.perf_counter() if self.profile_enabled else None
+            leverage = measurement_leverage_for_bad_data(result.H, result.gain)
             if gain_inverse_start is not None:
                 self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
-        if gain_inv is None:
+        if leverage is None:
             leverage = np.zeros_like(R_diag)
-        else:
-            leverage = measurement_leverage(result.H, gain_inv)
         omega_diag = np.maximum(R_diag - leverage, 1e-12)
         normalized = np.abs(result.residual) / np.sqrt(omega_diag)
 

@@ -130,6 +130,7 @@ from secore.se_math import (
     inverse_gain_for_bad_data,
     matrix_is_empty,
     measurement_leverage,
+    measurement_leverage_for_bad_data,
     LowerNormalEquationCscPlan,
     NormalEquationAssemblyPlan,
     NormalEquationSolver,
@@ -366,8 +367,7 @@ class _PackedMeasurementKeyCache:
         keys = self._keys
         if keys is not None:
             return int(key) in keys
-        probe = np.asarray([int(key)], dtype=np.int64)
-        return bool(self.estimator._active_measurement_key_membership(probe)[0])
+        return int(key) in self.estimator._active_measurement_key_set_ref()
 
     def __bool__(self) -> bool:
         keys = self._keys
@@ -619,6 +619,7 @@ class ACStateEstimator:
         self.meas_file = Path(meas_file)
         self.tol = self.params.tol
         self.max_iter = self.params.max_iter
+        self.diff_step = self.params.diff_step
         self.flat_start = self.params.flat_start
         self.pseudo_measurement_weight = self.params.pseudo_measurement_weight
         self.targeted_pseudo_measurement_max = self.params.targeted_pseudo_measurement_max
@@ -9982,7 +9983,7 @@ class ACStateEstimator:
         weights = np.asarray(measurement_table.weight, dtype=np.float64)
         R_diag = 1.0 / weights
         if self.n_state > 5000 and (result.H is None or result.gain is None):
-            gain_inv = None
+            leverage = None
         else:
             if result.H is None or result.gain is None:
                 result.H = self.jacobian_sparse(result.x, plan_tables)
@@ -9991,11 +9992,12 @@ class ACStateEstimator:
                     result.residual,
                     weights,
                 )
-            gain_inv = inverse_gain_for_bad_data(result.gain)
-        if gain_inv is None:
+            gain_inverse_start = time.perf_counter() if self.profile_enabled else None
+            leverage = measurement_leverage_for_bad_data(result.H, result.gain)
+            if gain_inverse_start is not None:
+                self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
+        if leverage is None:
             leverage = np.zeros_like(R_diag)
-        else:
-            leverage = measurement_leverage(result.H, gain_inv)
         omega_diag = np.maximum(R_diag - leverage, 1e-12)
         normalized = np.abs(result.residual) / np.sqrt(omega_diag)
 

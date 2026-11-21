@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass, field
+from itertools import repeat, starmap
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -129,7 +130,7 @@ class _MeasurementResultTable:
 
 @dataclass
 class SEResult:
-    @dataclass
+    @dataclass(slots=True)
     class StatisticsTable:
         converged: bool = False
         iterations: int = 0
@@ -146,7 +147,7 @@ class SEResult:
         bad_data_count: int = 0
         normal_measurement_count: int = 0
 
-    @dataclass
+    @dataclass(slots=True)
     class MeasurementRow:
         idx: int
         name: str
@@ -629,10 +630,25 @@ def _measurement_rows_from_table(
         estimates = optional_column(estimated, positions)
         residuals = optional_column(residual, positions)
         normalized_values = optional_column(normalized, positions)
-        reason_values = [""] * len(positions) if reasons is None else reasons[start:start + 8192]
-        for fields in zip(ids, names, device_types, device_names, meas_types, weights,
-                          valid, values, estimates, residuals, normalized_values, reason_values):
-            yield row_type(*fields, source)
+        reason_values = repeat("", len(positions)) if reasons is None else reasons[start:start + 8192]
+        yield from starmap(
+            row_type,
+            zip(
+                ids,
+                names,
+                device_types,
+                device_names,
+                meas_types,
+                weights,
+                valid,
+                values,
+                estimates,
+                residuals,
+                normalized_values,
+                reason_values,
+                repeat(source, len(positions)),
+            ),
+        )
 
 
 def build_seresult_full_from_table(
