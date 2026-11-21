@@ -91,6 +91,11 @@ def _sanitize_e_text(text: str) -> str:
     return "_".join(text.split())
 
 
+# 预先清洗静态设备类型与量测类型映射表，供大批量 E 文件导出直接查表
+_SANITIZED_DEVICE_TYPE_NAMES = {code: _sanitize_e_text(name) for code, name in DEVICE_TYPE_NAMES.items()}
+_SANITIZED_MEAS_TYPE_NAMES = {code: _sanitize_e_text(name) for code, name in MEAS_TYPE_NAMES.items()}
+
+
 def _extract_table_columns_chunk(
     table: MeasurementTable,
     positions: np.ndarray,
@@ -706,76 +711,232 @@ class SEResult:
         sanitize = _sanitize_e_text
         if table._columnar is not None and table._rows is None:
             batch = table._columnar
+            tbl = batch.table
             positions_all = batch.positions
             src_tok = sanitize(batch.source)
             reasons_all = batch.reasons
-            # 预先对固定枚举映射表做清洗，避免在几十万行内重复判断空白符
+            dt_lookup = _SANITIZED_DEVICE_TYPE_NAMES.get
+            mt_lookup = _SANITIZED_MEAS_TYPE_NAMES.get
+            device_pos_all = getattr(tbl, "device_pos", None)
+            meas_codes_all = getattr(tbl, "meas_type_code", None)
+            dev_codes_all = getattr(tbl, "device_type_code", None)
+            name_empty = tbl.name.size == 0
+            dev_name_empty = tbl.device_name.size == 0
+            dev_type_empty = tbl.device_type.size == 0
+            meas_type_empty = tbl.meas_type.size == 0
+
+            def _extract_sanitized_text_col(values, pos_chunk, max_pos, fallback_fn):
+                if values.size > max_pos:
+                    selected = values[pos_chunk]
+                    if values.dtype.kind in "OUS":
+                        raw_list = selected.tolist()
+                        if not all(type(x) is str for x in raw_list):
+                            raw_list = list(map(str, raw_list))
+                    else:
+                        raw_list = list(map(str, selected))
+                else:
+                    raw_list = [str(values[p]) if p < values.size else fallback_fn(int(p)) for p in pos_chunk.tolist()]
+                uniq = {s: sanitize(s) for s in dict.fromkeys(raw_list)}
+                return list(map(uniq.__getitem__, raw_list))
+
+            def _optional_float_col(values, pos_chunk, max_pos):
+                if values is None or values.size == 0:
+                    return None
+                if values.size > max_pos:
+                    return values[pos_chunk].tolist()
+                n_val = int(values.size)
+                return [float(values[p]) if p < n_val else None for p in pos_chunk.tolist()]
+
             for start in range(0, n_rows, 16384):
                 pos_chunk = positions_all[start : start + 16384]
                 chunk_len = int(pos_chunk.size)
-                (
-                    ids,
-                    names,
-                    device_types,
-                    device_names,
-                    meas_types,
-                    weights,
-                    valid,
-                    values,
-                    estimates,
-                    residuals,
-                    normalized_values,
-                ) = _extract_table_columns_chunk(
-                    batch.table,
-                    pos_chunk,
-                    estimated=batch.estimated,
-                    residual=batch.residual,
-                    normalized=batch.normalized,
-                )
-                # 对字符串列做轻量清洗：仅当出现空串或空白符时才替换
-                names_s = [sanitize(s) for s in names]
-                dt_map = {s: sanitize(s) for s in dict.fromkeys(device_types)}
-                dt_s = list(map(dt_map.__getitem__, device_types))
-                dn_map = {s: sanitize(s) for s in dict.fromkeys(device_names)}
-                dn_s = list(map(dn_map.__getitem__, device_names))
-                mt_map = {s: sanitize(s) for s in dict.fromkeys(meas_types)}
-                mt_s = list(map(mt_map.__getitem__, meas_types))
+                max_pos = int(pos_chunk[-1])
 
-                all_est = estimates is not None and (batch.estimated is not None and batch.estimated.size > int(pos_chunk[-1]))
-                all_res = residuals is not None and (batch.residual is not None and batch.residual.size > int(pos_chunk[-1]))
-                all_nrm = normalized_values is not None and (batch.normalized is not None and batch.normalized.size > int(pos_chunk[-1]))
+                ids = tbl.idx[pos_chunk].astype(np.int64, copy=False).tolist()
+                if dev_type_empty and dev_codes_all is not None and len(dev_codes_all) > max_pos:
+                    dt_s = [dt_lookup(code, "-") for code in dev_codes_all[pos_chunk].tolist()]
+                else:
+                    dt_s = _extract_sanitized_text_col(
+                        tbl.device_type,
+                        pos_chunk,
+                        max_pos,
+                        lambda p: DEVICE_TYPE_NAMES.get(int(dev_codes_all[p]), "")
+                        if dev_codes_all is not None and len(dev_codes_all) > p
+                        else "",
+                    )
+                if meas_type_empty and meas_codes_all is not None and len(meas_codes_all) > max_pos:
+                    mt_s = [mt_lookup(code, "-") for code in meas_codes_all[pos_chunk].tolist()]
+                else:
+                    mt_s = _extract_sanitized_text_col(
+                        tbl.meas_type,
+                        pos_chunk,
+                        max_pos,
+                        lambda p: MEAS_TYPE_NAMES.get(int(meas_codes_all[p]), "")
+                        if meas_codes_all is not None and len(meas_codes_all) > p
+                        else "",
+                    )
+
+                dp_list = None
+                dn_s = None
+                if dev_name_empty and device_pos_all is not None and len(device_pos_all) > max_pos:
+                    dp_arr = device_pos_all[pos_chunk]
+                    if bool(np.all(dp_arr >= 0)):
+                        dp_list = dp_arr.tolist()
+                    else:
+                        dn_s = [f"pos:{pos}" if pos >= 0 else "-" for pos in dp_arr.tolist()]
+                else:
+                    dn_s = _extract_sanitized_text_col(
+                        tbl.device_name,
+                        pos_chunk,
+                        max_pos,
+                        lambda p: f"pos:{int(device_pos_all[p])}"
+                        if device_pos_all is not None and len(device_pos_all) > p and int(device_pos_all[p]) >= 0
+                        else "",
+                    )
+
+                weights = tbl.weight[pos_chunk].astype(np.float64, copy=False).tolist()
+                valid_arr = tbl.valid[pos_chunk].astype(bool, copy=False)
+                all_valid_true = bool(valid_arr.all())
+                values = tbl.value[pos_chunk].astype(np.float64, copy=False).tolist()
+                estimates = _optional_float_col(batch.estimated, pos_chunk, max_pos)
+                residuals = _optional_float_col(batch.residual, pos_chunk, max_pos)
+                normalized_values = _optional_float_col(batch.normalized, pos_chunk, max_pos)
+
+                all_est = estimates is not None and (batch.estimated is not None and batch.estimated.size > max_pos)
+                all_res = residuals is not None and (batch.residual is not None and batch.residual.size > max_pos)
+                all_nrm = normalized_values is not None and (batch.normalized is not None and batch.normalized.size > max_pos)
 
                 if reasons_all is None and all_est and all_res and all_nrm:
-                    lines = [
-                        f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} {est:.12g} {res:.12g} {nrm:.12g} - {src_tok}"
-                        for idx, nm, dt, dn, mt, w, vld, val, est, res, nrm in zip(
-                            ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, estimates, residuals, normalized_values
-                        )
-                    ]
-                elif reasons_all is None and all_est and all_res and normalized_values is None:
-                    lines = [
-                        f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} {est:.12g} {res:.12g} - - {src_tok}"
-                        for idx, nm, dt, dn, mt, w, vld, val, est, res in zip(
-                            ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, estimates, residuals
-                        )
-                    ]
-                elif estimates is None and residuals is None and normalized_values is None:
-                    if reasons_all is None:
+                    if name_empty and dp_list is not None and all_valid_true:
                         lines = [
-                            f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - - {src_tok}"
-                            for idx, nm, dt, dn, mt, w, vld, val in zip(
-                                ids, names_s, dt_s, dn_s, mt_s, weights, valid, values
+                            f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} 1 {val:.12g} {est:.12g} {res:.12g} {nrm:.12g} - {src_tok}"
+                            for idx, dt, dp, mt, w, val, est, res, nrm in zip(
+                                ids, dt_s, dp_list, mt_s, weights, values, estimates, residuals, normalized_values
                             )
                         ]
                     else:
-                        rsn_chunk = [sanitize(s) for s in reasons_all[start : start + chunk_len]]
+                        names_s = (
+                            [f"m{idx}" for idx in ids]
+                            if name_empty
+                            else _extract_sanitized_text_col(tbl.name, pos_chunk, max_pos, lambda p: f"m{int(tbl.idx[p])}")
+                        )
+                        if dn_s is None:
+                            dn_s = [f"pos:{dp}" for dp in dp_list]
+                        if all_valid_true:
+                            lines = [
+                                f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} 1 {val:.12g} {est:.12g} {res:.12g} {nrm:.12g} - {src_tok}"
+                                for idx, nm, dt, dn, mt, w, val, est, res, nrm in zip(
+                                    ids, names_s, dt_s, dn_s, mt_s, weights, values, estimates, residuals, normalized_values
+                                )
+                            ]
+                        else:
+                            valid = valid_arr.tolist()
+                            lines = [
+                                f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} {est:.12g} {res:.12g} {nrm:.12g} - {src_tok}"
+                                for idx, nm, dt, dn, mt, w, vld, val, est, res, nrm in zip(
+                                    ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, estimates, residuals, normalized_values
+                                )
+                            ]
+                elif reasons_all is None and all_est and all_res and normalized_values is None:
+                    if name_empty and dp_list is not None and all_valid_true:
                         lines = [
-                            f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - {rsn} {src_tok}"
-                            for idx, nm, dt, dn, mt, w, vld, val, rsn in zip(
-                                ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, rsn_chunk
+                            f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} 1 {val:.12g} {est:.12g} {res:.12g} - - {src_tok}"
+                            for idx, dt, dp, mt, w, val, est, res in zip(
+                                ids, dt_s, dp_list, mt_s, weights, values, estimates, residuals
                             )
                         ]
+                    else:
+                        names_s = (
+                            [f"m{idx}" for idx in ids]
+                            if name_empty
+                            else _extract_sanitized_text_col(tbl.name, pos_chunk, max_pos, lambda p: f"m{int(tbl.idx[p])}")
+                        )
+                        if dn_s is None:
+                            dn_s = [f"pos:{dp}" for dp in dp_list]
+                        valid = valid_arr.tolist()
+                        lines = [
+                            f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} {est:.12g} {res:.12g} - - {src_tok}"
+                            for idx, nm, dt, dn, mt, w, vld, val, est, res in zip(
+                                ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, estimates, residuals
+                            )
+                        ]
+                elif estimates is None and residuals is None and normalized_values is None:
+                    all_valid_false = (not all_valid_true) and (not bool(valid_arr.any()))
+                    if name_empty and dp_list is not None:
+                        if reasons_all is None:
+                            if all_valid_false:
+                                lines = [
+                                    f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} 0 {val:.12g} - - - - {src_tok}"
+                                    for idx, dt, dp, mt, w, val in zip(ids, dt_s, dp_list, mt_s, weights, values)
+                                ]
+                            elif all_valid_true:
+                                lines = [
+                                    f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} 1 {val:.12g} - - - - {src_tok}"
+                                    for idx, dt, dp, mt, w, val in zip(ids, dt_s, dp_list, mt_s, weights, values)
+                                ]
+                            else:
+                                valid = valid_arr.tolist()
+                                lines = [
+                                    f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - - {src_tok}"
+                                    for idx, dt, dp, mt, w, vld, val in zip(ids, dt_s, dp_list, mt_s, weights, valid, values)
+                                ]
+                        else:
+                            rsn_raw = reasons_all[start : start + chunk_len]
+                            rsn_map = {s: sanitize(s) for s in dict.fromkeys(rsn_raw)}
+                            rsn_chunk = list(map(rsn_map.__getitem__, rsn_raw))
+                            if all_valid_false:
+                                lines = [
+                                    f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} 0 {val:.12g} - - - {rsn} {src_tok}"
+                                    for idx, dt, dp, mt, w, val, rsn in zip(ids, dt_s, dp_list, mt_s, weights, values, rsn_chunk)
+                                ]
+                            elif all_valid_true:
+                                lines = [
+                                    f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} 1 {val:.12g} - - - {rsn} {src_tok}"
+                                    for idx, dt, dp, mt, w, val, rsn in zip(ids, dt_s, dp_list, mt_s, weights, values, rsn_chunk)
+                                ]
+                            else:
+                                valid = valid_arr.tolist()
+                                lines = [
+                                    f"# {idx} m{idx} {dt} pos:{dp} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - {rsn} {src_tok}"
+                                    for idx, dt, dp, mt, w, vld, val, rsn in zip(
+                                        ids, dt_s, dp_list, mt_s, weights, valid, values, rsn_chunk
+                                    )
+                                ]
+                    else:
+                        names_s = (
+                            [f"m{idx}" for idx in ids]
+                            if name_empty
+                            else _extract_sanitized_text_col(tbl.name, pos_chunk, max_pos, lambda p: f"m{int(tbl.idx[p])}")
+                        )
+                        if dn_s is None:
+                            dn_s = [f"pos:{dp}" for dp in dp_list]
+                        valid = valid_arr.tolist()
+                        if reasons_all is None:
+                            lines = [
+                                f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - - {src_tok}"
+                                for idx, nm, dt, dn, mt, w, vld, val in zip(
+                                    ids, names_s, dt_s, dn_s, mt_s, weights, valid, values
+                                )
+                            ]
+                        else:
+                            rsn_raw = reasons_all[start : start + chunk_len]
+                            rsn_map = {s: sanitize(s) for s in dict.fromkeys(rsn_raw)}
+                            rsn_chunk = list(map(rsn_map.__getitem__, rsn_raw))
+                            lines = [
+                                f"# {idx} {nm} {dt} {dn} {mt} {w:.12g} {'1' if vld else '0'} {val:.12g} - - - {rsn} {src_tok}"
+                                for idx, nm, dt, dn, mt, w, vld, val, rsn in zip(
+                                    ids, names_s, dt_s, dn_s, mt_s, weights, valid, values, rsn_chunk
+                                )
+                            ]
                 else:
+                    names_s = (
+                        [f"m{idx}" for idx in ids]
+                        if name_empty
+                        else _extract_sanitized_text_col(tbl.name, pos_chunk, max_pos, lambda p: f"m{int(tbl.idx[p])}")
+                    )
+                    if dn_s is None:
+                        dn_s = [f"pos:{dp}" for dp in dp_list]
+                    valid = valid_arr.tolist()
                     est_iter = repeat(None, chunk_len) if estimates is None else estimates
                     res_iter = repeat(None, chunk_len) if residuals is None else residuals
                     nrm_iter = repeat(None, chunk_len) if normalized_values is None else normalized_values

@@ -261,17 +261,24 @@ def test_se_init_and_public_api_consistency():
         "jacobian_sparse",
         "measurement_device_counts",
         "measurement_device_names",
+        "materialize_measurements",
+        "voltage_measurement_node_idx",
         "state_layout",
         "print_state",
     )
     for method_name in shared_methods:
         param_lists = []
+        default_lists = []
         for cls in classes:
             assert hasattr(cls, method_name), f"{cls.__name__} missing {method_name}"
             sig = inspect.signature(getattr(cls, method_name))
             param_lists.append([(p.name, p.kind) for p in sig.parameters.values()])
+            default_lists.append([(p.name, p.default) for p in sig.parameters.values()])
         assert param_lists[0] == param_lists[1] == param_lists[2], (
             f"Signature mismatch for {method_name}: {param_lists}"
+        )
+        assert default_lists[0] == default_lists[1] == default_lists[2], (
+            f"Default value mismatch for {method_name}: {default_lists}"
         )
 
     for prop_name in ("state_labels", "state_meta"):
@@ -407,4 +414,211 @@ def test_hybrid_selected_inversion_with_cholmod_backfill_matches_dense(tmp_path:
 
     assert lev_sparse is not None
     assert np.allclose(lev_sparse, lev_dense, rtol=1e-10, atol=1e-11)
+
+
+@pytest.mark.parametrize("kind", ["ac", "dc", "hybrid"])
+def test_se_materialize_measurements_and_voltage_node_idx(tmp_path: Path, kind: str):
+    """验证三大 SE 统一补齐的 materialize_measurements 与 voltage_measurement_node_idx 接口行为。"""
+    from model.meas_model import MeasurementList
+    from model.meas_type import DEVICE_TYPE_ACNode, DEVICE_TYPE_DCNode, MEAS_TYPE_V
+
+    if kind == "ac":
+        ef, mf = _generate_ac_case(10, tmp_path)
+        cls = ACStateEstimator
+    elif kind == "dc":
+        ef, mf = _generate_dc_case(10, tmp_path)
+        cls = DCStateEstimator
+    else:
+        ef, mf = _generate_hybrid_case(8, 6, tmp_path)
+        cls = HybridStateEstimator
+
+    est = cls(e_file=ef, meas_file=mf, parameters=SE_PARAMS, flat_start=True)
+    mat = est.materialize_measurements()
+    assert isinstance(mat, MeasurementList)
+    assert len(mat) == len(est.active_measurements) > 0
+    assert all(m.device_type and m.meas_type and m.device_name for m in mat[:10])
+
+    if kind in ("ac", "hybrid"):
+        ac_node = est.voltage_measurement_node_idx(DEVICE_TYPE_ACNode, 0, MEAS_TYPE_V)
+        assert ac_node is not None and ac_node >= 1
+    if kind in ("dc", "hybrid"):
+        dc_node = est.voltage_measurement_node_idx(DEVICE_TYPE_DCNode, 0, MEAS_TYPE_V)
+        assert dc_node is not None and dc_node >= 1
+
+
+def test_multi_island_reference_selection_ac_and_dc(tmp_path: Path):
+    """多岛 AC / DC 网络向量化参考节点选择应覆盖全部电气岛且能稳定求解。"""
+    n_islands = 6
+    ac_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<ACNode>",
+        "@ idx name vbase voltage angle isl run_stat",
+    ]
+    ac_br = ["<ACBranch>", "@ idx name i_node j_node r x b run_stat"]
+    ac_gen = ["<ACGenerator>", "@ idx name node control_type p_set q_set v_set alpha run_stat"]
+    ac_load = ["<ACLoad>", "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat"]
+    ac_meas = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    m_id = 1
+    for isl in range(n_islands):
+        base = isl * 2 + 1
+        ac_lines.append(f"# {base} bus_{base} 110.0 110.0 0.0 {isl + 1} 1")
+        ac_lines.append(f"# {base + 1} bus_{base + 1} 110.0 110.0 0.0 {isl + 1} 1")
+        ac_br.append(f"# {isl + 1} br_{isl + 1} {base} {base + 1} 0.01 0.05 0.0 1")
+        ac_gen.append(f"# {isl + 1} gen_{isl + 1} {base} SLACK 0.0 0.0 110.0 1.0 1")
+        ac_load.append(f"# {isl + 1} load_{isl + 1} {base + 1} 0.0 1.0 0.0 0.0 0.0 1.0 0.0 0.0 1")
+        ac_meas.append(f"# {m_id} m_{m_id} ACNode bus_{base} V 100.0 1 110.0")
+        m_id += 1
+        ac_meas.append(f"# {m_id} m_{m_id} ACNode bus_{base + 1} V 100.0 1 110.0")
+        m_id += 1
+        if isl % 3 == 1:
+            ac_meas.append(f"# {m_id} m_{m_id} ACNode bus_{base + 1} ANGLE 1000.0 1 0.0")
+            m_id += 1
+        ac_meas.append(f"# {m_id} m_{m_id} ACBranch br_{isl + 1} P_FROM 25.0 1 0.0")
+        m_id += 1
+        ac_meas.append(f"# {m_id} m_{m_id} ACBranch br_{isl + 1} Q_FROM 25.0 1 0.0")
+        m_id += 1
+    ac_lines.append("</ACNode>")
+    ac_br.append("</ACBranch>")
+    ac_gen.append("</ACGenerator>")
+    ac_load.append("</ACLoad>")
+    ac_meas.append("</Measurement>")
+    ac_e = tmp_path / "ac_multi_isl.e"
+    ac_m = tmp_path / "ac_multi_isl.meas"
+    ac_e.write_text("\n".join(ac_lines + ac_br + ac_gen + ac_load) + "\n", encoding="utf8")
+    ac_m.write_text("\n".join(ac_meas) + "\n", encoding="utf8")
+
+    ac_est = ACStateEstimator(e_file=ac_e, meas_file=ac_m, parameters=SE_PARAMS, flat_start=True)
+    assert len(ac_est.references) == n_islands
+    ac_res = ac_est.estimate(verbose=False)
+    assert ac_res.converged
+
+    dc_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<DCNode>",
+        "@ idx name vbase voltage isl run_stat",
+    ]
+    dc_br = ["<DCBranch>", "@ idx name i_node j_node r run_stat"]
+    dc_gen = ["<DCGenerator>", "@ idx name node control_type p_set v_set run_stat"]
+    dc_load = ["<DCLoad>", "@ idx name node pbase pv0 pv1 pv2 run_stat"]
+    dc_meas = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    m_id = 1
+    for isl in range(n_islands):
+        base = isl * 2 + 1
+        dc_lines.append(f"# {base} dcbus_{base} 100.0 100.0 {isl + 1} 1")
+        dc_lines.append(f"# {base + 1} dcbus_{base + 1} 100.0 100.0 {isl + 1} 1")
+        dc_br.append(f"# {isl + 1} dcbr_{isl + 1} {base} {base + 1} 0.02 1")
+        dc_gen.append(f"# {isl + 1} dcgen_{isl + 1} {base} V 0.0 100.0 1")
+        dc_load.append(f"# {isl + 1} dcload_{isl + 1} {base + 1} 0.0 1.0 0.0 0.0 1")
+        dc_meas.append(f"# {m_id} m_{m_id} DCNode dcbus_{base} V 100.0 1 100.0")
+        m_id += 1
+        dc_meas.append(f"# {m_id} m_{m_id} DCNode dcbus_{base + 1} V 100.0 1 100.0")
+        m_id += 1
+        dc_meas.append(f"# {m_id} m_{m_id} DCBranch dcbr_{isl + 1} P_FROM 25.0 1 0.0")
+        m_id += 1
+    dc_lines.append("</DCNode>")
+    dc_br.append("</DCBranch>")
+    dc_gen.append("</DCGenerator>")
+    dc_load.append("</DCLoad>")
+    dc_meas.append("</Measurement>")
+    dc_e = tmp_path / "dc_multi_isl.e"
+    dc_m = tmp_path / "dc_multi_isl.meas"
+    dc_e.write_text("\n".join(dc_lines + dc_br + dc_gen + dc_load) + "\n", encoding="utf8")
+    dc_m.write_text("\n".join(dc_meas) + "\n", encoding="utf8")
+
+    dc_est = DCStateEstimator(e_file=dc_e, meas_file=dc_m, parameters=SE_PARAMS, flat_start=True)
+    dc_res = dc_est.estimate(verbose=False)
+    assert dc_res.converged
+
+
+def test_multi_energy_context_electric_only_short_circuit():
+    """纯电 E 文件行应触发多能上下文短路，避免无意义的对象物化；含流体表时正常构建。"""
+    from model.multi_energy_model import build_multi_energy_context_from_rows
+
+    electric_only_rows = {
+        "Model": {"header_list": ["p_base", "u_unit", "p_unit", "i_unit"], "rows": [["100.0", "kV", "MW", "kA"]]},
+        "ACNode": {
+            "header_list": ["idx", "name", "vbase", "voltage", "angle", "isl", "run_stat"],
+            "rows": [["1", "b1", "110.0", "110.0", "0.0", "1", "1"]],
+        },
+        "DCNode": {
+            "header_list": ["idx", "name", "vbase", "voltage", "isl", "run_stat"],
+            "rows": [["1", "d1", "100.0", "100.0", "1", "1"]],
+        },
+    }
+    ctx_elec = build_multi_energy_context_from_rows(electric_only_rows, source="electric_only")
+    assert not ctx_elec.fluid_networks
+    assert not ctx_elec.couplings
+    assert ctx_elec.total_fluid_nodes == 0
+    assert ctx_elec.source == Path("electric_only")
+
+    fluid_rows = {
+        "Model": {"header_list": ["p_base", "u_unit", "p_unit", "i_unit"], "rows": [["100.0", "kV", "MW", "kA"]]},
+        "HeatNode": {
+            "header_list": ["idx", "name", "p", "t", "run_stat"],
+            "rows": [["1", "h1", "0.5", "80.0", "1"]],
+        },
+    }
+    ctx_fluid = build_multi_energy_context_from_rows(fluid_rows, source="with_heat")
+    assert "heat" in ctx_fluid.fluid_networks
+    assert ctx_fluid.total_fluid_nodes == 1
+
+
+def test_sparse_jacobian_builder_fixed_pattern_add_many_fast_path():
+    """验证 SparseJacobianBuilder 固定模式 add_many 恒等快路径及回退分支与动态构建完全等价。"""
+    from secore.se_math import SparseJacobianBuilder, _normal_equation_structural_pattern
+
+    rows_full = np.array([0, 1, 2, 3], dtype=np.int32)
+    cols_full = np.array([0, 1, 2, 3], dtype=np.int32)
+    rows_part = np.array([0, 1, 2, 3], dtype=np.int32)
+    cols_part = np.array([1, -1, 3, 0], dtype=np.int32)
+    mask_part = np.array([True, True, False, True], dtype=bool)
+    mask_empty = np.array([False, False, False, False], dtype=bool)
+
+    fixed = SparseJacobianBuilder((4, 4))
+    fixed._assume_fixed_pattern = True
+
+    for step in range(3):
+        v1 = np.array([1.0 + step, 2.0 + step, 3.0 + step, 4.0 + step], dtype=np.float64)
+        v2 = np.array([0.5 + step, 99.0, 88.0, -1.5 - step], dtype=np.float64)
+        v3 = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float64)
+
+        fixed.reset()
+        fixed.add_many(rows_full, cols_full, v1)
+        fixed.add_many(rows_part, cols_part, v2, mask_part)
+        fixed.add_many(rows_full, cols_full, v3, mask_empty)
+        H_fixed = fixed.to_csr()
+
+        dyn = SparseJacobianBuilder((4, 4))
+        dyn.add_many(rows_full, cols_full, v1)
+        dyn.add_many(rows_part, cols_part, v2, mask_part)
+        dyn.add_many(rows_full, cols_full, v3, mask_empty)
+        H_dyn = dyn.to_csr()
+
+        assert np.allclose(H_fixed.toarray(), H_dyn.toarray(), rtol=0.0, atol=0.0)
+        pat_fixed = _normal_equation_structural_pattern(H_fixed, triangular="lower")
+        pat_dyn = _normal_equation_structural_pattern(H_dyn.copy(), triangular="lower")
+        assert np.array_equal(pat_fixed.indptr, pat_dyn.indptr)
+        assert np.array_equal(pat_fixed.indices, pat_dyn.indices)
+
+    # 动态替换新 mask 对象时应安全回退而不出错
+    alt_mask = mask_part.copy()
+    v1 = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float64)
+    v2 = np.array([1.25, 0.0, 0.0, -2.5], dtype=np.float64)
+    fixed.reset()
+    fixed.add_many(rows_full, cols_full, v1)
+    fixed.add_many(rows_part, cols_part, v2, alt_mask)
+    fixed.add_many(rows_full, cols_full, v1, mask_empty)
+    H_fallback = fixed.to_csr()
+    dyn = SparseJacobianBuilder((4, 4))
+    dyn.add_many(rows_full, cols_full, v1)
+    dyn.add_many(rows_part, cols_part, v2, alt_mask)
+    dyn.add_many(rows_full, cols_full, v1, mask_empty)
+    assert np.allclose(H_fallback.toarray(), dyn.to_csr().toarray(), rtol=0.0, atol=0.0)
+
 

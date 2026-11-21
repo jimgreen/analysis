@@ -69,12 +69,15 @@ from model.meas_type import (
     MEAS_TYPE_V_GEN,
     MEAS_TYPE_V_LOAD,
     MEAS_TYPE_V_TO,
+    DEVICE_TYPE_NAMES,
+    MEAS_TYPE_NAMES,
 )
 from model.meas_model import (
     BadDataItem,
     EstimateResult,
     MEAS_STATUS_INVALID,
     MEAS_STATUS_PSEUDO,
+    MeasurementList,
     MeasurementTable,
     MeasurementTableView,
     ObservabilityResult,
@@ -1319,7 +1322,7 @@ class DCStateEstimator:
         row_key_tuple = tuple(row_keys)
         merged: Dict[str, object] = {}
         for key, head_value in head.items():
-            if key.endswith("_masks"):
+            if key.endswith("_masks") or key == "_kind_slices":
                 continue
             tail_value = tail[key]
             if key in row_key_tuple:
@@ -1336,10 +1339,7 @@ class DCStateEstimator:
 
     @staticmethod
     def _populate_kind_masks(plan: Dict[str, np.ndarray]) -> None:
-        """Fill in per-kind bool masks that the fill_* hot loops would otherwise
-        recompute every iteration. Tuples of length max_kind+1; entry k is the
-        ``section_kind == k`` mask. Called after every plan build / merge /
-        shrink so the masks always reflect the current kind arrays."""
+        """预计算各类量测的布尔掩码及按量测类型分组的紧凑切片计划，避免热循环中重复扫描与空分支计算。"""
         for key, max_kind in (
             ("branch_kind", MEAS_TYPE_I_TO),
             ("load_kind", MEAS_TYPE_I_LOAD),
@@ -1353,6 +1353,198 @@ class DCStateEstimator:
                 continue
             mask_key = key.rsplit("_", 1)[0] + ("_ctrl_masks" if key.endswith("_ctrl") else "_kind_masks")
             plan[mask_key] = tuple((kind == k) for k in range(max_kind + 1))
+
+        slices: Dict[str, object] = {}
+
+        node_rows = plan.get("node_rows")
+        if node_rows is not None and node_rows.size:
+            slices["node_ones"] = np.ones(node_rows.size, dtype=np.float64)
+
+        constraint_rows = plan.get("constraint_rows")
+        if constraint_rows is not None and constraint_rows.size:
+            c_ones = np.ones(constraint_rows.size, dtype=np.float64)
+            slices["constraint_ones"] = (c_ones, -c_ones)
+
+        branch_rows = plan.get("branch_rows")
+        if branch_rows is not None and branch_rows.size:
+            b_masks = plan["branch_kind_masks"]
+            b_i = plan["branch_i"]
+            b_j = plan["branch_j"]
+            b_ic = plan["branch_i_col"]
+            b_jc = plan["branch_j_col"]
+            b_inv_r = plan["branch_inv_r"]
+            b_entries = {}
+            for k in (
+                MEAS_TYPE_P_FROM,
+                MEAS_TYPE_V_FROM,
+                MEAS_TYPE_I_FROM,
+                MEAS_TYPE_P_TO,
+                MEAS_TYPE_V_TO,
+                MEAS_TYPE_I_TO,
+            ):
+                idx = np.flatnonzero(b_masks[k]).astype(np.intp, copy=False)
+                if idx.size == 0:
+                    continue
+                inv_r_k = b_inv_r[idx]
+                b_entries[k] = (
+                    branch_rows[idx],
+                    b_i[idx],
+                    b_j[idx],
+                    b_ic[idx],
+                    b_jc[idx],
+                    inv_r_k,
+                    -inv_r_k if k in (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO) else None,
+                    np.ones(idx.size, dtype=np.float64) if k in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO) else None,
+                )
+            slices["branch"] = b_entries
+
+        load_rows = plan.get("load_rows")
+        if load_rows is not None and load_rows.size:
+            l_masks = plan["load_kind_masks"]
+            l_pos = plan["load_pos"]
+            l_col = plan["load_col"]
+            l_pv0 = plan["load_pv0"]
+            l_pv1 = plan["load_pv1"]
+            l_pv2 = plan["load_pv2"]
+            l_entries = {}
+            for k in (MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD):
+                idx = np.flatnonzero(l_masks[k]).astype(np.intp, copy=False)
+                if idx.size == 0:
+                    continue
+                l_entries[k] = (
+                    load_rows[idx],
+                    l_pos[idx],
+                    l_col[idx],
+                    l_pv0[idx],
+                    l_pv1[idx],
+                    l_pv2[idx],
+                    np.ones(idx.size, dtype=np.float64) if k == MEAS_TYPE_V_LOAD else None,
+                )
+            slices["load"] = l_entries
+
+        gen_rows = plan.get("gen_rows")
+        if gen_rows is not None and gen_rows.size:
+            g_masks = plan["gen_kind_masks"]
+            g_ctrl = plan["gen_ctrl_masks"]
+            g_pos = plan["gen_pos"]
+            g_col = plan["gen_col"]
+            g_pcol = plan["gen_p_col"]
+            g_vgen = plan["gen_vgen_pos"]
+            g_pset = plan["gen_p_set"]
+            g_iset = plan["gen_i_set"]
+            v_ctrl = g_ctrl[DC_CTRL_V]
+            p_ctrl = g_ctrl[DC_CTRL_P]
+            i_ctrl = g_ctrl[DC_CTRL_I]
+            g_jac = {}
+            idx_vg = np.flatnonzero(g_masks[MEAS_TYPE_V_GEN]).astype(np.intp, copy=False)
+            if idx_vg.size:
+                g_jac["v_gen"] = (gen_rows[idx_vg], g_col[idx_vg], np.ones(idx_vg.size, dtype=np.float64))
+            idx_pv = np.flatnonzero(g_masks[MEAS_TYPE_P_GEN] & v_ctrl).astype(np.intp, copy=False)
+            if idx_pv.size:
+                g_jac["p_gen_v"] = (gen_rows[idx_pv], g_pcol[idx_pv], np.ones(idx_pv.size, dtype=np.float64))
+            idx_pi = np.flatnonzero(g_masks[MEAS_TYPE_P_GEN] & i_ctrl).astype(np.intp, copy=False)
+            if idx_pi.size:
+                g_jac["p_gen_i"] = (gen_rows[idx_pi], g_col[idx_pi], g_iset[idx_pi])
+            idx_iv = np.flatnonzero(g_masks[MEAS_TYPE_I_GEN] & v_ctrl).astype(np.intp, copy=False)
+            if idx_iv.size:
+                g_jac["i_gen_v"] = (
+                    gen_rows[idx_iv],
+                    g_pos[idx_iv],
+                    g_col[idx_iv],
+                    g_pcol[idx_iv],
+                    g_vgen[idx_iv],
+                )
+            idx_ip = np.flatnonzero(g_masks[MEAS_TYPE_I_GEN] & p_ctrl).astype(np.intp, copy=False)
+            if idx_ip.size:
+                g_jac["i_gen_p"] = (gen_rows[idx_ip], g_pos[idx_ip], g_col[idx_ip], g_pset[idx_ip])
+            slices["gen_jac"] = g_jac
+
+        switch_rows = plan.get("switch_rows")
+        if switch_rows is not None and switch_rows.size:
+            s_masks = plan["switch_kind_masks"]
+            s_i = plan["switch_i"]
+            s_j = plan["switch_j"]
+            s_ic = plan["switch_i_col"]
+            s_jc = plan["switch_j_col"]
+            s_col = plan["switch_col"]
+            s_pos = plan["switch_pos"]
+            s_entries = {}
+            for k in (
+                MEAS_TYPE_P_FROM,
+                MEAS_TYPE_V_FROM,
+                MEAS_TYPE_I_FROM,
+                MEAS_TYPE_P_TO,
+                MEAS_TYPE_V_TO,
+                MEAS_TYPE_I_TO,
+            ):
+                idx = np.flatnonzero(s_masks[k]).astype(np.intp, copy=False)
+                if idx.size == 0:
+                    continue
+                pos_k = s_pos[idx]
+                valid_pos_k = pos_k >= 0
+                if k in (MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_I_FROM):
+                    const_k = np.ones(idx.size, dtype=np.float64)
+                elif k == MEAS_TYPE_I_TO:
+                    const_k = -np.ones(idx.size, dtype=np.float64)
+                else:
+                    const_k = None
+                s_entries[k] = (
+                    switch_rows[idx],
+                    s_i[idx],
+                    s_j[idx],
+                    s_ic[idx],
+                    s_jc[idx],
+                    s_col[idx],
+                    pos_k,
+                    valid_pos_k,
+                    bool(np.all(valid_pos_k)),
+                    const_k,
+                )
+            slices["switch"] = s_entries
+
+        dcdc_rows = plan.get("dcdc_rows")
+        if dcdc_rows is not None and dcdc_rows.size:
+            d_masks = plan["dcdc_kind_masks"]
+            d_i = plan["dcdc_i"]
+            d_j = plan["dcdc_j"]
+            d_ic = plan["dcdc_i_col"]
+            d_jc = plan["dcdc_j_col"]
+            d_pc = plan["dcdc_p_col"]
+            d_qc = plan["dcdc_q_col"]
+            d_pos = plan["dcdc_pos"]
+            d_entries = {}
+            for k in (
+                MEAS_TYPE_P_FROM,
+                MEAS_TYPE_V_FROM,
+                MEAS_TYPE_I_FROM,
+                MEAS_TYPE_P_TO,
+                MEAS_TYPE_V_TO,
+                MEAS_TYPE_I_TO,
+            ):
+                idx = np.flatnonzero(d_masks[k]).astype(np.intp, copy=False)
+                if idx.size == 0:
+                    continue
+                conv_k = d_pos[idx]
+                const_k = (
+                    np.ones(idx.size, dtype=np.float64)
+                    if k in (MEAS_TYPE_P_FROM, MEAS_TYPE_V_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_V_TO)
+                    else None
+                )
+                d_entries[k] = (
+                    dcdc_rows[idx],
+                    d_i[idx],
+                    d_j[idx],
+                    d_ic[idx],
+                    d_jc[idx],
+                    d_pc[idx],
+                    d_qc[idx],
+                    2 * conv_k,
+                    2 * conv_k + 1,
+                    const_k,
+                )
+            slices["dcdc"] = d_entries
+
+        plan["_kind_slices"] = slices
 
     def _normalize_measurements(self, measurements: Optional[object]):
         if measurements is None:
@@ -1862,12 +2054,13 @@ class DCStateEstimator:
         return _NodeIndexedValueMap(self._node_idx_by_pos, degrees, np.ones(degrees.size, dtype=bool))
 
     def _select_reference_nodes(self) -> np.ndarray:
-        """Choose one measured high-degree DC voltage reference per live DC topology island."""
+        """Choose one measured high-degree DC voltage reference per live DC topology island in O(N log N)."""
+        n_nodes = int(getattr(self, "n_nodes", 0))
         measured_solver_mask = np.asarray(
-            getattr(self, "_node_voltage_measurement_pos_mask_cache", np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)),
+            getattr(self, "_node_voltage_measurement_pos_mask_cache", np.zeros(n_nodes, dtype=bool)),
             dtype=bool,
         )
-        if measured_solver_mask.size != int(getattr(self, "n_nodes", 0)):
+        if measured_solver_mask.size != n_nodes:
             voltage_measurements = self.node_voltage_measurements
             measured_node_idx = (
                 np.fromiter(
@@ -1878,47 +2071,71 @@ class DCStateEstimator:
                 if voltage_measurements
                 else np.asarray([], dtype=np.int64)
             )
-            measured_solver_mask = np.zeros(int(getattr(self, "n_nodes", 0)), dtype=bool)
+            measured_solver_mask = np.zeros(n_nodes, dtype=bool)
             if measured_node_idx.size:
                 measured_solver_mask = np.isin(
                     np.asarray(self._node_idx_by_pos, dtype=np.int64),
                     measured_node_idx,
                     assume_unique=False,
                 )
-        degrees = getattr(self, "_node_degree_by_pos", np.zeros(int(getattr(self, "n_nodes", 0)), dtype=np.int64))
+        degrees = np.asarray(getattr(self, "_node_degree_by_pos", np.zeros(n_nodes, dtype=np.int64)), dtype=np.int64)
+        node_idx_by_pos = np.asarray(self._node_idx_by_pos, dtype=np.int64)
         topology_arrays = self._dc_topology_arrays
-        bus_solver_pos = self._bus_solver_pos
+        bus_solver_pos = np.asarray(self._bus_solver_pos, dtype=np.int64)
         island_alive = np.asarray(topology_arrays.island_alive_mask, dtype=bool)
-        references = np.full(int(np.count_nonzero(island_alive)), -1, dtype=np.int64)
-        ref_count = 0
-        has_measured_voltage = bool(np.any(measured_solver_mask))
-        for island_pos, alive in enumerate(np.asarray(topology_arrays.island_alive_mask, dtype=bool)):
-            if not bool(alive):
-                continue
-            start = int(topology_arrays.island_bus_offsets[island_pos])
-            end = int(topology_arrays.island_bus_offsets[island_pos + 1])
-            bus_pos = topology_arrays.island_bus_indices[start:end].astype(np.int64, copy=False)
-            solver_pos = bus_solver_pos[bus_pos.astype(np.intp, copy=False)]
-            solver_pos = solver_pos[solver_pos >= 0]
-            if solver_pos.size == 0:
-                continue
-            if has_measured_voltage:
-                measured_pos = solver_pos[measured_solver_mask[solver_pos.astype(np.intp, copy=False)]]
-            else:
-                measured_pos = np.asarray([], dtype=np.int64)
-            if measured_pos.size:
-                measured_pos = measured_pos.astype(np.intp, copy=False)
-                measured_degrees = degrees[measured_pos]
-                measured_candidate_node_idx = self._node_idx_by_pos[measured_pos]
-                best_order = np.lexsort((measured_candidate_node_idx, -measured_degrees))
-                references[ref_count] = int(measured_pos[int(best_order[0])])
-                ref_count += 1
-                continue
-            ref_bus = int(topology_arrays.island_reference_bus_pos[island_pos])
-            ref_solver = int(bus_solver_pos[ref_bus]) if 0 <= ref_bus < bus_solver_pos.size else -1
-            references[ref_count] = ref_solver if ref_solver >= 0 else int(solver_pos[0])
-            ref_count += 1
-        return references[:ref_count].astype(np.int64, copy=False)
+        n_islands = int(island_alive.size)
+        if n_islands == 0 or not np.any(island_alive):
+            return np.asarray([], dtype=np.int64)
+
+        offsets = np.asarray(topology_arrays.island_bus_offsets, dtype=np.int64)
+        bus_indices = np.asarray(topology_arrays.island_bus_indices, dtype=np.intp)
+        island_counts = offsets[1 : n_islands + 1] - offsets[:n_islands]
+        total_entries = int(bus_indices.size)
+        if total_entries == 0:
+            return np.asarray([], dtype=np.int64)
+
+        # 向量化展开所有 (island_pos, solver_pos) 项，彻底消除多岛循环内反复 lexsort
+        entry_island = np.repeat(np.arange(n_islands, dtype=np.int32), island_counts)
+        entry_solver = bus_solver_pos[bus_indices]
+        valid = island_alive[entry_island] & (entry_solver >= 0)
+        if not np.any(valid):
+            return np.asarray([], dtype=np.int64)
+        v_isl = entry_island[valid]
+        v_pos = entry_solver[valid]
+
+        # 保持拓扑中每岛第一个有效 solver_pos 作为最终兜底
+        first_all = np.empty(v_isl.size, dtype=bool)
+        first_all[0] = True
+        first_all[1:] = v_isl[1:] != v_isl[:-1]
+        active_islands = v_isl[first_all]
+        first_solver_pos = v_pos[first_all]
+
+        best_measured = np.full(n_islands, -1, dtype=np.int64)
+        if bool(np.any(measured_solver_mask)):
+            m_mask = measured_solver_mask[v_pos.astype(np.intp, copy=False)]
+            if np.any(m_mask):
+                m_isl = v_isl[m_mask]
+                m_pos = v_pos[m_mask]
+                m_pos_intp = m_pos.astype(np.intp, copy=False)
+                order_m = np.lexsort((node_idx_by_pos[m_pos_intp], -degrees[m_pos_intp], m_isl))
+                s_isl_m = m_isl[order_m]
+                s_pos_m = m_pos[order_m]
+                first_m = np.empty(s_isl_m.size, dtype=bool)
+                first_m[0] = True
+                first_m[1:] = s_isl_m[1:] != s_isl_m[:-1]
+                best_measured[s_isl_m[first_m]] = s_pos_m[first_m]
+
+        chosen = best_measured[active_islands]
+        need_fallback = chosen < 0
+        if np.any(need_fallback):
+            fb_islands = active_islands[need_fallback]
+            ref_bus_arr = np.asarray(topology_arrays.island_reference_bus_pos, dtype=np.int64)[fb_islands]
+            valid_bus = (ref_bus_arr >= 0) & (ref_bus_arr < bus_solver_pos.size)
+            fb_solver = np.full(fb_islands.size, -1, dtype=np.int64)
+            if np.any(valid_bus):
+                fb_solver[valid_bus] = bus_solver_pos[ref_bus_arr[valid_bus].astype(np.intp, copy=False)]
+            chosen[need_fallback] = np.where(fb_solver >= 0, fb_solver, first_solver_pos[need_fallback])
+        return chosen.astype(np.int64, copy=False)
 
     def _build_zero_tie_voltage_layout(self) -> None:
         """Compress DC voltage states across explicit zero branches and breakers.
@@ -2200,17 +2417,14 @@ class DCStateEstimator:
         if not hasattr(self, "_measurement_plan_meas_kind_code_by_type_code"):
             self._build_measurement_plan_lookup_arrays()
 
-    def _attach_meas_ppc_device_pos(self) -> None:
-        meas_ppc = getattr(self, "meas_ppc", None)
-        if not isinstance(meas_ppc, dict):
-            return
+    def _measurement_name_arrays_by_type_code(self) -> Dict[int, np.ndarray]:
         constraint_names = np.concatenate(
             (
                 np.asarray(getattr(self, "_zero_branch_names", ()), dtype=object),
                 np.asarray(getattr(self, "_break_names", ()), dtype=object),
             )
         )
-        name_arrays_by_code = {
+        return {
             DEVICE_TYPE_DCNode: np.asarray(getattr(self, "_raw_node_names_alive", ()), dtype=object),
             DEVICE_TYPE_DCBranch: np.asarray(getattr(self, "_branch_names", ()), dtype=object),
             DEVICE_TYPE_DCBreak: np.asarray(getattr(self, "_break_names", ()), dtype=object),
@@ -2221,10 +2435,50 @@ class DCStateEstimator:
             DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
             DEVICE_TYPE_DCBreakConstraint: constraint_names,
         }
+
+    def _attach_meas_ppc_device_pos(self) -> None:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if not isinstance(meas_ppc, dict):
+            return
+        name_arrays_by_code = self._measurement_name_arrays_by_type_code()
         device_pos = attach_device_pos_from_name_arrays(meas_ppc, name_arrays_by_code)
         table = getattr(getattr(self, "measurements", None), "table", None)
         if table is not None and int(getattr(table, "idx", np.asarray([])).size) == int(device_pos.size):
             table.device_pos = device_pos
+
+    def materialize_measurements(
+        self,
+        measurements: Optional[object] = None,
+    ) -> MeasurementList:
+        """将数组型量测视图物化为 MeasurementList，供诊断与兼容接口使用（与 AC/Hybrid SE 接口一致）。"""
+        source = self.active_measurements if measurements is None else measurements
+        table = getattr(source, "table", None)
+        if table is None or int(table.idx.size) != len(source):
+            return MeasurementList(list(source), normalized=getattr(source, "normalized", False))
+        codes = np.asarray(table.device_type_code, dtype=np.int16)
+        positions = self._measurement_device_pos_array(table)
+        meas_codes = np.asarray(
+            getattr(table, "meas_type_code", np.zeros(table.idx.size, dtype=np.int16)),
+            dtype=np.int16,
+        )
+        name_arrays = self._measurement_name_arrays_by_type_code()
+        status = measurement_table_status_code(table)
+        rows = []
+        for row in range(int(table.idx.size)):
+            measurement = measurement_from_table_row(table, row)
+            type_code = int(codes[row])
+            meas_code = int(meas_codes[row]) if meas_codes.size == table.idx.size else 0
+            device_pos = int(positions[row]) if positions.size == table.idx.size else -1
+            measurement.device_type = DEVICE_TYPE_NAMES.get(type_code, measurement.device_type)
+            measurement.meas_type = MEAS_TYPE_NAMES.get(meas_code, measurement.meas_type)
+            names = np.asarray(name_arrays.get(type_code, ()), dtype=object)
+            if 0 <= device_pos < names.size:
+                measurement.device_name = str(names[device_pos])
+            if not measurement.name or measurement.name.startswith("m"):
+                prefix = "pseudo" if int(status[row]) == MEAS_STATUS_PSEUDO else "measurement"
+                measurement.name = f"{prefix}_{measurement.meas_type.lower()}_{measurement.device_name}"
+            rows.append(measurement)
+        return MeasurementList(rows, table=table, normalized=getattr(source, "normalized", False))
 
     def _measurement_device_pos_array(
         self,
@@ -4843,63 +5097,61 @@ class DCStateEstimator:
     ) -> np.ndarray:
         """Batch-evaluate common DC measurement rows without per-device Python calls."""
         plan = measurements if isinstance(measurements, dict) and "handled_mask" in measurements else self._measurement_plan(measurements)
+        slices = plan.get("_kind_slices", {})
 
         rows = plan["node_rows"]
         if rows.size:
             values[rows] = voltage[plan["node_pos"]]
 
-        rows = plan["branch_rows"]
-        if rows.size:
-            kind_masks = plan["branch_kind_masks"]
-            i = plan["branch_i"]
-            j = plan["branch_j"]
-            vi = voltage[i]
-            vj = voltage[j]
-            inv_r = plan["branch_inv_r"]
-            current = (vi - vj) * inv_r
-            out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[MEAS_TYPE_P_FROM]
-            if m.any():
-                out[m] = vi[m] * current[m]
-            m = kind_masks[MEAS_TYPE_V_FROM]
-            if m.any():
-                out[m] = vi[m]
-            m = kind_masks[MEAS_TYPE_I_FROM]
-            if m.any():
-                out[m] = current[m]
-            m = kind_masks[MEAS_TYPE_P_TO]
-            if m.any():
-                out[m] = -vj[m] * current[m]
-            m = kind_masks[MEAS_TYPE_V_TO]
-            if m.any():
-                out[m] = vj[m]
-            m = kind_masks[MEAS_TYPE_I_TO]
-            if m.any():
-                out[m] = -current[m]
-            values[rows] = out
+        b_entries = slices.get("branch")
+        if b_entries:
+            entry = b_entries.get(MEAS_TYPE_P_FROM)
+            if entry is not None:
+                k_rows, bi, bj, _, _, inv_r, _, _ = entry
+                vi = voltage[bi]
+                values[k_rows] = vi * ((vi - voltage[bj]) * inv_r)
+            entry = b_entries.get(MEAS_TYPE_V_FROM)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[1]]
+            entry = b_entries.get(MEAS_TYPE_I_FROM)
+            if entry is not None:
+                k_rows, bi, bj, _, _, inv_r, _, _ = entry
+                values[k_rows] = (voltage[bi] - voltage[bj]) * inv_r
+            entry = b_entries.get(MEAS_TYPE_P_TO)
+            if entry is not None:
+                k_rows, bi, bj, _, _, inv_r, _, _ = entry
+                vj = voltage[bj]
+                values[k_rows] = -vj * ((voltage[bi] - vj) * inv_r)
+            entry = b_entries.get(MEAS_TYPE_V_TO)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[2]]
+            entry = b_entries.get(MEAS_TYPE_I_TO)
+            if entry is not None:
+                k_rows, bi, bj, _, _, inv_r, _, _ = entry
+                values[k_rows] = -((voltage[bi] - voltage[bj]) * inv_r)
 
-        rows = plan["load_rows"]
-        if rows.size:
-            kind_masks = plan["load_kind_masks"]
-            v = voltage[plan["load_pos"]]
-            p = plan["load_pv0"] + plan["load_pv1"] * v + plan["load_pv2"] * v * v
-            out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[MEAS_TYPE_P_LOAD]
-            if m.any():
-                out[m] = p[m]
-            m = kind_masks[MEAS_TYPE_V_LOAD]
-            if m.any():
-                out[m] = v[m]
-            i_mask = kind_masks[MEAS_TYPE_I_LOAD]
-            if i_mask.any():
-                out[i_mask] = 0.0
-                v_i = v[i_mask]
-                p_i = p[i_mask]
-                valid = np.abs(v_i) > self.min_current_voltage
-                if valid.any():
-                    idx = np.flatnonzero(i_mask)
-                    out[idx[valid]] = p_i[valid] / v_i[valid]
-            values[rows] = out
+        l_entries = slices.get("load")
+        if l_entries:
+            entry = l_entries.get(MEAS_TYPE_P_LOAD)
+            if entry is not None:
+                k_rows, pos, _, pv0, pv1, pv2, _ = entry
+                v = voltage[pos]
+                values[k_rows] = pv0 + pv1 * v + pv2 * v * v
+            entry = l_entries.get(MEAS_TYPE_V_LOAD)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[1]]
+            entry = l_entries.get(MEAS_TYPE_I_LOAD)
+            if entry is not None:
+                k_rows, pos, _, pv0, pv1, pv2, _ = entry
+                v = voltage[pos]
+                p = pv0 + pv1 * v + pv2 * v * v
+                out_i = np.zeros(k_rows.size, dtype=np.float64)
+                valid = np.abs(v) > self.min_current_voltage
+                if valid.all():
+                    out_i = p / v
+                elif valid.any():
+                    out_i[valid] = p[valid] / v[valid]
+                values[k_rows] = out_i
 
         rows = plan["gen_rows"]
         if rows.size:
@@ -4916,103 +5168,100 @@ class DCStateEstimator:
                 p[p_ctrl] = plan["gen_p_set"][p_ctrl]
             if i_ctrl.any():
                 p[i_ctrl] = plan["gen_i_set"][i_ctrl] * v[i_ctrl]
-            current = np.zeros(rows.size, dtype=np.float64)
-            if i_ctrl.any():
-                current[i_ctrl] = plan["gen_i_set"][i_ctrl]
-            derived_current = ~i_ctrl
-            if derived_current.any():
-                v_d = v[derived_current]
-                p_d = p[derived_current]
-                valid = np.abs(v_d) > self.min_current_voltage
-                if valid.any():
-                    idx = np.flatnonzero(derived_current)
-                    current[idx[valid]] = p_d[valid] / v_d[valid]
-            out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[MEAS_TYPE_P_GEN]
-            if m.any():
-                out[m] = p[m]
-            m = kind_masks[MEAS_TYPE_V_GEN]
-            if m.any():
-                out[m] = v[m]
-            m = kind_masks[MEAS_TYPE_I_GEN]
-            if m.any():
-                out[m] = current[m]
-            values[rows] = out
+            m_i = kind_masks[MEAS_TYPE_I_GEN]
+            if m_i.any():
+                current = np.zeros(rows.size, dtype=np.float64)
+                if i_ctrl.any():
+                    current[i_ctrl] = plan["gen_i_set"][i_ctrl]
+                derived_current = ~i_ctrl
+                if derived_current.any():
+                    v_d = v[derived_current]
+                    p_d = p[derived_current]
+                    valid = np.abs(v_d) > self.min_current_voltage
+                    if valid.any():
+                        idx = np.flatnonzero(derived_current)
+                        current[idx[valid]] = p_d[valid] / v_d[valid]
+                values[rows[m_i]] = current[m_i]
+            m_p = kind_masks[MEAS_TYPE_P_GEN]
+            if m_p.any():
+                values[rows[m_p]] = p[m_p]
+            m_v = kind_masks[MEAS_TYPE_V_GEN]
+            if m_v.any():
+                values[rows[m_v]] = v[m_v]
 
-        rows = plan["switch_rows"]
-        if rows.size:
-            kind_masks = plan["switch_kind_masks"]
-            vi = voltage[plan["switch_i"]]
-            vj = voltage[plan["switch_j"]]
-            current = np.zeros(rows.size, dtype=np.float64)
-            current_mask = plan["switch_pos"] >= 0
-            if current_mask.any():
-                current[current_mask] = switch_current[plan["switch_pos"][current_mask]]
-            out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[MEAS_TYPE_P_FROM]
-            if m.any():
-                out[m] = vi[m] * current[m]
-            m = kind_masks[MEAS_TYPE_V_FROM]
-            if m.any():
-                out[m] = vi[m]
-            m = kind_masks[MEAS_TYPE_I_FROM]
-            if m.any():
-                out[m] = current[m]
-            m = kind_masks[MEAS_TYPE_P_TO]
-            if m.any():
-                out[m] = -vj[m] * current[m]
-            m = kind_masks[MEAS_TYPE_V_TO]
-            if m.any():
-                out[m] = vj[m]
-            m = kind_masks[MEAS_TYPE_I_TO]
-            if m.any():
-                out[m] = -current[m]
-            values[rows] = out
+        s_entries = slices.get("switch")
+        if s_entries:
+            def _sw_cur(pos_k, valid_pos_k, all_valid):
+                if all_valid:
+                    return switch_current[pos_k]
+                cur = np.zeros(pos_k.size, dtype=np.float64)
+                if valid_pos_k.any():
+                    cur[valid_pos_k] = switch_current[pos_k[valid_pos_k]]
+                return cur
+
+            entry = s_entries.get(MEAS_TYPE_P_FROM)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[1]] * _sw_cur(entry[6], entry[7], entry[8])
+            entry = s_entries.get(MEAS_TYPE_V_FROM)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[1]]
+            entry = s_entries.get(MEAS_TYPE_I_FROM)
+            if entry is not None:
+                values[entry[0]] = _sw_cur(entry[6], entry[7], entry[8])
+            entry = s_entries.get(MEAS_TYPE_P_TO)
+            if entry is not None:
+                values[entry[0]] = -voltage[entry[2]] * _sw_cur(entry[6], entry[7], entry[8])
+            entry = s_entries.get(MEAS_TYPE_V_TO)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[2]]
+            entry = s_entries.get(MEAS_TYPE_I_TO)
+            if entry is not None:
+                values[entry[0]] = -_sw_cur(entry[6], entry[7], entry[8])
 
         rows = plan["constraint_rows"]
         if rows.size:
             values[rows] = voltage[plan["constraint_i"]] - voltage[plan["constraint_j"]]
 
-        rows = plan["dcdc_rows"]
-        if rows.size:
-            kind_masks = plan["dcdc_kind_masks"]
-            conv_pos = plan["dcdc_pos"]
-            p_from = dcdc_power[2 * conv_pos]
-            p_to = dcdc_power[2 * conv_pos + 1]
-            v_from = voltage[plan["dcdc_i"]]
-            v_to = voltage[plan["dcdc_j"]]
-            out = np.empty(rows.size, dtype=np.float64)
-            m = kind_masks[MEAS_TYPE_P_FROM]
-            if m.any():
-                out[m] = p_from[m]
-            m = kind_masks[MEAS_TYPE_V_FROM]
-            if m.any():
-                out[m] = v_from[m]
-            m = kind_masks[MEAS_TYPE_I_FROM]
-            if m.any():
-                v_f = v_from[m]
+        d_entries = slices.get("dcdc")
+        if d_entries:
+            entry = d_entries.get(MEAS_TYPE_P_FROM)
+            if entry is not None:
+                values[entry[0]] = dcdc_power[entry[7]]
+            entry = d_entries.get(MEAS_TYPE_V_FROM)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[1]]
+            entry = d_entries.get(MEAS_TYPE_I_FROM)
+            if entry is not None:
+                k_rows = entry[0]
+                v_f = voltage[entry[1]]
+                p_f = dcdc_power[entry[7]]
                 valid = np.abs(v_f) > self.min_current_voltage
-                idx = np.flatnonzero(m)
-                tmp = np.zeros(idx.size, dtype=np.float64)
-                if valid.any():
-                    tmp[valid] = p_from[m][valid] / v_f[valid]
-                out[idx] = tmp
-            m = kind_masks[MEAS_TYPE_P_TO]
-            if m.any():
-                out[m] = p_to[m]
-            m = kind_masks[MEAS_TYPE_V_TO]
-            if m.any():
-                out[m] = v_to[m]
-            m = kind_masks[MEAS_TYPE_I_TO]
-            if m.any():
-                v_t = v_to[m]
+                if valid.all():
+                    values[k_rows] = p_f / v_f
+                else:
+                    tmp = np.zeros(k_rows.size, dtype=np.float64)
+                    if valid.any():
+                        tmp[valid] = p_f[valid] / v_f[valid]
+                    values[k_rows] = tmp
+            entry = d_entries.get(MEAS_TYPE_P_TO)
+            if entry is not None:
+                values[entry[0]] = dcdc_power[entry[8]]
+            entry = d_entries.get(MEAS_TYPE_V_TO)
+            if entry is not None:
+                values[entry[0]] = voltage[entry[2]]
+            entry = d_entries.get(MEAS_TYPE_I_TO)
+            if entry is not None:
+                k_rows = entry[0]
+                v_t = voltage[entry[2]]
+                p_t = dcdc_power[entry[8]]
                 valid = np.abs(v_t) > self.min_current_voltage
-                idx = np.flatnonzero(m)
-                tmp = np.zeros(idx.size, dtype=np.float64)
-                if valid.any():
-                    tmp[valid] = p_to[m][valid] / v_t[valid]
-                out[idx] = tmp
-            values[rows] = out
+                if valid.all():
+                    values[k_rows] = p_t / v_t
+                else:
+                    tmp = np.zeros(k_rows.size, dtype=np.float64)
+                    if valid.any():
+                        tmp[valid] = p_t[valid] / v_t[valid]
+                    values[k_rows] = tmp
 
         return plan["handled_mask"]
 
@@ -5022,7 +5271,7 @@ class DCStateEstimator:
         measurement_plan_tables=None,
         *,
         out: Optional[np.ndarray] = None,
-        measurements=None,
+        measurements: Optional[object] = None,
     ) -> np.ndarray:
         """Evaluate h(x): estimated values for each active DC measurement."""
         if measurements is not None:
@@ -5100,143 +5349,149 @@ class DCStateEstimator:
     ) -> np.ndarray:
         """Batch-fill sparse/dense DC measurement Jacobian rows."""
         plan = measurements if isinstance(measurements, dict) and "handled_mask" in measurements else self._measurement_plan(measurements)
+        slices = plan.get("_kind_slices", {})
 
         rows = plan["node_rows"]
         if rows.size:
-            self._add_indexed_values(H, rows, plan["node_col"], np.ones(rows.size, dtype=np.float64))
+            self._add_indexed_values(H, rows, plan["node_col"], slices["node_ones"])
 
-        rows = plan["branch_rows"]
-        if rows.size:
-            kind_masks = plan["branch_kind_masks"]
-            i = plan["branch_i"]
-            j = plan["branch_j"]
-            i_col = plan["branch_i_col"]
-            j_col = plan["branch_j_col"]
-            vi = voltage[i]
-            vj = voltage[j]
-            inv_r = plan["branch_inv_r"]
+        b_entries = slices.get("branch")
+        if b_entries:
+            entry = b_entries.get(MEAS_TYPE_P_FROM)
+            if entry is not None:
+                k_rows, bi, bj, ic, jc, inv_r, _, _ = entry
+                vi = voltage[bi]
+                vj = voltage[bj]
+                self._add_indexed_values(H, k_rows, ic, (2.0 * vi - vj) * inv_r)
+                self._add_indexed_values(H, k_rows, jc, -vi * inv_r)
+            entry = b_entries.get(MEAS_TYPE_V_FROM)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[3], entry[7])
+            entry = b_entries.get(MEAS_TYPE_I_FROM)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[3], entry[5])
+                self._add_indexed_values(H, entry[0], entry[4], entry[6])
+            entry = b_entries.get(MEAS_TYPE_P_TO)
+            if entry is not None:
+                k_rows, bi, bj, ic, jc, inv_r, _, _ = entry
+                vi = voltage[bi]
+                vj = voltage[bj]
+                self._add_indexed_values(H, k_rows, ic, -vj * inv_r)
+                self._add_indexed_values(H, k_rows, jc, (-vi + 2.0 * vj) * inv_r)
+            entry = b_entries.get(MEAS_TYPE_V_TO)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[4], entry[7])
+            entry = b_entries.get(MEAS_TYPE_I_TO)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[3], entry[6])
+                self._add_indexed_values(H, entry[0], entry[4], entry[5])
 
-            mask = kind_masks[MEAS_TYPE_P_FROM]
-            self._add_indexed_values(H, rows, i_col, (2.0 * vi - vj) * inv_r, mask)
-            self._add_indexed_values(H, rows, j_col, -vi * inv_r, mask)
-            mask = kind_masks[MEAS_TYPE_V_FROM]
-            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[MEAS_TYPE_I_FROM]
-            self._add_indexed_values(H, rows, i_col, inv_r, mask)
-            self._add_indexed_values(H, rows, j_col, -inv_r, mask)
-            mask = kind_masks[MEAS_TYPE_P_TO]
-            self._add_indexed_values(H, rows, i_col, -vj * inv_r, mask)
-            self._add_indexed_values(H, rows, j_col, (-vi + 2.0 * vj) * inv_r, mask)
-            mask = kind_masks[MEAS_TYPE_V_TO]
-            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[MEAS_TYPE_I_TO]
-            self._add_indexed_values(H, rows, i_col, -inv_r, mask)
-            self._add_indexed_values(H, rows, j_col, inv_r, mask)
+        l_entries = slices.get("load")
+        if l_entries:
+            entry = l_entries.get(MEAS_TYPE_P_LOAD)
+            if entry is not None:
+                k_rows, pos, col, _, pv1, pv2, _ = entry
+                self._add_indexed_values(H, k_rows, col, pv1 + 2.0 * pv2 * voltage[pos])
+            entry = l_entries.get(MEAS_TYPE_V_LOAD)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[2], entry[6])
+            entry = l_entries.get(MEAS_TYPE_I_LOAD)
+            if entry is not None:
+                k_rows, pos, col, pv0, _, pv2, _ = entry
+                v = voltage[pos]
+                self._add_indexed_values(H, k_rows, col, pv2 - pv0 / (v * v))
 
-        rows = plan["load_rows"]
-        if rows.size:
-            kind_masks = plan["load_kind_masks"]
-            pos = plan["load_pos"]
-            col = plan["load_col"]
-            v = voltage[pos]
-            self._add_indexed_values(
-                H, rows, col, plan["load_pv1"] + 2.0 * plan["load_pv2"] * v, kind_masks[MEAS_TYPE_P_LOAD]
-            )
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_LOAD])
-            self._add_indexed_values(
-                H, rows, col, plan["load_pv2"] - plan["load_pv0"] / (v * v), kind_masks[MEAS_TYPE_I_LOAD]
-            )
+        g_jac = slices.get("gen_jac")
+        if g_jac:
+            entry = g_jac.get("v_gen")
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[1], entry[2])
+            entry = g_jac.get("p_gen_v")
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[1], entry[2])
+            entry = g_jac.get("p_gen_i")
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[1], entry[2])
+            entry = g_jac.get("i_gen_v")
+            if entry is not None:
+                k_rows, pos, col, p_col, vgen_pos = entry
+                v = voltage[pos]
+                p = v_generator_power[vgen_pos]
+                self._add_indexed_values(H, k_rows, p_col, 1.0 / v)
+                self._add_indexed_values(H, k_rows, col, -p / (v * v))
+            entry = g_jac.get("i_gen_p")
+            if entry is not None:
+                k_rows, pos, col, p_set = entry
+                v = voltage[pos]
+                self._add_indexed_values(H, k_rows, col, -p_set / (v * v))
 
-        rows = plan["gen_rows"]
-        if rows.size:
-            kind_masks = plan["gen_kind_masks"]
-            ctrl_masks = plan["gen_ctrl_masks"]
-            pos = plan["gen_pos"]
-            col = plan["gen_col"]
-            v = voltage[pos]
-            p_col = plan["gen_p_col"]
-            v_ctrl = ctrl_masks[DC_CTRL_V]
-            p_ctrl = ctrl_masks[DC_CTRL_P]
-            i_ctrl = ctrl_masks[DC_CTRL_I]
-            p = np.zeros(rows.size, dtype=np.float64)
-            if v_ctrl.any():
-                p[v_ctrl] = v_generator_power[plan["gen_vgen_pos"][v_ctrl]]
-            if p_ctrl.any():
-                p[p_ctrl] = plan["gen_p_set"][p_ctrl]
-            if i_ctrl.any():
-                p[i_ctrl] = plan["gen_i_set"][i_ctrl] * v[i_ctrl]
+        s_entries = slices.get("switch")
+        if s_entries:
+            def _sw_cur(pos_k, valid_pos_k, all_valid):
+                if all_valid:
+                    return switch_current[pos_k]
+                cur = np.zeros(pos_k.size, dtype=np.float64)
+                if valid_pos_k.any():
+                    cur[valid_pos_k] = switch_current[pos_k[valid_pos_k]]
+                return cur
 
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_GEN])
-            self._add_indexed_values(
-                H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_P_GEN] & v_ctrl
-            )
-            self._add_indexed_values(H, rows, col, plan["gen_i_set"], kind_masks[MEAS_TYPE_P_GEN] & i_ctrl)
-            self._add_indexed_values(H, rows, p_col, 1.0 / v, kind_masks[MEAS_TYPE_I_GEN] & v_ctrl)
-            self._add_indexed_values(H, rows, col, -p / (v * v), kind_masks[MEAS_TYPE_I_GEN] & v_ctrl)
-            self._add_indexed_values(
-                H, rows, col, -plan["gen_p_set"] / (v * v), kind_masks[MEAS_TYPE_I_GEN] & p_ctrl
-            )
-
-        rows = plan["switch_rows"]
-        if rows.size:
-            kind_masks = plan["switch_kind_masks"]
-            i = plan["switch_i"]
-            j = plan["switch_j"]
-            i_col = plan["switch_i_col"]
-            j_col = plan["switch_j_col"]
-            col = plan["switch_col"]
-            vi = voltage[i]
-            vj = voltage[j]
-            current = np.zeros(rows.size, dtype=np.float64)
-            current_mask = plan["switch_pos"] >= 0
-            if current_mask.any():
-                current[current_mask] = switch_current[plan["switch_pos"][current_mask]]
-
-            mask = kind_masks[MEAS_TYPE_P_FROM]
-            self._add_indexed_values(H, rows, i_col, current, mask)
-            self._add_indexed_values(H, rows, col, vi, mask)
-            mask = kind_masks[MEAS_TYPE_V_FROM]
-            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[MEAS_TYPE_I_FROM]
-            self._add_indexed_values(H, rows, col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[MEAS_TYPE_P_TO]
-            self._add_indexed_values(H, rows, j_col, -current, mask)
-            self._add_indexed_values(H, rows, col, -vj, mask)
-            mask = kind_masks[MEAS_TYPE_V_TO]
-            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), mask)
-            mask = kind_masks[MEAS_TYPE_I_TO]
-            self._add_indexed_values(H, rows, col, -np.ones(rows.size, dtype=np.float64), mask)
+            entry = s_entries.get(MEAS_TYPE_P_FROM)
+            if entry is not None:
+                k_rows, si, _, ic, _, col, pos_k, valid_pos_k, all_valid, _ = entry
+                self._add_indexed_values(H, k_rows, ic, _sw_cur(pos_k, valid_pos_k, all_valid))
+                self._add_indexed_values(H, k_rows, col, voltage[si])
+            entry = s_entries.get(MEAS_TYPE_V_FROM)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[3], entry[9])
+            entry = s_entries.get(MEAS_TYPE_I_FROM)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[5], entry[9])
+            entry = s_entries.get(MEAS_TYPE_P_TO)
+            if entry is not None:
+                k_rows, _, sj, _, jc, col, pos_k, valid_pos_k, all_valid, _ = entry
+                self._add_indexed_values(H, k_rows, jc, -_sw_cur(pos_k, valid_pos_k, all_valid))
+                self._add_indexed_values(H, k_rows, col, -voltage[sj])
+            entry = s_entries.get(MEAS_TYPE_V_TO)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[4], entry[9])
+            entry = s_entries.get(MEAS_TYPE_I_TO)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[5], entry[9])
 
         rows = plan["constraint_rows"]
         if rows.size:
-            self._add_indexed_values(H, rows, plan["constraint_i_col"], np.ones(rows.size, dtype=np.float64))
-            self._add_indexed_values(H, rows, plan["constraint_j_col"], -np.ones(rows.size, dtype=np.float64))
+            c_ones, c_neg_ones = slices["constraint_ones"]
+            self._add_indexed_values(H, rows, plan["constraint_i_col"], c_ones)
+            self._add_indexed_values(H, rows, plan["constraint_j_col"], c_neg_ones)
 
-        rows = plan["dcdc_rows"]
-        if rows.size:
-            kind_masks = plan["dcdc_kind_masks"]
-            i = plan["dcdc_i"]
-            j = plan["dcdc_j"]
-            i_col = plan["dcdc_i_col"]
-            j_col = plan["dcdc_j_col"]
-            p_col = plan["dcdc_p_col"]
-            q_col = plan["dcdc_q_col"]
-            conv_pos = plan["dcdc_pos"]
-            p_from = dcdc_power[2 * conv_pos]
-            p_to = dcdc_power[2 * conv_pos + 1]
-            v_from = voltage[i]
-            v_to = voltage[j]
-
-            self._add_indexed_values(H, rows, p_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_P_FROM])
-            self._add_indexed_values(H, rows, i_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_FROM])
-            mask = kind_masks[MEAS_TYPE_I_FROM]
-            self._add_indexed_values(H, rows, p_col, 1.0 / v_from, mask)
-            self._add_indexed_values(H, rows, i_col, -p_from / (v_from * v_from), mask)
-            self._add_indexed_values(H, rows, q_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_P_TO])
-            self._add_indexed_values(H, rows, j_col, np.ones(rows.size, dtype=np.float64), kind_masks[MEAS_TYPE_V_TO])
-            mask = kind_masks[MEAS_TYPE_I_TO]
-            self._add_indexed_values(H, rows, q_col, 1.0 / v_to, mask)
-            self._add_indexed_values(H, rows, j_col, -p_to / (v_to * v_to), mask)
+        d_entries = slices.get("dcdc")
+        if d_entries:
+            entry = d_entries.get(MEAS_TYPE_P_FROM)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[5], entry[9])
+            entry = d_entries.get(MEAS_TYPE_V_FROM)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[3], entry[9])
+            entry = d_entries.get(MEAS_TYPE_I_FROM)
+            if entry is not None:
+                k_rows, di, _, ic, _, pc, _, p_idx, _, _ = entry
+                v_from = voltage[di]
+                p_from = dcdc_power[p_idx]
+                self._add_indexed_values(H, k_rows, pc, 1.0 / v_from)
+                self._add_indexed_values(H, k_rows, ic, -p_from / (v_from * v_from))
+            entry = d_entries.get(MEAS_TYPE_P_TO)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[6], entry[9])
+            entry = d_entries.get(MEAS_TYPE_V_TO)
+            if entry is not None:
+                self._add_indexed_values(H, entry[0], entry[4], entry[9])
+            entry = d_entries.get(MEAS_TYPE_I_TO)
+            if entry is not None:
+                k_rows, _, dj, _, jc, _, qc, _, q_idx, _ = entry
+                v_to = voltage[dj]
+                p_to = dcdc_power[q_idx]
+                self._add_indexed_values(H, k_rows, qc, 1.0 / v_to)
+                self._add_indexed_values(H, k_rows, jc, -p_to / (v_to * v_to))
 
         return plan["handled_mask"]
 

@@ -7475,6 +7475,23 @@ class HybridStateEstimator:
             return None, None
         return side, int(node_idx)
 
+    def voltage_measurement_node_idx(
+        self,
+        device_type_code: int,
+        device_pos: int,
+        meas_type_code: int,
+    ) -> Optional[int]:
+        """返回电压量测对应的节点编号（与 AC/DC SE 接口保持一致）。"""
+        delegate = self._delegate()
+        if delegate is not None:
+            return delegate.voltage_measurement_node_idx(device_type_code, device_pos, meas_type_code)
+        _, node_idx = self._voltage_measurement_side_node_idx_from_code(
+            device_type_code,
+            device_pos,
+            meas_type_code,
+        )
+        return node_idx
+
     def _voltage_pseudo_is_covered_by_code(
         self,
         device_type_code: int,
@@ -7542,7 +7559,7 @@ class HybridStateEstimator:
 
     def materialize_measurements(
         self,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
     ) -> MeasurementList:
         """Materialize array-backed rows for diagnostics and compatibility only."""
         source = self.active_measurements if measurements is None else measurements
@@ -8834,7 +8851,7 @@ class HybridStateEstimator:
         measurement_plan_tables=None,
         *,
         out: Optional[np.ndarray] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
     ) -> np.ndarray:
         # Keep the AC/DC legacy plan keyword and the common measurements
         # keyword interchangeable.  Rejecting both avoids silently evaluating
@@ -8877,10 +8894,10 @@ class HybridStateEstimator:
         )
         return values
 
-    def jacobian(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
+    def jacobian(self, x: np.ndarray, measurements: Optional[object] = None) -> np.ndarray:
         return self.jacobian_sparse(x, measurements).toarray()
 
-    def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None):
+    def jacobian_sparse(self, x: np.ndarray, measurements: Optional[object] = None):
         delegate = self._delegate()
         if delegate is not None:
             return delegate.jacobian_sparse(x, measurements)
@@ -9124,7 +9141,7 @@ class HybridStateEstimator:
     def observability_analysis(
         self,
         x: Optional[np.ndarray] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         H: Optional[np.ndarray] = None,
         normal_matrix: Optional[np.ndarray] = None,
         normal_factor_diag: Optional[np.ndarray] = None,
@@ -9200,7 +9217,7 @@ class HybridStateEstimator:
 
     def estimate(
         self,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
         final_diagnostics: bool = True,

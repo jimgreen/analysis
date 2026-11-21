@@ -821,9 +821,39 @@ def build_multi_energy_context_from_model(model, source=None) -> MultiEnergyCont
 
 
 def build_multi_energy_context_from_rows(rows, source=None) -> MultiEnergyContext:
+    source_path = None if source is None else Path(source)
+    if not isinstance(rows, dict) or not rows:
+        return MultiEnergyContext(source=source_path)
+
+    def _table_has_rows(table) -> bool:
+        if isinstance(table, dict):
+            return bool(table.get("rows"))
+        return bool(table)
+
+    # 快速检测：纯电网不含任何流体节点表或多能耦合表时直接短路，避免将全网电表物化为对象
+    has_fluid = any(
+        f"{prefix}Node" in rows and _table_has_rows(rows[f"{prefix}Node"])
+        for prefix in FLUID_SYSTEM_PREFIXES
+    )
+    has_coupling = any(
+        _table_has_rows(table) and _COUPLING_TABLE_RE.match(str(name)) is not None
+        for name, table in rows.items()
+    )
+    if not has_fluid and not has_coupling:
+        return MultiEnergyContext(source=source_path)
+
     effective_rows, overrides = propagate_composite_run_states(rows)
+    # 若不存在跨电耦合表，仅实例化流体表与基准表，避免无谓物化庞大的 AC/DC 电表
+    if not has_coupling:
+        filtered_rows = {
+            name: table
+            for name, table in effective_rows.items()
+            if name in ("Model", "PowerBase") or str(name).startswith(FLUID_SYSTEM_PREFIXES)
+        }
+    else:
+        filtered_rows = effective_rows
     context = build_multi_energy_context_from_model(
-        efile_factory_from_rows(effective_rows),
+        efile_factory_from_rows(filtered_rows),
         source=source,
     )
     context.warnings.extend(

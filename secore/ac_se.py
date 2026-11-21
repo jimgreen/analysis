@@ -97,6 +97,8 @@ from model.meas_type import (
     MEAS_TYPE_V_DIFF,
     MEAS_TYPE_ANGLE_DIFF,
     MEAS_TYPE_THETA_DIFF,
+    DEVICE_TYPE_NAMES,
+    MEAS_TYPE_NAMES,
 )
 from algorithm_parameters import DEFAULT_SE_PARAMETER_FILE, StateEstimationParameters, load_se_parameters
 from paths import measurement_file, model_file
@@ -754,8 +756,8 @@ class ACStateEstimator:
     def prepare(
         self,
         *,
-        network: Optional[ACPowerNetwork] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        network: Optional[object] = None,
+        measurements: Optional[object] = None,
         prepare_active_measurements: Optional[bool] = None,
         defer_prepare_finalize: Optional[bool] = None,
     ) -> "ACStateEstimator":
@@ -2561,14 +2563,11 @@ class ACStateEstimator:
             "normalized": bool(getattr(getattr(self, "measurements", None), "normalized", False)),
         }
 
-    def _attach_meas_ppc_device_pos(self) -> None:
-        meas_ppc = getattr(self, "meas_ppc", None)
-        if not isinstance(meas_ppc, dict):
-            return
+    def _measurement_name_arrays_by_type_code(self) -> Dict[int, np.ndarray]:
         self._ensure_measurement_plan_lookup_arrays()
         rows_by_code = getattr(self, "_ac_measurement_plan_rows_by_type_code", None)
         if not rows_by_code:
-            return
+            return {}
         ppc = self._ac_ppc_dict()
         name_key_by_code = {
             DEVICE_TYPE_ACNode: "bus_name",
@@ -2584,7 +2583,7 @@ class ACStateEstimator:
             DEVICE_TYPE_ACBreakConstraint: "break_name",
             DEVICE_TYPE_ACPowerBalance: "bus_name",
         }
-        name_arrays_by_code = {}
+        name_arrays_by_code: Dict[int, np.ndarray] = {}
         for code, rows in rows_by_code.items():
             name_key = name_key_by_code.get(int(code))
             if name_key is None:
@@ -2593,10 +2592,53 @@ class ACStateEstimator:
                 ppc.get(name_key, np.asarray([], dtype=object)),
                 np.asarray(rows, dtype=np.int64),
             )
+        return name_arrays_by_code
+
+    def _attach_meas_ppc_device_pos(self) -> None:
+        meas_ppc = getattr(self, "meas_ppc", None)
+        if not isinstance(meas_ppc, dict):
+            return
+        name_arrays_by_code = self._measurement_name_arrays_by_type_code()
+        if not name_arrays_by_code:
+            return
         device_pos = attach_device_pos_from_name_arrays(meas_ppc, name_arrays_by_code)
         table = getattr(getattr(self, "measurements", None), "table", None)
         if table is not None and int(getattr(table, "idx", np.asarray([])).size) == int(device_pos.size):
             table.device_pos = device_pos
+
+    def materialize_measurements(
+        self,
+        measurements: Optional[object] = None,
+    ) -> MeasurementList:
+        """将数组型量测视图物化为 MeasurementList，供诊断与兼容接口使用（与 DC/Hybrid SE 接口一致）。"""
+        source = self.active_measurements if measurements is None else measurements
+        table = getattr(source, "table", None)
+        if table is None or int(table.idx.size) != len(source):
+            return MeasurementList(list(source), normalized=getattr(source, "normalized", False))
+        codes = np.asarray(table.device_type_code, dtype=np.int16)
+        positions = self._measurement_device_pos_array(table)
+        meas_codes = np.asarray(
+            getattr(table, "meas_type_code", np.zeros(table.idx.size, dtype=np.int16)),
+            dtype=np.int16,
+        )
+        name_arrays = self._measurement_name_arrays_by_type_code()
+        status = measurement_table_status_code(table)
+        rows = []
+        for row in range(int(table.idx.size)):
+            measurement = measurement_from_table_row(table, row)
+            type_code = int(codes[row])
+            meas_code = int(meas_codes[row]) if meas_codes.size == table.idx.size else 0
+            device_pos = int(positions[row]) if positions.size == table.idx.size else -1
+            measurement.device_type = DEVICE_TYPE_NAMES.get(type_code, measurement.device_type)
+            measurement.meas_type = MEAS_TYPE_NAMES.get(meas_code, measurement.meas_type)
+            names = np.asarray(name_arrays.get(type_code, ()), dtype=object)
+            if 0 <= device_pos < names.size:
+                measurement.device_name = str(names[device_pos])
+            if not measurement.name or measurement.name.startswith("m"):
+                prefix = "pseudo" if int(status[row]) == MEAS_STATUS_PSEUDO else "measurement"
+                measurement.name = f"{prefix}_{measurement.meas_type.lower()}_{measurement.device_name}"
+            rows.append(measurement)
+        return MeasurementList(rows, table=table, normalized=getattr(source, "normalized", False))
 
     def _measurement_device_pos_array(
         self,
@@ -5797,68 +5839,116 @@ class ACStateEstimator:
         return {int(node_ids[pos]): int(degree_array[pos]) for pos in range(int(node_ids.size))}
 
     def _select_reference_positions(self) -> np.ndarray:
-        """Choose one reference solver position per live AC island using topology arrays."""
+        """Choose one reference solver position per live AC island using vectorized O(N log N) grouping."""
         node_ids = np.asarray(getattr(self, "_ac_node_ids", np.asarray([], dtype=np.int64)), dtype=np.int64)
         node_island_pos = np.asarray(getattr(self, "_ac_node_island_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
         island_alive = np.asarray(getattr(self, "_ac_island_alive_mask", np.asarray([], dtype=bool)), dtype=bool)
         island_ref_pos = np.asarray(getattr(self, "_ac_island_reference_solver_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
-        if node_ids.size == 0:
+        n_nodes = int(node_ids.size)
+        n_islands = int(island_alive.size)
+        if n_nodes == 0 or n_islands == 0:
             return np.asarray([], dtype=np.int32)
         cached_measured_by_pos = getattr(self, "_node_voltage_measurement_pos_mask_cache", None)
-        if isinstance(cached_measured_by_pos, np.ndarray) and int(cached_measured_by_pos.size) == int(node_ids.size):
+        if isinstance(cached_measured_by_pos, np.ndarray) and int(cached_measured_by_pos.size) == n_nodes:
             measured_by_pos = np.asarray(cached_measured_by_pos, dtype=bool)
         else:
             voltage_measurements = getattr(self, "node_voltage_measurements", {})
-            measured_by_pos = np.zeros(node_ids.size, dtype=bool)
+            measured_by_pos = np.zeros(n_nodes, dtype=bool)
             if voltage_measurements:
                 measured_ids = np.fromiter((int(key) for key in voltage_measurements.keys()), dtype=np.int64)
                 if measured_ids.size:
                     measured_by_pos = np.isin(node_ids, measured_ids, assume_unique=False)
         degree_array = np.asarray(getattr(self, "node_degree_array", np.asarray([], dtype=np.int32)), dtype=np.int32)
-        if degree_array.size != node_ids.size:
+        if degree_array.size != n_nodes:
             degree_array = np.asarray(
                 [self.node_degrees.get(int(node_id), 0) for node_id in node_ids],
                 dtype=np.int32,
             )
-        references = []
-        for island_pos in range(int(island_alive.size)):
-            if not bool(island_alive[island_pos]):
-                continue
-            candidates = np.flatnonzero(node_island_pos == island_pos).astype(np.int32, copy=False)
-            if candidates.size == 0:
-                continue
-            measured_mask = measured_by_pos[candidates.astype(np.intp, copy=False)]
-            measured = candidates[measured_mask]
-            if measured.size:
-                measured_pos = measured.astype(np.intp, copy=False)
-                order = np.lexsort((node_ids[measured_pos], -degree_array[measured_pos]))
-                references.append(int(measured[int(order[0])]))
-                continue
-            ref_pos = int(island_ref_pos[island_pos]) if island_pos < island_ref_pos.size else -1
-            if 0 <= ref_pos < node_ids.size:
-                references.append(ref_pos)
-                continue
-            references.append(int(candidates[np.argmin(node_ids[candidates.astype(np.intp, copy=False)])]))
-        return np.asarray(references, dtype=np.int32)
+
+        # 一次性筛选所有属于有效活动岛的节点，消除按岛循环全表扫描的 O(N_island * N_node) 开销
+        in_range = (node_island_pos >= 0) & (node_island_pos < n_islands)
+        if not np.any(in_range):
+            return np.asarray([], dtype=np.int32)
+        valid_pos = np.flatnonzero(in_range)
+        valid_isl = node_island_pos[valid_pos]
+        alive_node_mask = island_alive[valid_isl]
+        if not np.any(alive_node_mask):
+            return np.asarray([], dtype=np.int32)
+        valid_pos = valid_pos[alive_node_mask]
+        valid_isl = valid_isl[alive_node_mask]
+
+        # 统计有节点的活动岛，并为无测点回退准备每岛最小 node_id 节点
+        order_all = np.lexsort((node_ids[valid_pos], valid_isl))
+        s_isl_all = valid_isl[order_all]
+        s_pos_all = valid_pos[order_all]
+        first_all = np.empty(s_isl_all.size, dtype=bool)
+        first_all[0] = True
+        first_all[1:] = s_isl_all[1:] != s_isl_all[:-1]
+        active_islands = s_isl_all[first_all]
+        min_id_pos = s_pos_all[first_all]
+
+        # 为每个有实测电压节点的岛一次性选出（度数最大 -> 节点 ID 最小）参考节点
+        best_measured = np.full(n_islands, -1, dtype=np.int32)
+        m_mask = measured_by_pos[valid_pos]
+        if np.any(m_mask):
+            m_pos = valid_pos[m_mask]
+            m_isl = valid_isl[m_mask]
+            order_m = np.lexsort((node_ids[m_pos], -degree_array[m_pos], m_isl))
+            s_isl_m = m_isl[order_m]
+            s_pos_m = m_pos[order_m]
+            first_m = np.empty(s_isl_m.size, dtype=bool)
+            first_m[0] = True
+            first_m[1:] = s_isl_m[1:] != s_isl_m[:-1]
+            best_measured[s_isl_m[first_m]] = s_pos_m[first_m].astype(np.int32, copy=False)
+
+        # 按 island_pos 升序合并优先级：实测最优 -> 拓扑预设参考 -> 最小 node_id
+        chosen = best_measured[active_islands]
+        need_fallback = chosen < 0
+        if np.any(need_fallback):
+            fb_islands = active_islands[need_fallback]
+            fb_ref = np.where(
+                fb_islands < island_ref_pos.size,
+                island_ref_pos[np.minimum(fb_islands, max(0, island_ref_pos.size - 1))],
+                -1,
+            ) if island_ref_pos.size else np.full(fb_islands.size, -1, dtype=np.int32)
+            has_topo_ref = (fb_ref >= 0) & (fb_ref < n_nodes)
+            chosen[need_fallback] = np.where(
+                has_topo_ref,
+                fb_ref,
+                min_id_pos[need_fallback].astype(np.int32, copy=False),
+            )
+        return chosen.astype(np.int32, copy=False)
 
     def _reference_angle_offsets(self) -> Dict[int, float]:
-        """Map each node position to the original island reference angle."""
+        """Map each node position to the original island reference angle in O(N)."""
         reference_pos = np.asarray(getattr(self, "reference_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
         node_island_pos = np.asarray(getattr(self, "_ac_node_island_pos", np.asarray([], dtype=np.int32)), dtype=np.int32)
         file_theta = np.asarray(getattr(self, "file_theta", np.asarray([], dtype=np.float64)), dtype=np.float64)
-        offsets: Dict[int, float] = {}
-        for ref_pos in reference_pos:
-            ref_pos_int = int(ref_pos)
-            if ref_pos_int < 0 or ref_pos_int >= node_island_pos.size:
-                continue
-            island_pos = int(node_island_pos[ref_pos_int])
-            if island_pos < 0:
-                continue
-            offset = float(file_theta[ref_pos_int]) if ref_pos_int < file_theta.size else 0.0
-            member_pos = np.flatnonzero(node_island_pos == island_pos)
-            for pos in member_pos:
-                offsets[int(pos)] = offset
-        return offsets
+        n_nodes = int(node_island_pos.size)
+        if reference_pos.size == 0 or n_nodes == 0:
+            return {}
+        max_isl = int(node_island_pos.max())
+        if max_isl < 0:
+            return {}
+        island_has_ref = np.zeros(max_isl + 1, dtype=bool)
+        island_offset = np.zeros(max_isl + 1, dtype=np.float64)
+        for ref_pos_int in reference_pos.tolist():
+            if 0 <= ref_pos_int < n_nodes:
+                isl = int(node_island_pos[ref_pos_int])
+                if 0 <= isl <= max_isl:
+                    island_has_ref[isl] = True
+                    island_offset[isl] = float(file_theta[ref_pos_int]) if ref_pos_int < file_theta.size else 0.0
+        in_range = node_island_pos >= 0
+        valid_pos = np.flatnonzero(in_range)
+        if valid_pos.size == 0:
+            return {}
+        isl_vals = node_island_pos[valid_pos]
+        hit = island_has_ref[isl_vals]
+        if not np.any(hit):
+            return {}
+        hit_pos = valid_pos[hit]
+        hit_off = island_offset[isl_vals[hit]]
+        return dict(zip(hit_pos.tolist(), hit_off.tolist()))
 
     def _rebase_angle_measurements(self) -> None:
         """Convert absolute node angle measurements to the estimator reference frame."""
@@ -6343,27 +6433,22 @@ class ACStateEstimator:
         return Y
 
     def _prepare_y_row_cache(self) -> None:
-        """Cache sparse Y-row topology used repeatedly by generator Jacobian rows."""
-        n = int(getattr(self, "n_nodes", 0))
-        self._y_row_nodes = []
-        self._y_row_y_conj = []
+        """O(1) 缓存导纳矩阵对角共轭与稀疏数据共轭，避免为万级节点急切构造逐行切片列表。"""
         self._y_row_diag_conj = np.conj(self.Y.diagonal()).astype(np.complex128, copy=False)
-        y_indices = self.Y.indices if issparse(self.Y) else None
-        y_data_conj = np.conj(self.Y.data) if issparse(self.Y) else None
-
-        for pos in range(n):
-            if issparse(self.Y):
-                start, end = self.Y.indptr[pos], self.Y.indptr[pos + 1]
-                nodes = y_indices[start:end]
-                y_conj = y_data_conj[start:end]
-            else:
+        if issparse(self.Y):
+            self._y_data_conj = np.conj(self.Y.data).astype(np.complex128, copy=False)
+            self._y_row_nodes = None
+            self._y_row_y_conj = None
+        else:
+            n = int(getattr(self, "n_nodes", 0))
+            self._y_data_conj = None
+            self._y_row_nodes = []
+            self._y_row_y_conj = []
+            for pos in range(n):
                 row = self.Y[pos, :]
                 nodes = np.nonzero(row)[0].astype(np.int32)
-                y_values = np.asarray(row[nodes], dtype=np.complex128)
-                y_conj = np.conj(y_values)
-
-            self._y_row_nodes.append(nodes)
-            self._y_row_y_conj.append(y_conj)
+                self._y_row_nodes.append(nodes)
+                self._y_row_y_conj.append(np.conj(np.asarray(row[nodes], dtype=np.complex128)))
 
     def initial_state(self, flat: Optional[bool] = None) -> np.ndarray:
         flat = self.flat_start if flat is None else bool(flat)
@@ -7661,7 +7746,7 @@ class ACStateEstimator:
         measurement_plan_tables=None,
         *,
         out: Optional[np.ndarray] = None,
-        measurements=None,
+        measurements: Optional[object] = None,
     ) -> np.ndarray:
         # Common public keyword; retain the original plan keyword for callers
         # that already pass compiled AC measurement plans.
@@ -8578,6 +8663,39 @@ class ACStateEstimator:
                     y_nodes.astype(np.int64, copy=False),
                     np.conj(y_csr.data[start:end]).astype(np.complex128, copy=False),
                 )
+        if issparse(self.Y) and getattr(self, "_y_row_nodes", None) is None:
+            y_indptr = self.Y.indptr
+            y_indices = self.Y.indices
+            y_data_conj = getattr(self, "_y_data_conj", None)
+            if y_data_conj is None:
+                y_data_conj = np.conj(self.Y.data).astype(np.complex128, copy=False)
+                self._y_data_conj = y_data_conj
+            pos_intp = pos_array.astype(np.intp, copy=False)
+            starts = y_indptr[pos_intp]
+            ends = y_indptr[pos_intp + 1]
+            counts = (ends - starts).astype(np.int64, copy=False)
+            total = int(counts.sum())
+            if total == 0:
+                return (
+                    np.array([], dtype=np.int32),
+                    np.array([], dtype=np.int32),
+                    np.array([], dtype=np.int64),
+                    np.array([], dtype=np.complex128),
+                )
+            y_balance = np.repeat(np.arange(pos_array.size, dtype=np.int32), counts)
+            y_nodes = np.empty(total, dtype=np.int32)
+            y_conj = np.empty(total, dtype=np.complex128)
+            offset = 0
+            for s, e in zip(starts.tolist(), ends.tolist()):
+                cnt = e - s
+                if cnt <= 0:
+                    continue
+                nxt = offset + cnt
+                y_nodes[offset:nxt] = y_indices[s:e]
+                y_conj[offset:nxt] = y_data_conj[s:e]
+                offset = nxt
+            return y_balance, y_nodes, y_nodes.astype(np.int64, copy=False), y_conj
+
         counts = np.fromiter(
             (int(self._y_row_nodes[int(node_pos)].size) for node_pos in pos_array),
             dtype=np.int64,
@@ -9483,11 +9601,11 @@ class ACStateEstimator:
         )
         return H.to_csr() if sparse else H
 
-    def jacobian_sparse(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None):
+    def jacobian_sparse(self, x: np.ndarray, measurements: Optional[object] = None):
         """Assemble the WLS measurement Jacobian directly as sparse CSR triplets."""
         return self._assemble_jacobian(x, measurements, sparse=True)
 
-    def jacobian(self, x: np.ndarray, measurements: Optional[Sequence[Measurement]] = None) -> np.ndarray:
+    def jacobian(self, x: np.ndarray, measurements: Optional[object] = None) -> np.ndarray:
         """返回稠密量测雅可比矩阵（与 DC/Hybrid SE 接口保持一致）。"""
         H = self.jacobian_sparse(x, measurements)
         return H.toarray() if hasattr(H, "toarray") else np.asarray(H, dtype=np.float64)
@@ -9495,7 +9613,7 @@ class ACStateEstimator:
     def observability_analysis(
         self,
         x: Optional[np.ndarray] = None,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         H: Optional[np.ndarray] = None,
         normal_matrix: Optional[np.ndarray] = None,
         normal_factor_diag: Optional[np.ndarray] = None,
@@ -9584,7 +9702,7 @@ class ACStateEstimator:
 
     def estimate(
         self,
-        measurements: Optional[Sequence[Measurement]] = None,
+        measurements: Optional[object] = None,
         x0: Optional[np.ndarray] = None,
         verbose: bool = False,
         final_diagnostics: bool = True,

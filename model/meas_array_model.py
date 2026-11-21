@@ -262,48 +262,79 @@ def attach_device_pos_from_name_arrays(
     device_name_id = np.asarray(device_name_id, dtype=np.int64)
     device_names = np.asarray(device_names, dtype=object)
     device_name_id_by_name = ppc.get("device_name_id_by_name")
+    lookup_size = int(device_names.size)
+    shared_lookup: Optional[np.ndarray] = None
+    get_name_id = device_name_id_by_name.get if isinstance(device_name_id_by_name, dict) else None
     for code, plan_names in name_arrays_by_type_code.items():
         rows = rows_by_code.get(int(code))
         if rows is None:
             continue
         rows = np.asarray(rows, dtype=np.int64)
-        rows = rows[(rows >= 0) & (rows < row_count)]
         if rows.size == 0:
             continue
-        unresolved = device_pos[rows.astype(np.intp, copy=False)] < 0
+        if int(rows.min()) < 0 or int(rows.max()) >= row_count:
+            rows = rows[(rows >= 0) & (rows < row_count)]
+            if rows.size == 0:
+                continue
+        rows_idx = rows.astype(np.intp, copy=False)
+        unresolved = device_pos[rows_idx] < 0
         if not np.any(unresolved):
             continue
-        rows = rows[unresolved]
-        if isinstance(device_name_id_by_name, dict):
-            # 优先使用 list 视图直接查字典，避免 np.asarray(..., dtype=object) 拷贝和逐元素拆箱
+        if not np.all(unresolved):
+            rows = rows[unresolved]
+            rows_idx = rows.astype(np.intp, copy=False)
+        if get_name_id is not None:
+            # 优先使用只读列表视图，避免拷贝和逐元素拆箱
             if isinstance(plan_names, (list, tuple)):
                 name_list = plan_names
+            elif hasattr(plan_names, "raw_str_list"):
+                raw_list = plan_names.raw_str_list()
+                name_list = raw_list if raw_list is not None else plan_names.tolist()
             elif hasattr(plan_names, "tolist"):
                 name_list = plan_names.tolist()
             else:
                 name_list = list(plan_names)
             if not name_list:
                 continue
-            ids = device_name_id[rows.astype(np.intp, copy=False)]
-            valid_ids = (ids >= 0) & (ids < device_names.size)
-            if not np.any(valid_ids):
-                continue
-            lookup_size = int(device_names.size)
-            lookup = [-1] * lookup_size
-            get_name_id = device_name_id_by_name.get
+            ids = device_name_id[rows_idx]
+            all_ids_valid = int(ids.min()) >= 0 and int(ids.max()) < lookup_size
+            if all_ids_valid:
+                query_ids = ids.astype(np.intp, copy=False)
+            else:
+                valid_ids = (ids >= 0) & (ids < lookup_size)
+                if not np.any(valid_ids):
+                    continue
+                valid_row_pos = np.flatnonzero(valid_ids)
+                query_ids = ids[valid_ids].astype(np.intp, copy=False)
+            if shared_lookup is None:
+                shared_lookup = np.full(lookup_size, -1, dtype=np.int64)
+            touched_ids = []
+            touched_pos = []
+            append_id = touched_ids.append
+            append_pos = touched_pos.append
             for pos, name in enumerate(name_list):
                 name_id = get_name_id(name)
                 if name_id is None and not isinstance(name, str):
                     name_id = get_name_id(str(name))
                 if name_id is not None and 0 <= name_id < lookup_size:
-                    lookup[name_id] = pos
-            lookup_arr = np.asarray(lookup, dtype=np.int64)
-            valid_row_pos = np.flatnonzero(valid_ids)
-            target_pos = lookup_arr[ids[valid_ids].astype(np.intp, copy=False)]
+                    append_id(name_id)
+                    append_pos(pos)
+            if not touched_ids:
+                continue
+            touched_ids_arr = np.asarray(touched_ids, dtype=np.intp)
+            shared_lookup[touched_ids_arr] = np.asarray(touched_pos, dtype=np.int64)
+            target_pos = shared_lookup[query_ids]
+            shared_lookup[touched_ids_arr] = -1
             matched = target_pos >= 0
             if np.any(matched):
-                target_rows = rows[valid_row_pos[matched]].astype(np.intp, copy=False)
-                device_pos[target_rows] = target_pos[matched]
+                if all_ids_valid:
+                    if np.all(matched):
+                        device_pos[rows_idx] = target_pos
+                    else:
+                        device_pos[rows_idx[matched]] = target_pos[matched]
+                else:
+                    target_rows = rows[valid_row_pos[matched]].astype(np.intp, copy=False)
+                    device_pos[target_rows] = target_pos[matched]
             continue
         names = np.asarray(plan_names, dtype=object)
         if names.size == 0:

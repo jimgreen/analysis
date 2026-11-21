@@ -41,6 +41,7 @@ except Exception:
 
 ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
 _NORMAL_EQUATION_PATTERN_CACHE = {}
+_NORMAL_EQUATION_PATTERN_IDENTITY_CACHE = []
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
 _SPARSE_PATTERN_LINEAR_INDEX_CACHE = {}
 _SPARSE_CSR_ROW_INDEX_CACHE = {}
@@ -189,11 +190,16 @@ class SparseJacobianBuilder:
         self._data_only_direct_active = False
         self._data_only_direct_initialized = False
         self._data_only_chunk_cursor = 0
+        self._recorded_add_many_specs: List[Tuple[object, object, int, Optional[np.ndarray]]] = []
+        self._cached_add_many_specs: Optional[List[Tuple[object, object, int, Optional[np.ndarray]]]] = None
+        self._add_many_call_cursor = 0
+        self._add_many_fast_path_ok = False
         self.reset()
 
     def _set_cached_slot_positions(self, slot: np.ndarray) -> None:
         self._cached_slot_positions = slot
         self._cached_chunk_slices = self._current_chunk_slices()
+        self._cached_add_many_specs = list(self._recorded_add_many_specs) if self._recorded_add_many_specs else None
         self._cached_chunk_slot_plans = []
         self._cached_direct_chunk_slots = []
         if slot.size == 0:
@@ -269,12 +275,17 @@ class SparseJacobianBuilder:
         self._col_chunks = []
         self._data_chunks = []
         self._data_only_chunk_cursor = 0
+        self._recorded_add_many_specs = []
+        self._add_many_call_cursor = 0
         self._data_only_refresh_active = bool(
             self._data_only_refresh_enabled
             and self._assume_fixed_pattern
             and self._cached_pattern_indptr is not None
             and self._cached_pattern_indices is not None
             and self._cached_chunk_slices is not None
+        )
+        self._add_many_fast_path_ok = bool(
+            self._data_only_refresh_active and self._cached_add_many_specs is not None
         )
         first_chunk_starts_after_scalars = (
             self._cached_chunk_slices is not None
@@ -560,6 +571,28 @@ class SparseJacobianBuilder:
             self.data.append(float(value))
 
     def add_many(self, rows: np.ndarray, cols: np.ndarray, values: np.ndarray, mask: np.ndarray = None) -> None:
+        # 固定稀疏模式刷新快路径：若 cols 与 mask 对象身份与录制期一致，直接跳过类型转换与 cols>=0/mask 过滤
+        if self._add_many_fast_path_ok:
+            specs = self._cached_add_many_specs
+            cursor = self._add_many_call_cursor
+            if specs is not None and cursor < len(specs):
+                rec_cols, rec_mask, kind, rec_idx = specs[cursor]
+                self._add_many_call_cursor = cursor + 1
+                if cols is rec_cols and mask is rec_mask:
+                    if kind == 0:
+                        return
+                    if kind == 1:
+                        if self._append_data_only_chunk(values):
+                            return
+                    elif kind == 2 and rec_idx is not None:
+                        val_arr = _as_array_dtype(values, np.float64)
+                        if self._append_data_only_chunk(val_arr[rec_idx]):
+                            return
+            else:
+                self._add_many_fast_path_ok = False
+
+        raw_cols = cols
+        raw_mask = mask
         rows = _as_array_dtype(rows, np.int32)
         cols = _as_array_dtype(cols, np.int32)
         values = _as_array_dtype(values, np.float64)
@@ -571,11 +604,23 @@ class SparseJacobianBuilder:
             mask = np.asarray(mask, dtype=bool) & (cols >= 0)
         if mask.any():
             if mask.all():
+                if not self._data_only_refresh_active:
+                    self._recorded_add_many_specs.append((raw_cols, raw_mask, 1, None))
                 if self._append_data_only_chunk(values):
                     return
                 self._row_chunks.append(rows)
                 self._col_chunks.append(cols)
                 self._data_chunks.append(values)
+                return
+            if not self._data_only_refresh_active:
+                rec_idx = np.flatnonzero(mask).astype(np.intp, copy=False)
+                self._recorded_add_many_specs.append((raw_cols, raw_mask, 2, rec_idx))
+                masked_values = values[rec_idx].astype(np.float64, copy=False)
+                if self._append_data_only_chunk(masked_values):
+                    return
+                self._row_chunks.append(rows[rec_idx].astype(np.int32, copy=False))
+                self._col_chunks.append(cols[rec_idx].astype(np.int32, copy=False))
+                self._data_chunks.append(masked_values)
                 return
             masked_values = values[mask].astype(np.float64, copy=False)
             if self._append_data_only_chunk(masked_values):
@@ -583,6 +628,8 @@ class SparseJacobianBuilder:
             self._row_chunks.append(rows[mask].astype(np.int32, copy=False))
             self._col_chunks.append(cols[mask].astype(np.int32, copy=False))
             self._data_chunks.append(masked_values)
+        elif not self._data_only_refresh_active:
+            self._recorded_add_many_specs.append((raw_cols, raw_mask, 0, None))
 
     def to_csr(self):
         if self._assume_fixed_pattern and self._cached_slot_positions is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
@@ -729,7 +776,25 @@ def _normal_equation_structural_pattern(H, triangular: Optional[str] = None):
     triangular_mode = None if triangular is None else str(triangular).lower()
     if triangular_mode not in (None, "lower"):
         raise ValueError(f"Unsupported normal-equation triangular mode: {triangular!r}")
-    H_csc = H if getattr(H, "format", None) == "csc" else H.tocsc()
+    # 若 H 的稀疏结构数组对象身份未变（如固定模式刷新），跳过 tocsc() 与 blake2b 哈希
+    h_fmt = getattr(H, "format", None)
+    h_indptr = getattr(H, "indptr", None) if h_fmt in ("csr", "csc") else None
+    h_indices = getattr(H, "indices", None) if h_fmt in ("csr", "csc") else None
+    h_shape = H.shape
+    h_nnz = int(H.nnz)
+    if h_indptr is not None and h_indices is not None:
+        for c_fmt, c_shape, c_nnz, c_tri, c_indptr, c_indices, c_pattern in _NORMAL_EQUATION_PATTERN_IDENTITY_CACHE:
+            if (
+                c_fmt == h_fmt
+                and c_shape == h_shape
+                and c_nnz == h_nnz
+                and c_tri == triangular_mode
+                and c_indptr is h_indptr
+                and c_indices is h_indices
+            ):
+                return c_pattern
+
+    H_csc = H if h_fmt == "csc" else H.tocsc()
     digest = hashlib.blake2b(
         H_csc.indptr.tobytes() + H_csc.indices.tobytes(),
         digest_size=16,
@@ -737,6 +802,12 @@ def _normal_equation_structural_pattern(H, triangular: Optional[str] = None):
     key = (H_csc.shape, int(H_csc.nnz), digest, triangular_mode)
     cached = _NORMAL_EQUATION_PATTERN_CACHE.get(key)
     if cached is not None:
+        if h_indptr is not None and h_indices is not None:
+            if len(_NORMAL_EQUATION_PATTERN_IDENTITY_CACHE) >= 8:
+                _NORMAL_EQUATION_PATTERN_IDENTITY_CACHE.pop(0)
+            _NORMAL_EQUATION_PATTERN_IDENTITY_CACHE.append(
+                (h_fmt, h_shape, h_nnz, triangular_mode, h_indptr, h_indices, cached)
+            )
         return cached
     H_pattern = H_csc.copy()
     H_pattern.data = np.ones(int(H_pattern.nnz), dtype=np.float64)
@@ -747,6 +818,12 @@ def _normal_equation_structural_pattern(H, triangular: Optional[str] = None):
     if len(_NORMAL_EQUATION_PATTERN_CACHE) > 16:
         _NORMAL_EQUATION_PATTERN_CACHE.clear()
     _NORMAL_EQUATION_PATTERN_CACHE[key] = pattern
+    if h_indptr is not None and h_indices is not None:
+        if len(_NORMAL_EQUATION_PATTERN_IDENTITY_CACHE) >= 8:
+            _NORMAL_EQUATION_PATTERN_IDENTITY_CACHE.pop(0)
+        _NORMAL_EQUATION_PATTERN_IDENTITY_CACHE.append(
+            (h_fmt, h_shape, h_nnz, triangular_mode, h_indptr, h_indices, pattern)
+        )
     return pattern
 
 
