@@ -1,3 +1,5 @@
+import mmap
+import struct
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -14,14 +16,25 @@ for path in (MODEL_DIR, ROOT_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from topology import build_ac_topology_input_ppc
+from topology import (
+    GridTopologyInput,
+    SingleDeviceTopologyInput,
+    TerminalDeviceTopologyInput,
+    _EMPTY_BOOL,
+    _EMPTY_INT,
+    _map_node_positions,
+    build_ac_topology_input_ppc,
+)
 from model.effective_state import propagate_composite_run_states
 from model.setpoint_validation import (
+    MAX_VOLTAGE_SETPOINT,
+    MIN_VOLTAGE_SETPOINT,
     append_setpoint_corrections,
     sanitize_fixed_setpoints,
 )
 from model.switching_status import switching_status_columns
 from model.array_common import (
+    LazyNameArray,
     _assign_current_if_present,
     _assign_power_if_present,
     _base_from_rows,
@@ -1531,159 +1544,415 @@ def build_matpower_ppc_from_ac_ppc(ac_ppc: Dict) -> Dict[str, Any]:
     return {"version": "2", "baseMVA": base_mva, "bus": bus, "gen": gen, "branch": branch}
 
 
-def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict:
-    """Read a MATPOWER/PYPOWER ``.mat`` case and build this project's AC ppc.
+_MAT_V5_MI_INT8 = 1
+_MAT_V5_MI_UINT8 = 2
+_MAT_V5_MI_INT16 = 3
+_MAT_V5_MI_UINT16 = 4
+_MAT_V5_MI_INT32 = 5
+_MAT_V5_MI_UINT32 = 6
+_MAT_V5_MI_SINGLE = 7
+_MAT_V5_MI_DOUBLE = 9
+_MAT_V5_MI_INT64 = 12
+_MAT_V5_MI_UINT64 = 13
+_MAT_V5_MI_MATRIX = 14
+_MAT_V5_MI_COMPRESSED = 15
 
-    The input must provide ``baseMVA``, ``bus``, ``gen`` and ``branch`` either
-    inside a MATLAB struct named by ``variable_name`` or as top-level MAT
-    variables. Text MATPOWER ``.m`` files using ``mpc.*`` assignments are also
-    accepted. Bus loads and shunts are converted into ACLoad/ACShunt rows.
-    MATPOWER branches with tap or phase shift are converted into ACTransformer
-    rows; ordinary branches stay in the ACBranch table.
-    """
+_MAT_V5_MX_STRUCT_CLASS = 2
+_MAT_V5_NUMERIC_MX_CLASSES = frozenset((6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+_MAT_V5_REQUIRED_FIELDS = frozenset(("baseMVA", "bus", "gen", "branch"))
+_MAT_V5_DTYPE_BY_MI = {
+    _MAT_V5_MI_INT8: np.dtype("<i1"),
+    _MAT_V5_MI_UINT8: np.dtype("<u1"),
+    _MAT_V5_MI_INT16: np.dtype("<i2"),
+    _MAT_V5_MI_UINT16: np.dtype("<u2"),
+    _MAT_V5_MI_INT32: np.dtype("<i4"),
+    _MAT_V5_MI_UINT32: np.dtype("<u4"),
+    _MAT_V5_MI_SINGLE: np.dtype("<f4"),
+    _MAT_V5_MI_DOUBLE: np.dtype("<f8"),
+    _MAT_V5_MI_INT64: np.dtype("<i8"),
+    _MAT_V5_MI_UINT64: np.dtype("<u8"),
+}
+_EMPTY_OBJ_ARRAY = np.asarray([], dtype=object)
+_EMPTY_OBJ_ARRAY.setflags(write=False)
 
-    path = Path(file_path).resolve()
-    mpc = (
-        _load_matpower_case_from_m_file(path, variable_name=variable_name)
-        if path.suffix.lower() == ".m"
-        else _load_matpower_case_from_mat_file(path, variable_name=variable_name)
-    )
+
+def _read_mat_v5_tag(buf, pos: int, limit: int):
+    """解析 MATLAB Level-5 数据元素标签，返回 (dtype_code, nbytes, data_start, next_pos)。"""
+    if pos + 8 > limit:
+        return None
+    word0, word1 = struct.unpack_from("<II", buf, pos)
+    upper = word0 >> 16
+    if upper != 0:
+        # 小数据元素（Small Data Element）格式
+        dtype_code = word0 & 0xFFFF
+        nbytes = upper
+        if nbytes > 4:
+            return None
+        return dtype_code, nbytes, pos + 4, pos + 8
+    dtype_code = word0
+    nbytes = word1
+    data_start = pos + 8
+    next_pos = data_start + ((nbytes + 7) & ~7)
+    if data_start + nbytes > limit or next_pos > limit:
+        return None
+    return dtype_code, nbytes, data_start, next_pos
+
+
+def _parse_mat_v5_matrix(buf, data_start: int, data_end: int):
+    """解析未压缩小端 Level-5 miMATRIX，仅处理标量/实数值矩阵与 1x1 MATPOWER 结构体。"""
+    tag = _read_mat_v5_tag(buf, data_start, data_end)
+    if tag is None:
+        return None
+    dt, nb, ds, pos = tag
+    if dt != _MAT_V5_MI_UINT32 or nb < 8:
+        return None
+    flags0 = struct.unpack_from("<I", buf, ds)[0]
+    mx_class = flags0 & 0xFF
+    if flags0 & 0x0800:  # 复数矩阵回退 scipy.io.loadmat
+        return None
+
+    tag = _read_mat_v5_tag(buf, pos, data_end)
+    if tag is None:
+        return None
+    dt, nb, ds, pos = tag
+    if dt != _MAT_V5_MI_INT32 or nb == 0 or (nb & 3) != 0:
+        return None
+    dims = struct.unpack_from(f"<{nb // 4}i", buf, ds)
+    if any(d < 0 for d in dims):
+        return None
+
+    tag = _read_mat_v5_tag(buf, pos, data_end)
+    if tag is None:
+        return None
+    dt, nb, ds, pos = tag
+    if dt not in (_MAT_V5_MI_INT8, _MAT_V5_MI_UINT8):
+        return None
+    name = bytes(buf[ds : ds + nb]).decode("ascii", errors="ignore")
+
+    if mx_class in _MAT_V5_NUMERIC_MX_CLASSES:
+        tag = _read_mat_v5_tag(buf, pos, data_end)
+        if tag is None:
+            return None
+        dt, nb, ds, _ = tag
+        np_dt = _MAT_V5_DTYPE_BY_MI.get(dt)
+        if np_dt is None:
+            return None
+        count = 1
+        for dim in dims:
+            count *= dim
+        if nb < count * np_dt.itemsize:
+            return None
+        arr = np.frombuffer(buf, dtype=np_dt, count=count, offset=ds).reshape(dims, order="F")
+        return name, arr
+
+    if mx_class == _MAT_V5_MX_STRUCT_CLASS:
+        if any(dim != 1 for dim in dims):
+            return None
+        tag = _read_mat_v5_tag(buf, pos, data_end)
+        if tag is None:
+            return None
+        dt, nb, ds, pos = tag
+        if dt != _MAT_V5_MI_INT32 or nb != 4:
+            return None
+        field_name_len = struct.unpack_from("<i", buf, ds)[0]
+        if field_name_len <= 0:
+            return None
+
+        tag = _read_mat_v5_tag(buf, pos, data_end)
+        if tag is None:
+            return None
+        dt, nb, ds, pos = tag
+        if dt not in (_MAT_V5_MI_INT8, _MAT_V5_MI_UINT8) or (nb % field_name_len) != 0:
+            return None
+        n_fields = nb // field_name_len
+        field_names = [
+            bytes(buf[ds + i * field_name_len : ds + (i + 1) * field_name_len])
+            .split(b"\x00", 1)[0]
+            .decode("ascii", errors="ignore")
+            for i in range(n_fields)
+        ]
+
+        result: Dict[str, Any] = {}
+        for fname in field_names:
+            ftag = _read_mat_v5_tag(buf, pos, data_end)
+            if ftag is None:
+                return None
+            fdt, fnb, fds, pos = ftag
+            if fname not in _MAT_V5_REQUIRED_FIELDS:
+                continue
+            if fdt != _MAT_V5_MI_MATRIX:
+                return None
+            parsed = _parse_mat_v5_matrix(buf, fds, fds + fnb)
+            if parsed is None or not isinstance(parsed[1], np.ndarray):
+                return None
+            result[fname] = parsed[1]
+        return name, result
+
+    # 无关顶层变量（如字符串 version 等）标记跳过
+    return name, None
+
+
+def _make_node_lookup_and_unique(bus_ids_32: np.ndarray) -> Tuple[Any, bool]:
+    """一次构建拓扑节点位置查找表，同时检测母线 ID 是否严格唯一。"""
+    n_bus = int(bus_ids_32.size)
+    if n_bus == 0:
+        return np.array([], dtype=np.int32), True
+    min_id = int(bus_ids_32.min())
+    max_id = int(bus_ids_32.max())
+    if min_id >= 0 and max_id <= max(1024, n_bus * 4):
+        lookup = np.full(max_id + 1, -1, dtype=np.int32)
+        lookup[bus_ids_32] = np.arange(n_bus, dtype=np.int32)
+        is_unique = int(np.count_nonzero(lookup >= 0)) == n_bus
+        return lookup, is_unique
+    mapping = {int(node_id): pos for pos, node_id in enumerate(bus_ids_32.tolist())}
+    return mapping, len(mapping) == n_bus
+
+
+def _assemble_ac_ppc_from_matpower_dict(mpc: Dict[str, Any], source_str: str) -> Dict:
+    """将 MATPOWER/PYPOWER 字典向量化组装为本项目 AC PPC（列主序分配并融合拓扑输入）。"""
     base_mva = _matpower_scalar(mpc.get("baseMVA"), 1.0)
     bus_mp = _matpower_matrix(mpc.get("bus"), 13, required=True)
     gen_mp = _matpower_matrix(mpc.get("gen"), 10)
     branch_mp = _matpower_matrix(mpc.get("branch"), 13)
 
-    bus = np.zeros((bus_mp.shape[0], len(BUS_COLS)), dtype=np.float64)
-    if bus_mp.size:
-        bus[:, BUS_COLS["idx"]] = bus_mp[:, MP_BUS_I].astype(np.int64)
+    # 1. 母线表（列主序分配：利用 OS 虚拟零页并使所有按列读写完全连续）
+    n_bus = bus_mp.shape[0]
+    bus = np.zeros((n_bus, len(BUS_COLS)), dtype=np.float64, order="F")
+    if n_bus:
+        bus_ids = bus_mp[:, MP_BUS_I].astype(np.int64)
+        bus_ids_32 = bus_ids.astype(np.int32)
+        bus_types = bus_mp[:, MP_BUS_TYPE].astype(np.int8)
+        bus_active = bus_types != MP_NONE
+        bus[:, BUS_COLS["idx"]] = bus_ids
         bus[:, BUS_COLS["vbase"]] = bus_mp[:, MP_BASE_KV]
         bus[:, BUS_COLS["voltage"]] = bus_mp[:, MP_VM]
-        bus[:, BUS_COLS["angle"]] = np.deg2rad(bus_mp[:, MP_VA])
-        bus[:, BUS_COLS["isl"]] = 0.0
-        bus[:, BUS_COLS["run_stat"]] = (bus_mp[:, MP_BUS_TYPE].astype(np.int64) != MP_NONE).astype(np.float64)
-    bus_names = np.asarray([f"bus_{int(idx)}" for idx in bus[:, BUS_COLS["idx"]]], dtype=object)
+        np.deg2rad(bus_mp[:, MP_VA], out=bus[:, BUS_COLS["angle"]])
+        bus[:, BUS_COLS["run_stat"]] = bus_active
+    else:
+        bus_ids = np.empty(0, dtype=np.int64)
+        bus_ids_32 = _EMPTY_INT
+        bus_types = np.empty(0, dtype=np.int8)
+        bus_active = _EMPTY_BOOL
+    bus_names = LazyNameArray(None, bus_ids, "bus")
 
-    load_rows = []
-    for pos, row in enumerate(bus_mp):
-        if int(row[MP_BUS_TYPE]) == MP_NONE:
-            continue
-        pd = float(row[MP_PD])
-        qd = float(row[MP_QD])
-        if abs(pd) <= 1e-12 and abs(qd) <= 1e-12:
-            continue
-        out = np.zeros(len(LOAD_COLS), dtype=np.float64)
-        out[LOAD_COLS["idx"]] = len(load_rows) + 1
-        out[LOAD_COLS["node"]] = bus[pos, BUS_COLS["idx"]]
-        out[LOAD_COLS["pbase"]] = pd / base_mva
-        out[LOAD_COLS["pv0"]] = 1.0
-        out[LOAD_COLS["qbase"]] = qd / base_mva
-        out[LOAD_COLS["qv0"]] = 1.0
-        out[LOAD_COLS["run_stat"]] = 1.0
-        load_rows.append(out)
-    load = np.vstack(load_rows) if load_rows else _empty(len(LOAD_COLS))
-    load_names = np.asarray([f"load_{int(row[LOAD_COLS['idx']])}" for row in load], dtype=object)
+    # 一次构建 node_lookup 并同时供发电机控制类型与 GridTopologyInput 共用
+    node_lookup, bus_ids_unique = _make_node_lookup_and_unique(bus_ids_32)
 
-    shunt_rows = []
-    for pos, row in enumerate(bus_mp):
-        if int(row[MP_BUS_TYPE]) == MP_NONE:
-            continue
-        gs = float(row[MP_GS])
-        bs = float(row[MP_BS])
-        if abs(gs) <= 1e-12 and abs(bs) <= 1e-12:
-            continue
-        out = np.zeros(len(SHUNT_COLS), dtype=np.float64)
-        out[SHUNT_COLS["idx"]] = len(shunt_rows) + 1
-        out[SHUNT_COLS["node"]] = bus[pos, BUS_COLS["idx"]]
-        out[SHUNT_COLS["control_type"]] = SHUNT_B
-        out[SHUNT_COLS["g_set"]] = gs / base_mva
-        out[SHUNT_COLS["b_set"]] = bs / base_mva
-        out[SHUNT_COLS["run_stat"]] = 1.0
-        shunt_rows.append(out)
+    # 2. 负荷表（跳过停运母线及零负荷母线）
+    if n_bus:
+        pd_col = bus_mp[:, MP_PD]
+        qd_col = bus_mp[:, MP_QD]
+        load_pos = np.flatnonzero(bus_active & ((np.abs(pd_col) > 1e-12) | (np.abs(qd_col) > 1e-12)))
+        n_load = int(load_pos.size)
+    else:
+        load_pos = _EMPTY_INT
+        n_load = 0
+    if n_load:
+        load_idx = np.arange(1, n_load + 1, dtype=np.int64)
+        load = np.zeros((n_load, len(LOAD_COLS)), dtype=np.float64, order="F")
+        load_nodes = bus_ids[load_pos]
+        load[:, LOAD_COLS["idx"]] = load_idx
+        load[:, LOAD_COLS["node"]] = load_nodes
+        np.divide(pd_col[load_pos], base_mva, out=load[:, LOAD_COLS["pbase"]])
+        load[:, LOAD_COLS["pv0"]] = 1.0
+        np.divide(qd_col[load_pos], base_mva, out=load[:, LOAD_COLS["qbase"]])
+        load[:, LOAD_COLS["qv0"]] = 1.0
+        load[:, LOAD_COLS["run_stat"]] = 1.0
+    else:
+        load_idx = np.empty(0, dtype=np.int64)
+        load = _empty(len(LOAD_COLS))
+        load_nodes = np.empty(0, dtype=np.int64)
+    load_names = LazyNameArray(None, load_idx, "load")
 
-    bus_type_by_idx = {int(row[MP_BUS_I]): int(row[MP_BUS_TYPE]) for row in bus_mp}
-    gen = np.zeros((gen_mp.shape[0], len(GEN_COLS)), dtype=np.float64)
-    for row_idx, row in enumerate(gen_mp):
-        gen[row_idx, GEN_COLS["idx"]] = row_idx + 1
-        gen[row_idx, GEN_COLS["node"]] = row[MP_GEN_BUS]
-        bus_type = bus_type_by_idx.get(int(row[MP_GEN_BUS]), MP_PQ)
-        if bus_type == MP_REF:
-            control = CTRL_SLACK
-        elif bus_type == MP_PV:
-            control = CTRL_PV
+    # 3. 母线并联索引（稍后与变压器末端充电电纳并联合并分配）
+    if n_bus:
+        gs_col = bus_mp[:, MP_GS]
+        bs_col = bus_mp[:, MP_BS]
+        bus_shunt_pos = np.flatnonzero(
+            bus_active & ((np.abs(gs_col) > 1e-12) | (np.abs(bs_col) > 1e-12))
+        )
+        n_bus_shunt = int(bus_shunt_pos.size)
+    else:
+        bus_shunt_pos = _EMPTY_INT
+        n_bus_shunt = 0
+
+    # 4. 发电机表（复用 node_lookup 查母线类型并同步产出 gen_node_pos）
+    n_gen = gen_mp.shape[0]
+    if n_gen:
+        gen = np.zeros((n_gen, len(GEN_COLS)), dtype=np.float64, order="F")
+        gen_idx = np.arange(1, n_gen + 1, dtype=np.int64)
+        gen_bus_raw = gen_mp[:, MP_GEN_BUS]
+        if n_bus:
+            gen_node_pos = _map_node_positions(gen_bus_raw, node_lookup)
+            valid_g = gen_node_pos >= 0
+            if valid_g.all():
+                gen_bus_types = bus_types[gen_node_pos]
+            else:
+                gen_bus_types = np.full(n_gen, MP_PQ, dtype=np.int8)
+                if valid_g.any():
+                    gen_bus_types[valid_g] = bus_types[gen_node_pos[valid_g]]
         else:
-            control = CTRL_PQ
-        gen[row_idx, GEN_COLS["control_type"]] = control
-        gen[row_idx, GEN_COLS["p_set"]] = row[MP_PG] / base_mva
-        gen[row_idx, GEN_COLS["q_set"]] = row[MP_QG] / base_mva
-        gen[row_idx, GEN_COLS["v_set"]] = row[MP_VG] if abs(row[MP_VG]) > 1e-12 else 1.0
-        gen[row_idx, GEN_COLS["alpha"]] = 1.0
-        gen[row_idx, GEN_COLS["run_stat"]] = row[MP_GEN_STATUS] if gen_mp.shape[1] > MP_GEN_STATUS else 1.0
-        gen[row_idx, GEN_COLS["p"]] = row[MP_PG] / base_mva
-        gen[row_idx, GEN_COLS["q"]] = row[MP_QG] / base_mva
-        gen[row_idx, GEN_COLS["p_max"]] = row[MP_PMAX] / base_mva if gen_mp.shape[1] > MP_PMAX else np.nan
+            gen_node_pos = np.full(n_gen, -1, dtype=np.int32)
+            gen_bus_types = np.full(n_gen, MP_PQ, dtype=np.int8)
+
+        gen_ctrl = gen[:, GEN_COLS["control_type"]]
+        gen_ctrl.fill(CTRL_PQ)
+        gen_ctrl[gen_bus_types == MP_PV] = CTRL_PV
+        gen_ctrl[gen_bus_types == MP_REF] = CTRL_SLACK
+
+        p_pu = gen[:, GEN_COLS["p_set"]]
+        q_pu = gen[:, GEN_COLS["q_set"]]
+        np.divide(gen_mp[:, MP_PG], base_mva, out=p_pu)
+        np.divide(gen_mp[:, MP_QG], base_mva, out=q_pu)
+        vg_col = gen_mp[:, MP_VG]
+
+        gen[:, GEN_COLS["idx"]] = gen_idx
+        gen[:, GEN_COLS["node"]] = gen_bus_raw
+        gen[:, GEN_COLS["v_set"]] = np.where(np.abs(vg_col) > 1e-12, vg_col, 1.0)
+        gen[:, GEN_COLS["alpha"]] = 1.0
+        if gen_mp.shape[1] > MP_GEN_STATUS:
+            gen[:, GEN_COLS["run_stat"]] = gen_mp[:, MP_GEN_STATUS]
+        else:
+            gen[:, GEN_COLS["run_stat"]] = 1.0
+        gen[:, GEN_COLS["p"]] = p_pu
+        gen[:, GEN_COLS["q"]] = q_pu
+        if gen_mp.shape[1] > MP_PMAX:
+            np.divide(gen_mp[:, MP_PMAX], base_mva, out=gen[:, GEN_COLS["p_max"]])
+        else:
+            gen[:, GEN_COLS["p_max"]] = np.nan
+    else:
+        gen = _empty(len(GEN_COLS))
+        gen_idx = np.empty(0, dtype=np.int64)
+        gen_node_pos = _EMPTY_INT
+
     gen_p_min = (
         gen_mp[:, MP_PMIN] / base_mva
         if gen_mp.shape[1] > MP_PMIN
-        else np.full(gen.shape[0], np.nan, dtype=np.float64)
+        else np.full(n_gen, np.nan, dtype=np.float64)
     )
     gen_q_min = (
         gen_mp[:, MP_QMIN] / base_mva
         if gen_mp.shape[1] > MP_QMIN
-        else np.full(gen.shape[0], np.nan, dtype=np.float64)
+        else np.full(n_gen, np.nan, dtype=np.float64)
     )
     gen_q_max = (
         gen_mp[:, MP_QMAX] / base_mva
         if gen_mp.shape[1] > MP_QMAX
-        else np.full(gen.shape[0], np.nan, dtype=np.float64)
+        else np.full(n_gen, np.nan, dtype=np.float64)
     )
-    gen_names = np.asarray([f"gen_{int(row[GEN_COLS['idx']])}" for row in gen], dtype=object)
+    gen_names = LazyNameArray(None, gen_idx, "gen")
 
-    branch_rows = []
-    transformer_rows = []
-    for row in branch_mp:
-        status = row[MP_BR_STATUS] if branch_mp.shape[1] > MP_BR_STATUS else 1.0
-        tap = row[MP_TAP] if branch_mp.shape[1] > MP_TAP and abs(row[MP_TAP]) > 1e-12 else 1.0
-        shift = row[MP_SHIFT] if branch_mp.shape[1] > MP_SHIFT else 0.0
-        charging = row[MP_BR_B] if branch_mp.shape[1] > MP_BR_B else 0.0
-        as_transformer = abs(tap - 1.0) > 1e-12 or abs(shift) > 1e-12
-        if as_transformer:
-            out = np.zeros(len(TRANSFORMER_COLS), dtype=np.float64)
-            out[TRANSFORMER_COLS["idx"]] = len(transformer_rows) + 1
-            out[TRANSFORMER_COLS["i_node"]] = row[MP_F_BUS]
-            out[TRANSFORMER_COLS["j_node"]] = row[MP_T_BUS]
-            out[TRANSFORMER_COLS["r"]] = row[MP_BR_R]
-            out[TRANSFORMER_COLS["x"]] = row[MP_BR_X]
-            out[TRANSFORMER_COLS["gt"]] = 0.0
-            out[TRANSFORMER_COLS["bt"]] = 0.5 * charging
-            out[TRANSFORMER_COLS["tap"]] = tap
-            out[TRANSFORMER_COLS["shift"]] = shift
-            out[TRANSFORMER_COLS["run_stat"]] = status
-            transformer_rows.append(out)
-            if abs(charging) > 1e-12:
-                shunt = np.zeros(len(SHUNT_COLS), dtype=np.float64)
-                shunt[SHUNT_COLS["idx"]] = len(shunt_rows) + 1
-                shunt[SHUNT_COLS["node"]] = row[MP_T_BUS]
-                shunt[SHUNT_COLS["control_type"]] = SHUNT_B
-                shunt[SHUNT_COLS["b_set"]] = 0.5 * charging
-                shunt[SHUNT_COLS["run_stat"]] = status
-                shunt_rows.append(shunt)
+    # 5. 普通线路、变压器与变压器末端充电电纳并联（先切 1D 连续列，再用 flatnonzero + take）
+    n_br = branch_mp.shape[0]
+    if n_br:
+        br_ncols = branch_mp.shape[1]
+        f_bus_col = branch_mp[:, MP_F_BUS]
+        t_bus_col = branch_mp[:, MP_T_BUS]
+        r_col = branch_mp[:, MP_BR_R]
+        x_col = branch_mp[:, MP_BR_X]
+        status_col = (
+            branch_mp[:, MP_BR_STATUS]
+            if br_ncols > MP_BR_STATUS
+            else np.ones(n_br, dtype=np.float64)
+        )
+        if br_ncols > MP_TAP:
+            raw_tap = branch_mp[:, MP_TAP]
+            tap_col = np.where(np.abs(raw_tap) > 1e-12, raw_tap, 1.0)
         else:
-            out = np.zeros(len(BRANCH_COLS), dtype=np.float64)
-            out[BRANCH_COLS["idx"]] = len(branch_rows) + 1
-            out[BRANCH_COLS["i_node"]] = row[MP_F_BUS]
-            out[BRANCH_COLS["j_node"]] = row[MP_T_BUS]
-            out[BRANCH_COLS["r"]] = row[MP_BR_R]
-            out[BRANCH_COLS["x"]] = row[MP_BR_X]
-            out[BRANCH_COLS["b"]] = charging
-            out[BRANCH_COLS["run_stat"]] = status
-            branch_rows.append(out)
-    branch = np.vstack(branch_rows) if branch_rows else _empty(len(BRANCH_COLS))
-    transformer = np.vstack(transformer_rows) if transformer_rows else _empty(len(TRANSFORMER_COLS))
-    shunt = np.vstack(shunt_rows) if shunt_rows else _empty(len(SHUNT_COLS))
+            tap_col = np.ones(n_br, dtype=np.float64)
+        shift_col = (
+            branch_mp[:, MP_SHIFT]
+            if br_ncols > MP_SHIFT
+            else np.zeros(n_br, dtype=np.float64)
+        )
+        charging_col = (
+            branch_mp[:, MP_BR_B]
+            if br_ncols > MP_BR_B
+            else np.zeros(n_br, dtype=np.float64)
+        )
+
+        xfmr_mask = (np.abs(tap_col - 1.0) > 1e-12) | (np.abs(shift_col) > 1e-12)
+        xfmr_pos = np.flatnonzero(xfmr_mask)
+        n_xfmr = int(xfmr_pos.size)
+        n_line = n_br - n_xfmr
+
+        if n_line:
+            branch_idx = np.arange(1, n_line + 1, dtype=np.int64)
+            branch = np.zeros((n_line, len(BRANCH_COLS)), dtype=np.float64, order="F")
+            branch[:, BRANCH_COLS["idx"]] = branch_idx
+            if n_xfmr == 0:
+                branch[:, BRANCH_COLS["i_node"]] = f_bus_col
+                branch[:, BRANCH_COLS["j_node"]] = t_bus_col
+                branch[:, BRANCH_COLS["r"]] = r_col
+                branch[:, BRANCH_COLS["x"]] = x_col
+                branch[:, BRANCH_COLS["b"]] = charging_col
+                branch[:, BRANCH_COLS["run_stat"]] = status_col
+            else:
+                line_pos = np.flatnonzero(~xfmr_mask)
+                np.take(f_bus_col, line_pos, out=branch[:, BRANCH_COLS["i_node"]])
+                np.take(t_bus_col, line_pos, out=branch[:, BRANCH_COLS["j_node"]])
+                np.take(r_col, line_pos, out=branch[:, BRANCH_COLS["r"]])
+                np.take(x_col, line_pos, out=branch[:, BRANCH_COLS["x"]])
+                np.take(charging_col, line_pos, out=branch[:, BRANCH_COLS["b"]])
+                np.take(status_col, line_pos, out=branch[:, BRANCH_COLS["run_stat"]])
+        else:
+            branch_idx = np.empty(0, dtype=np.int64)
+            branch = _empty(len(BRANCH_COLS))
+
+        if n_xfmr:
+            xfmr_idx = np.arange(1, n_xfmr + 1, dtype=np.int64)
+            transformer = np.zeros((n_xfmr, len(TRANSFORMER_COLS)), dtype=np.float64, order="F")
+            transformer[:, TRANSFORMER_COLS["idx"]] = xfmr_idx
+            np.take(f_bus_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["i_node"]])
+            np.take(t_bus_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["j_node"]])
+            np.take(r_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["r"]])
+            np.take(x_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["x"]])
+            xf_ch = charging_col[xfmr_pos]
+            np.multiply(xf_ch, 0.5, out=transformer[:, TRANSFORMER_COLS["bt"]])
+            np.take(tap_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["tap"]])
+            np.take(shift_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["shift"]])
+            np.take(status_col, xfmr_pos, out=transformer[:, TRANSFORMER_COLS["run_stat"]])
+
+            xf_shunt_sub = np.flatnonzero(np.abs(xf_ch) > 1e-12)
+            n_xfmr_shunt = int(xf_shunt_sub.size)
+        else:
+            xfmr_idx = np.empty(0, dtype=np.int64)
+            transformer = _empty(len(TRANSFORMER_COLS))
+            xf_ch = np.empty(0, dtype=np.float64)
+            xf_shunt_sub = _EMPTY_INT
+            n_xfmr_shunt = 0
+    else:
+        branch_idx = np.empty(0, dtype=np.int64)
+        branch = _empty(len(BRANCH_COLS))
+        xfmr_idx = np.empty(0, dtype=np.int64)
+        transformer = _empty(len(TRANSFORMER_COLS))
+        xf_ch = np.empty(0, dtype=np.float64)
+        xf_shunt_sub = _EMPTY_INT
+        n_xfmr_shunt = 0
+
+    # 6. 合并分配并联表
+    n_shunt = n_bus_shunt + n_xfmr_shunt
+    if n_shunt:
+        shunt_idx = np.arange(1, n_shunt + 1, dtype=np.int64)
+        shunt = np.zeros((n_shunt, len(SHUNT_COLS)), dtype=np.float64, order="F")
+        shunt[:, SHUNT_COLS["idx"]] = shunt_idx
+        shunt[:, SHUNT_COLS["control_type"]] = SHUNT_B
+        if n_bus_shunt:
+            shunt[:n_bus_shunt, SHUNT_COLS["node"]] = bus_ids[bus_shunt_pos]
+            np.divide(gs_col[bus_shunt_pos], base_mva, out=shunt[:n_bus_shunt, SHUNT_COLS["g_set"]])
+            np.divide(bs_col[bus_shunt_pos], base_mva, out=shunt[:n_bus_shunt, SHUNT_COLS["b_set"]])
+            shunt[:n_bus_shunt, SHUNT_COLS["run_stat"]] = 1.0
+        if n_xfmr_shunt:
+            shunt[n_bus_shunt:, SHUNT_COLS["node"]] = transformer[xf_shunt_sub, TRANSFORMER_COLS["j_node"]]
+            np.multiply(xf_ch[xf_shunt_sub], 0.5, out=shunt[n_bus_shunt:, SHUNT_COLS["b_set"]])
+            shunt[n_bus_shunt:, SHUNT_COLS["run_stat"]] = transformer[xf_shunt_sub, TRANSFORMER_COLS["run_stat"]]
+    else:
+        shunt_idx = np.empty(0, dtype=np.int64)
+        shunt = _empty(len(SHUNT_COLS))
 
     ppc = {
         "format": "ac_ppc_v1",
-        "source": str(path),
+        "source": source_str,
         "base": {
             "p_base": float(base_mva),
             "u_scale": 1.0,
@@ -1706,16 +1975,16 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "break": _empty(len(BREAK_COLS)),
         "acac": _empty(len(ACAC_COLS)),
         "bus_name": bus_names,
-        "branch_name": np.asarray([f"branch_{int(row[BRANCH_COLS['idx']])}" for row in branch], dtype=object),
-        "transformer_name": np.asarray([f"transformer_{int(row[TRANSFORMER_COLS['idx']])}" for row in transformer], dtype=object),
-        "three_winding_transformer_name": np.asarray([], dtype=object),
+        "branch_name": LazyNameArray(None, branch_idx, "branch"),
+        "transformer_name": LazyNameArray(None, xfmr_idx, "transformer"),
+        "three_winding_transformer_name": _EMPTY_OBJ_ARRAY,
         "gen_name": gen_names,
         "load_name": load_names,
-        "shunt_name": np.asarray([f"shunt_{int(row[SHUNT_COLS['idx']])}" for row in shunt], dtype=object),
-        "zero_branch_name": np.asarray([], dtype=object),
-        "switch_name": np.asarray([], dtype=object),
-        "break_name": np.asarray([], dtype=object),
-        "acac_name": np.asarray([], dtype=object),
+        "shunt_name": LazyNameArray(None, shunt_idx, "shunt"),
+        "zero_branch_name": _EMPTY_OBJ_ARRAY,
+        "switch_name": _EMPTY_OBJ_ARRAY,
+        "break_name": _EMPTY_OBJ_ARRAY,
+        "acac_name": _EMPTY_OBJ_ARRAY,
         "bus_cols": BUS_COLS,
         "branch_cols": BRANCH_COLS,
         "transformer_cols": TRANSFORMER_COLS,
@@ -1730,10 +1999,188 @@ def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict
         "ctrl": {"PQ": CTRL_PQ, "P": CTRL_P, "PV": CTRL_PV, "SLACK": CTRL_SLACK},
         "shunt_ctrl": {"Q": SHUNT_Q, "V": SHUNT_V, "B": SHUNT_B, "Z": SHUNT_Z},
     }
-    sanitize_ac_voltage_setpoints(ppc)
+
+    # 7. 电压设定点校验快速短路（shunt 全为 SHUNT_B、acac 为空，仅需检查 gen v_set 合法区间）
+    if n_gen:
+        v_set_col = gen[:, GEN_COLS["v_set"]]
+        if not bool(np.all((v_set_col >= MIN_VOLTAGE_SETPOINT) & (v_set_col <= MAX_VOLTAGE_SETPOINT))):
+            sanitize_ac_voltage_setpoints(ppc)
     ppc["_setpoints_preverified"] = True
-    ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
+
+    # 8. 融合构造 GridTopologyInput（复用已有 node_lookup，唯一母线 ID 时 load/shunt 零查表）
+    empty_term = TerminalDeviceTopologyInput(_EMPTY_INT, _EMPTY_INT, _EMPTY_BOOL)
+    if branch.shape[0]:
+        br_run_col = branch[:, BRANCH_COLS["run_stat"]]
+        br_term = TerminalDeviceTopologyInput(
+            _map_node_positions(branch[:, BRANCH_COLS["i_node"]], node_lookup),
+            _map_node_positions(branch[:, BRANCH_COLS["j_node"]], node_lookup),
+            (br_run_col >= 1.0) & (br_run_col < 2.0),
+        )
+    else:
+        br_term = empty_term
+
+    if transformer.shape[0]:
+        xf_j_pos = _map_node_positions(transformer[:, TRANSFORMER_COLS["j_node"]], node_lookup)
+        xf_run_col = transformer[:, TRANSFORMER_COLS["run_stat"]]
+        xf_term = TerminalDeviceTopologyInput(
+            _map_node_positions(transformer[:, TRANSFORMER_COLS["i_node"]], node_lookup),
+            xf_j_pos,
+            (xf_run_col >= 1.0) & (xf_run_col < 2.0),
+        )
+    else:
+        xf_j_pos = _EMPTY_INT
+        xf_term = empty_term
+
+    if n_gen:
+        gen_run_col = gen[:, GEN_COLS["run_stat"]]
+        gen_single = SingleDeviceTopologyInput(
+            gen_node_pos,
+            (gen_run_col >= 1.0) & (gen_run_col < 2.0),
+        )
+    else:
+        gen_single = SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+
+    if n_load:
+        load_node_pos = (
+            load_pos.astype(np.int32)
+            if bus_ids_unique
+            else _map_node_positions(load_nodes, node_lookup)
+        )
+        load_single = SingleDeviceTopologyInput(load_node_pos, np.ones(n_load, dtype=bool))
+    else:
+        load_single = SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+
+    if n_shunt:
+        if bus_ids_unique:
+            if n_xfmr_shunt == 0:
+                sh_node_pos = bus_shunt_pos.astype(np.int32)
+                sh_run_mask = np.ones(n_bus_shunt, dtype=bool)
+            elif n_bus_shunt == 0:
+                sh_node_pos = xf_j_pos[xf_shunt_sub]
+                sh_run_col = shunt[:, SHUNT_COLS["run_stat"]]
+                sh_run_mask = (sh_run_col >= 1.0) & (sh_run_col < 2.0)
+            else:
+                sh_node_pos = np.empty(n_shunt, dtype=np.int32)
+                sh_node_pos[:n_bus_shunt] = bus_shunt_pos
+                sh_node_pos[n_bus_shunt:] = xf_j_pos[xf_shunt_sub]
+                sh_run_col = shunt[:, SHUNT_COLS["run_stat"]]
+                sh_run_mask = (sh_run_col >= 1.0) & (sh_run_col < 2.0)
+        else:
+            sh_node_pos = _map_node_positions(shunt[:, SHUNT_COLS["node"]], node_lookup)
+            sh_run_col = shunt[:, SHUNT_COLS["run_stat"]]
+            sh_run_mask = (sh_run_col >= 1.0) & (sh_run_col < 2.0)
+        shunt_single = SingleDeviceTopologyInput(sh_node_pos, sh_run_mask)
+    else:
+        shunt_single = SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+
+    ppc["_topology_input"] = GridTopologyInput(
+        bus_ids_32,
+        bus_active,
+        node_lookup,
+        terminals={
+            "branch": br_term,
+            "transformer": xf_term,
+            "three_winding_transformer_ij": empty_term,
+            "three_winding_transformer_ik": empty_term,
+            "zero_branch": empty_term,
+            "switch": empty_term,
+            "break": empty_term,
+            "acac": empty_term,
+        },
+        singles={
+            "gen": gen_single,
+            "load": load_single,
+            "shunt": shunt_single,
+        },
+    )
     return ppc
+
+
+def _try_assemble_ac_ppc_from_mat_v5(path: Path, variable_name: str = "mpc") -> Any:
+    """对标准未压缩小端 MATLAB Level-5 .mat 文件执行 mmap 零拷贝直读并组装 PPC；不匹配时返回 None 回退。"""
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        return None
+    if file_size < 128:
+        return None
+
+    with open(path, "rb") as fp:
+        with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            version, endian = struct.unpack_from("<H2s", mm, 124)
+            if version != 0x0100 or endian != b"IM":
+                return None
+
+            pos = 128
+            selected_mpc = None
+            top_arrays: Dict[str, np.ndarray] = {}
+            fallback_structs: List[Dict[str, Any]] = []
+            parsed = None
+            vval = None
+            try:
+                while pos + 8 <= file_size:
+                    tag = _read_mat_v5_tag(mm, pos, file_size)
+                    if tag is None:
+                        return None
+                    dt, nb, ds, next_pos = tag
+                    if dt == _MAT_V5_MI_COMPRESSED:
+                        return None
+                    if dt == _MAT_V5_MI_MATRIX:
+                        parsed = _parse_mat_v5_matrix(mm, ds, ds + nb)
+                        if parsed is None:
+                            return None
+                        vname, vval = parsed
+                        if vname == variable_name and isinstance(vval, dict):
+                            if "bus" not in vval:
+                                return None
+                            selected_mpc = vval
+                            break
+                        if isinstance(vval, dict):
+                            if _MAT_V5_REQUIRED_FIELDS.issubset(vval.keys()):
+                                fallback_structs.append(vval)
+                        elif isinstance(vval, np.ndarray) and vname in _MAT_V5_REQUIRED_FIELDS:
+                            top_arrays[vname] = vval
+                    pos = next_pos
+
+                if selected_mpc is None:
+                    if _MAT_V5_REQUIRED_FIELDS.issubset(top_arrays.keys()):
+                        selected_mpc = top_arrays
+                    elif fallback_structs:
+                        selected_mpc = fallback_structs[0]
+
+                if selected_mpc is None:
+                    return None
+
+                # 在 mmap 有效期内完成全部独立数组组装，退出前通过 finally 清理全部 buffer view
+                return _assemble_ac_ppc_from_matpower_dict(selected_mpc, str(path))
+            finally:
+                selected_mpc = None
+                top_arrays.clear()
+                fallback_structs.clear()
+                parsed = None
+                vval = None
+
+
+def build_ac_ppc_from_mat_file(file_path, *, variable_name: str = "mpc") -> Dict:
+    """Read a MATPOWER/PYPOWER ``.mat`` case and build this project's AC ppc.
+
+    The input must provide ``baseMVA``, ``bus``, ``gen`` and ``branch`` either
+    inside a MATLAB struct named by ``variable_name`` or as top-level MAT
+    variables. Text MATPOWER ``.m`` files using ``mpc.*`` assignments are also
+    accepted. Bus loads and shunts are converted into ACLoad/ACShunt rows.
+    MATPOWER branches with tap or phase shift are converted into ACTransformer
+    rows; ordinary branches stay in the ACBranch table.
+    """
+
+    path = Path(file_path).resolve()
+    if path.suffix.lower() != ".m":
+        fast_ppc = _try_assemble_ac_ppc_from_mat_v5(path, variable_name=variable_name)
+        if fast_ppc is not None:
+            return fast_ppc
+        mpc = _load_matpower_case_from_mat_file(path, variable_name=variable_name)
+    else:
+        mpc = _load_matpower_case_from_m_file(path, variable_name=variable_name)
+    return _assemble_ac_ppc_from_matpower_dict(mpc, str(path))
 
 
 def save_ac_ppc_to_mat_file(ppc: Dict, file_path, *, variable_name: str = "mpc") -> Path:

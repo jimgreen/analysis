@@ -214,6 +214,11 @@ class LazyNameArray:
     def tolist(self):
         if self._raw_list is not None and self._array is None:
             return list(self._raw_list)
+        if self._raw_names is None and self._array is None:
+            prefix = self._prefix
+            if self._idx_values.dtype.kind in "iu":
+                return [f"{prefix}_{idx}" for idx in self._idx_values.tolist()]
+            return [f"{prefix}_{int(idx)}" for idx in self._idx_values.tolist()]
         return self._materialize().tolist()
 
     def raw_str_list(self):

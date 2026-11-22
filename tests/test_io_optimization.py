@@ -208,3 +208,185 @@ def test_se_result_columnar_export_exact_equivalence(tmp_path: Path, skip_bad_da
     assert col_pref_dicts == [asdict(r) for r in pref_rows]
     assert col_norm_dicts == [asdict(r) for r in norm_rows]
     assert se_res.normal_measurements.to_dicts() == col_norm_dicts
+
+
+@pytest.mark.parametrize("sparse_bus_ids", [False, True])
+def test_build_ac_ppc_from_mat_file_vectorized_equivalence(tmp_path: Path, sparse_bus_ids: bool):
+    """验证向量化 build_ac_ppc_from_mat_file() 在稠密与稀疏大母线 ID、移相/充电变压器、停运节点与多机场景下完全精确。"""
+    from scipy.io import savemat
+
+    from lfcore.ac_lf import ACPowerFlowCalc
+    from model.ac_array_model import (
+        BRANCH_COLS,
+        BUS_COLS,
+        CTRL_PQ,
+        CTRL_PV,
+        CTRL_SLACK,
+        GEN_COLS,
+        LOAD_COLS,
+        SHUNT_B,
+        SHUNT_COLS,
+        TRANSFORMER_COLS,
+        build_ac_ppc_from_mat_file,
+    )
+    from model.array_common import LazyNameArray
+
+    ids = [100001, 200002, 300003, 400004] if sparse_bus_ids else [1, 2, 3, 4]
+    # bus: [BUS_I, TYPE(1=PQ,2=PV,3=REF,4=NONE), PD, QD, GS, BS, AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN]
+    bus_mp = np.array(
+        [
+            [ids[0], 3, 0.0, 0.0, 0.0, 0.0, 1, 1.02, 0.0, 110.0, 1, 1.1, 0.9],
+            [ids[1], 2, 20.0, 5.0, 1.5, -2.0, 1, 1.01, 0.0, 110.0, 1, 1.1, 0.9],
+            [ids[2], 1, 35.0, 12.0, 0.0, 3.0, 1, 1.00, 0.0, 110.0, 1, 1.1, 0.9],
+            [ids[3], 4, 10.0, 4.0, 2.0, 1.0, 1, 1.00, 0.0, 110.0, 1, 1.1, 0.9],  # 停运母线，负荷/并联应跳过
+        ],
+        dtype=np.float64,
+    )
+    # gen: [GEN_BUS, PG, QG, QMAX, QMIN, VG, MBASE, STATUS, PMAX, PMIN]
+    gen_mp = np.array(
+        [
+            [ids[0], 30.0, 10.0, 50.0, -50.0, 1.02, 100.0, 1.0, 100.0, 0.0],
+            [ids[1], 25.0, 0.0, 40.0, -40.0, 0.0, 100.0, 1.0, 80.0, 0.0],  # VG=0 -> 回退 1.0
+            [ids[2], 5.0, 2.0, 20.0, -20.0, 1.00, 100.0, 1.0, 30.0, 0.0],  # PQ 母线挂发电机 -> CTRL_PQ
+        ],
+        dtype=np.float64,
+    )
+    # branch: [F_BUS, T_BUS, R, X, B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, STATUS, ANGMIN, ANGMAX]
+    branch_mp = np.array(
+        [
+            [ids[0], ids[1], 0.01, 0.05, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -360.0, 360.0],   # 普通线路
+            [ids[1], ids[2], 0.008, 0.04, 0.04, 0.0, 0.0, 0.0, 1.05, 3.0, 1.0, -360.0, 360.0], # 移相+变比+充电电纳变压器
+            [ids[0], ids[2], 0.015, 0.06, 0.00, 0.0, 0.0, 0.0, 0.98, 0.0, 1.0, -360.0, 360.0], # 仅变比无充电电纳变压器
+        ],
+        dtype=np.float64,
+    )
+    mat_path = tmp_path / f"case_vec_{sparse_bus_ids}.mat"
+    savemat(str(mat_path), {"mpc": {"version": "2", "baseMVA": 100.0, "bus": bus_mp, "gen": gen_mp, "branch": branch_mp}})
+
+    ppc = build_ac_ppc_from_mat_file(mat_path)
+
+    # 校验矩阵维度、数值与 LazyNameArray 名称完全一致
+    assert ppc["bus"].shape[0] == 4
+    assert ppc["bus"][3, BUS_COLS["run_stat"]] == 0.0
+    assert ppc["load"].shape[0] == 2
+    assert np.allclose(ppc["load"][:, LOAD_COLS["node"]], [ids[1], ids[2]])
+    assert np.allclose(ppc["load"][:, LOAD_COLS["pbase"]], [0.20, 0.35])
+    assert ppc["gen"].shape[0] == 3
+    assert ppc["gen"][:, GEN_COLS["control_type"]].tolist() == [CTRL_SLACK, CTRL_PV, CTRL_PQ]
+    assert np.allclose(ppc["gen"][:, GEN_COLS["v_set"]], [1.02, 1.0, 1.0])
+    assert ppc["branch"].shape[0] == 1
+    assert np.isclose(ppc["branch"][0, BRANCH_COLS["b"]], 0.02)
+    assert ppc["transformer"].shape[0] == 2
+    assert np.allclose(ppc["transformer"][:, TRANSFORMER_COLS["bt"]], [0.02, 0.0])
+    assert np.allclose(ppc["transformer"][:, TRANSFORMER_COLS["shift"]], [3.0, 0.0])
+    # shunt = 2 条母线并联 + 1 条变压器末端 B/2 并联
+    assert ppc["shunt"].shape[0] == 3
+    assert np.allclose(ppc["shunt"][:, SHUNT_COLS["idx"]], [1.0, 2.0, 3.0])
+    assert np.allclose(ppc["shunt"][:, SHUNT_COLS["node"]], [ids[1], ids[2], ids[2]])
+    assert np.allclose(ppc["shunt"][:, SHUNT_COLS["g_set"]], [0.015, 0.0, 0.0])
+    assert np.allclose(ppc["shunt"][:, SHUNT_COLS["b_set"]], [-0.02, 0.03, 0.02])
+    assert np.all(ppc["shunt"][:, SHUNT_COLS["control_type"]] == SHUNT_B)
+
+    for key, expected in (
+        ("bus_name", [f"bus_{i}" for i in ids]),
+        ("load_name", ["load_1", "load_2"]),
+        ("gen_name", ["gen_1", "gen_2", "gen_3"]),
+        ("branch_name", ["branch_1"]),
+        ("transformer_name", ["transformer_1", "transformer_2"]),
+        ("shunt_name", ["shunt_1", "shunt_2", "shunt_3"]),
+    ):
+        assert isinstance(ppc[key], LazyNameArray)
+        assert ppc[key].tolist() == expected
+
+    # 验证 array 与 full 模式均能正确收敛且电压完全一致
+    calc_arr = ACPowerFlowCalc(build_ac_ppc_from_mat_file(mat_path), parameters=LF_PARAMS, result_mode="array")
+    calc_arr.prepare()
+    assert calc_arr.run() == 0 and calc_arr.converged
+    calc_full = ACPowerFlowCalc(build_ac_ppc_from_mat_file(mat_path), parameters=LF_PARAMS, result_mode="full")
+    calc_full.prepare()
+    assert calc_full.run() == 0 and calc_full.converged
+    assert np.allclose(calc_arr.ppc["bus"][:, BUS_COLS["voltage"]], calc_full.ppc["bus"][:, BUS_COLS["voltage"]])
+    assert list(calc_full.lf_result.nodes.keys()) == [f"bus_{i}" for i in ids]
+
+
+def test_build_ac_ppc_from_mat_file_v5_fast_path_fallback_and_edge_cases(tmp_path: Path):
+    """验证 Level-5 mmap 快读路径、压缩回退、顶层变量、重复母线 ID、越界 VG 修正与句柄释放。"""
+    from scipy.io import savemat
+
+    from model.ac_array_model import (
+        GEN_COLS,
+        _try_assemble_ac_ppc_from_mat_v5,
+        build_ac_ppc_from_mat_file,
+    )
+    from model.topology import build_ac_topology_input_ppc
+
+    bus_mp = np.array(
+        [
+            [1, 3, 0.0, 0.0, 0.0, 0.0, 1, 1.02, 0.0, 110.0, 1, 1.1, 0.9],
+            [2, 2, 15.0, 5.0, 1.0, -1.0, 1, 1.01, 0.0, 110.0, 1, 1.1, 0.9],
+            [3, 1, 25.0, 8.0, 0.0, 2.0, 1, 1.00, 0.0, 110.0, 1, 1.1, 0.9],
+        ],
+        dtype=np.float64,
+    )
+    gen_mp = np.array(
+        [
+            [1, 20.0, 0.0, 50.0, -50.0, 1.02, 100.0, 1.0, 100.0, 0.0],
+            [2, 20.0, 0.0, 40.0, -40.0, 2.50, 100.0, 1.0, 80.0, 0.0],  # 越界 VG=2.5，应被修正为 1.0
+        ],
+        dtype=np.float64,
+    )
+    branch_mp = np.array(
+        [
+            [1, 2, 0.01, 0.05, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, -360.0, 360.0],
+            [2, 3, 0.01, 0.04, 0.04, 0.0, 0.0, 0.0, 1.04, 2.0, 1.0, -360.0, 360.0],
+        ],
+        dtype=np.float64,
+    )
+    mpc = {"version": "2", "baseMVA": 100.0, "bus": bus_mp, "gen": gen_mp, "branch": branch_mp}
+
+    raw_mat = tmp_path / "uncompressed.mat"
+    cmp_mat = tmp_path / "compressed.mat"
+    top_mat = tmp_path / "top_level.mat"
+    savemat(str(raw_mat), {"mpc": mpc}, do_compression=False)
+    savemat(str(cmp_mat), {"mpc": mpc}, do_compression=True)
+    savemat(str(top_mat), mpc, do_compression=False)
+
+    # 未压缩文件应命中 Level-5 mmap 快速路径，压缩文件应返回 None 并回退 scipy.io.loadmat
+    assert _try_assemble_ac_ppc_from_mat_v5(raw_mat) is not None
+    assert _try_assemble_ac_ppc_from_mat_v5(cmp_mat) is None
+    assert _try_assemble_ac_ppc_from_mat_v5(top_mat) is not None
+
+    ppc_raw = build_ac_ppc_from_mat_file(raw_mat)
+    ppc_cmp = build_ac_ppc_from_mat_file(cmp_mat)
+    ppc_top = build_ac_ppc_from_mat_file(top_mat)
+
+    # Windows 下确认 mmap 句柄已彻底关闭，临时文件可立即删除
+    raw_mat.unlink()
+    top_mat.unlink()
+
+    # 校验未压缩快读、压缩回退、顶层散列变量三者逐位一致，且越界 VG 已触发修正
+    assert ppc_raw["gen"][1, GEN_COLS["v_set"]] == 1.0
+    assert len(ppc_raw.get("_setpoint_corrections", [])) == 1
+    for other in (ppc_cmp, ppc_top):
+        for key in ("bus", "branch", "transformer", "gen", "load", "shunt", "_gen_p_min", "_gen_q_min", "_gen_q_max"):
+            assert np.array_equal(ppc_raw[key], other[key], equal_nan=True)
+
+    # 校验融合生成的 _topology_input 与 build_ac_topology_input_ppc() 完全一致（含重复母线 ID 场景）
+    dup_bus_mp = np.vstack([bus_mp, [2, 1, 5.0, 1.0, 0.5, 0.5, 1, 1.0, 0.0, 110.0, 1, 1.1, 0.9]])
+    dup_mat = tmp_path / "dup_bus.mat"
+    savemat(str(dup_mat), {"mpc": {**mpc, "bus": dup_bus_mp}}, do_compression=False)
+    ppc_dup = build_ac_ppc_from_mat_file(dup_mat)
+    dup_mat.unlink()
+    ref_topo = build_ac_topology_input_ppc(ppc_dup)
+    got_topo = ppc_dup["_topology_input"]
+    assert np.array_equal(got_topo.node_ids, ref_topo.node_ids)
+    assert np.array_equal(got_topo.node_run_mask, ref_topo.node_run_mask)
+    for key in ref_topo.terminals:
+        assert np.array_equal(got_topo.terminals[key].i_node_pos, ref_topo.terminals[key].i_node_pos)
+        assert np.array_equal(got_topo.terminals[key].j_node_pos, ref_topo.terminals[key].j_node_pos)
+        assert np.array_equal(got_topo.terminals[key].run_mask, ref_topo.terminals[key].run_mask)
+    for key in ref_topo.singles:
+        assert np.array_equal(got_topo.singles[key].node_pos, ref_topo.singles[key].node_pos)
+        assert np.array_equal(got_topo.singles[key].run_mask, ref_topo.singles[key].run_mask)
+
+
