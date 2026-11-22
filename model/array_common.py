@@ -34,13 +34,14 @@ def _optional_ppc_vector(ppc, key: str, size: int, default=np.nan) -> np.ndarray
 class EFileTableRows:
     """List-compatible E table rows with cached column access."""
 
-    __slots__ = ("rows", "columns", "_matrix", "_raw_cache")
+    __slots__ = ("rows", "columns", "_matrix", "_raw_cache", "_num_cache")
 
     def __init__(self, rows, columns):
         self.rows = rows
         self.columns = columns
         self._matrix = None
         self._raw_cache = {}
+        self._num_cache = {}
 
     def __len__(self):
         return len(self.rows)
@@ -64,14 +65,47 @@ class EFileTableRows:
         self._matrix = matrix if matrix.ndim == 2 else False
         return self._matrix
 
+    def preload_numeric_columns(self, col_indices) -> None:
+        """一次性通过 NumPy C 解析器预加载本表全部数值列，避免逐列 Python 浮点转换。"""
+        if not col_indices or not self.rows:
+            return
+        loader = getattr(self.rows, "load_numeric_columns", None)
+        if loader is None:
+            return
+        pending = []
+        seen = set()
+        for col in col_indices:
+            if col is None:
+                continue
+            col_idx = int(col)
+            if col_idx not in self._num_cache and col_idx not in seen:
+                seen.add(col_idx)
+                pending.append(col_idx)
+        if not pending:
+            return
+        arr = loader(pending)
+        if arr is None:
+            return
+        for pos, col_idx in enumerate(pending):
+            self._num_cache[col_idx] = arr[:, pos]
+
     def float_column(self, col: int, default: float = 0.0) -> np.ndarray:
         n = len(self.rows)
         if col is None or n == 0:
             return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
         col_idx = int(col)
-        col_tokens = self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
+        cached = self._num_cache.get(col_idx)
+        if cached is not None:
+            return cached
+        col_bytes = self.rows.column_bytes_tokens(col_idx) if hasattr(self.rows, "column_bytes_tokens") else None
+        col_tokens = col_bytes if col_bytes is not None else (
+            self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
+        )
         try:
             if col_tokens is not None:
+                first = col_tokens[0]
+                if col_tokens.count(first) == n:
+                    return np.full(n, float(first), dtype=np.float64)
                 return np.fromiter(map(float, col_tokens), dtype=np.float64, count=n)
             return np.fromiter(
                 map(float, map(operator.itemgetter(col_idx), self.rows)),
@@ -86,9 +120,18 @@ class EFileTableRows:
         if col is None or n == 0:
             return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
         col_idx = int(col)
-        col_tokens = self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
+        cached = self._num_cache.get(col_idx)
+        if cached is not None:
+            return np.trunc(cached)
+        col_bytes = self.rows.column_bytes_tokens(col_idx) if hasattr(self.rows, "column_bytes_tokens") else None
+        col_tokens = col_bytes if col_bytes is not None else (
+            self.rows.column_tokens(col_idx) if hasattr(self.rows, "column_tokens") else None
+        )
         try:
             if col_tokens is not None:
+                first = col_tokens[0]
+                if col_tokens.count(first) == n:
+                    return np.full(n, float(int(first)), dtype=np.float64)
                 return np.fromiter(map(int, col_tokens), dtype=np.float64, count=n)
             return np.fromiter(
                 map(int, map(operator.itemgetter(col_idx), self.rows)),
@@ -103,6 +146,15 @@ class EFileTableRows:
                 .astype(np.float64)
             )
 
+    def flat_bytes_column(self, col):
+        """当底层为二进制批量块视图时，直接返回未解码的 bytes token 列表。"""
+        n = len(self.rows)
+        if col is None or n == 0:
+            return None
+        if hasattr(self.rows, "column_bytes_tokens"):
+            return self.rows.column_bytes_tokens(int(col))
+        return None
+
     def flat_str_column(self, col):
         """当底层为批量扁平 token 视图时，直接返回非空字符串列 list，避免对象数组拷贝。"""
         n = len(self.rows)
@@ -111,6 +163,39 @@ class EFileTableRows:
         if hasattr(self.rows, "column_tokens"):
             return self.rows.column_tokens(int(col))
         return None
+
+    def lazy_name_loaders(self, col):
+        """对未切分的二进制块返回零开销惰性名称提取器，避免 LF array 模式切分名称列。"""
+        n = len(self.rows)
+        if col is None or n == 0:
+            return None
+        raw_bytes = getattr(self.rows, "_raw_bytes", None)
+        if raw_bytes is None or getattr(self.rows, "_rows", None) is not None:
+            return None
+        col_idx = int(col)
+        stride = int(getattr(self.rows, "_stride", 0))
+        nrows = int(getattr(self.rows, "_nrows", 0))
+        if col_idx < 0 or col_idx + 1 >= stride or nrows != n:
+            return None
+        rows_ref = self.rows
+
+        def load_bytes():
+            if getattr(rows_ref, "_raw_bytes", None) is raw_bytes and getattr(rows_ref, "_rows", None) is None:
+                col_b = rows_ref.column_bytes_tokens(col_idx)
+                if col_b is not None:
+                    return col_b
+            btoks = raw_bytes.split()
+            if len(btoks) == nrows * stride:
+                return btoks[col_idx + 1 :: stride]
+            return None
+
+        def load_strs():
+            col_b = load_bytes()
+            if col_b is not None:
+                return b"\n".join(col_b).decode("utf8").split("\n")
+            return None
+
+        return load_strs, load_bytes
 
     def raw_column(self, col, default="") -> np.ndarray:
         n = len(self.rows)
@@ -148,12 +233,36 @@ class EFileTableRows:
 
 
 class LazyNameArray:
-    """按需物化的序列兼容名称数组，支持扁平字符串列零拷贝快速路径。"""
+    """按需物化的序列兼容名称数组，支持扁平字符串列与二进制字节列零拷贝快速路径。"""
 
-    __slots__ = ("_raw_names", "_raw_list", "_idx_values", "_prefix", "_array")
+    __slots__ = (
+        "_raw_names",
+        "_raw_list",
+        "_raw_bytes_list",
+        "_lazy_str_loader",
+        "_lazy_bytes_loader",
+        "_idx_values",
+        "_prefix",
+        "_array",
+    )
 
-    def __init__(self, raw_names, idx_values: np.ndarray, prefix: str, *, verified_str_list: bool = False):
-        if verified_str_list and isinstance(raw_names, list):
+    def __init__(
+        self,
+        raw_names,
+        idx_values: np.ndarray,
+        prefix: str,
+        *,
+        verified_str_list: bool = False,
+        lazy_str_loader=None,
+        lazy_bytes_loader=None,
+    ):
+        self._raw_bytes_list = None
+        self._lazy_str_loader = lazy_str_loader
+        self._lazy_bytes_loader = lazy_bytes_loader
+        if lazy_str_loader is not None:
+            self._raw_list = None
+            self._raw_names = None
+        elif verified_str_list and isinstance(raw_names, list):
             self._raw_list = raw_names
             self._raw_names = None
         else:
@@ -163,12 +272,20 @@ class LazyNameArray:
         self._prefix = str(prefix)
         self._array = None
 
+    def _ensure_lazy_strs(self):
+        if self._raw_list is None and self._lazy_str_loader is not None:
+            loaded = self._lazy_str_loader()
+            self._lazy_str_loader = None
+            if loaded is not None:
+                self._raw_list = loaded
+
     def __len__(self):
         return int(self._idx_values.shape[0])
 
     def _materialize(self) -> np.ndarray:
         if self._array is not None:
             return self._array
+        self._ensure_lazy_strs()
         if self._raw_list is not None:
             names = np.asarray(self._raw_list, dtype=object)
         elif self._raw_names is None:
@@ -190,6 +307,7 @@ class LazyNameArray:
         return self._materialize()[item]
 
     def __iter__(self):
+        self._ensure_lazy_strs()
         if self._raw_list is not None and self._array is None:
             return iter(self._raw_list)
         return iter(self._materialize())
@@ -212,6 +330,7 @@ class LazyNameArray:
         return self._materialize().astype(dtype, copy=copy)
 
     def tolist(self):
+        self._ensure_lazy_strs()
         if self._raw_list is not None and self._array is None:
             return list(self._raw_list)
         if self._raw_names is None and self._array is None:
@@ -222,9 +341,22 @@ class LazyNameArray:
         return self._materialize().tolist()
 
     def raw_str_list(self):
-        """返回只读底层字符串列表（若已就绪），供内部只读装配避免额外拷贝。"""
+        """返回只读底层字符串列表（若已就绪或可按需加载），供内部只读装配避免额外拷贝。"""
+        self._ensure_lazy_strs()
         if self._raw_list is not None and self._array is None:
             return self._raw_list
+        return None
+
+    def raw_bytes_list(self):
+        """返回只读底层 UTF-8 字节名称列表（若支持），供 SE 量测映射零解码直连。"""
+        if self._raw_bytes_list is not None:
+            return self._raw_bytes_list
+        if self._lazy_bytes_loader is not None:
+            loaded = self._lazy_bytes_loader()
+            self._lazy_bytes_loader = None
+            if loaded is not None:
+                self._raw_bytes_list = loaded
+                return loaded
         return None
 
 
@@ -306,12 +438,36 @@ def _code_value(value, mapping: Dict[str, int], default_label: str) -> int:
     return mapping.get(str(value).upper(), mapping[default_label])
 
 
+def _preload_numeric_columns(table_rows, columns, attrs) -> None:
+    """批量预加载表内存在的数值列（底层为二进制块时单次 C 解析）。"""
+    if not table_rows or not hasattr(table_rows, "preload_numeric_columns"):
+        return
+    col_indices = [columns[attr] for attr in attrs if attr in columns]
+    if col_indices:
+        table_rows.preload_numeric_columns(col_indices)
+
+
 def _code_column(table_rows, columns, attr: str, mapping: Dict[str, int], default_label: str) -> np.ndarray:
     col = columns.get(attr)
     n = len(table_rows)
     default = mapping[default_label]
     if col is None or n == 0:
         return np.full(n, float(default), dtype=np.float64) if n else np.empty(0, dtype=np.float64)
+    if hasattr(table_rows, "flat_bytes_column"):
+        flat_bytes = table_rows.flat_bytes_column(col)
+        if flat_bytes is not None:
+            first = flat_bytes[0]
+            if flat_bytes.count(first) == n:
+                return np.full(
+                    n,
+                    float(_code_value(first.decode("utf8"), mapping, default_label)),
+                    dtype=np.float64,
+                )
+            val_map = {
+                tok: float(_code_value(tok.decode("utf8"), mapping, default_label))
+                for tok in dict.fromkeys(flat_bytes)
+            }
+            return np.fromiter(map(val_map.__getitem__, flat_bytes), dtype=np.float64, count=n)
     if hasattr(table_rows, "flat_str_column"):
         flat_tokens = table_rows.flat_str_column(col)
         if flat_tokens is not None:
@@ -335,6 +491,17 @@ def _names_from_rows(table_rows, columns, prefix: str, idx_values: np.ndarray) -
         if hasattr(table_rows, "raw_column"):
             return LazyNameArray(None, idx_values, prefix)
         return np.asarray([f"{prefix}_{int(idx)}" for idx in idx_values], dtype=object)
+    if hasattr(table_rows, "lazy_name_loaders"):
+        loaders = table_rows.lazy_name_loaders(name_col)
+        if loaders is not None:
+            str_loader, bytes_loader = loaders
+            return LazyNameArray(
+                None,
+                idx_values,
+                prefix,
+                lazy_str_loader=str_loader,
+                lazy_bytes_loader=bytes_loader,
+            )
     if hasattr(table_rows, "flat_str_column"):
         flat_names = table_rows.flat_str_column(name_col)
         if flat_names is not None:

@@ -55,6 +55,7 @@ from model.array_common import (
     _name_array,
     _names_from_rows,
     _optional_ppc_vector,
+    _preload_numeric_columns,
     _raw_vbase_by_node,
     _rows_for,
     _scale_by_node,
@@ -594,8 +595,9 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     p_base, u_scale, p_scale, i_scale, p_base_kW = _base_from_rows(rows)
 
     columns, table_rows = _rows_for(rows, "ACNode")
-    bus = np.zeros((len(table_rows), len(BUS_COLS)), dtype=np.float64)
+    bus = np.zeros((len(table_rows), len(BUS_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(table_rows, columns, ("idx", "vbase", "voltage", "angle", "isl", "run_stat"))
         raw_vbase = _float_column(table_rows, columns, "vbase")
         bus[:, BUS_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         bus[:, BUS_COLS["vbase"]] = raw_vbase / u_scale
@@ -626,8 +628,11 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         return current_scale_by_node
 
     columns, table_rows = _rows_for(rows, "ACBranch")
-    branch = np.zeros((len(table_rows), len(BRANCH_COLS)), dtype=np.float64)
+    branch = np.zeros((len(table_rows), len(BRANCH_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows, columns, ("idx", "i_node", "j_node", "r", "x", "b", "run_stat", "i_p", "i_q", "j_p", "j_q", "i_c", "j_c")
+        )
         branch[:, BRANCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         branch[:, BRANCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
         branch[:, BRANCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
@@ -658,8 +663,13 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     branch_names = _names_from_rows(table_rows, columns, "branch", branch[:, BRANCH_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACTransformer")
-    transformer = np.zeros((len(table_rows), len(TRANSFORMER_COLS)), dtype=np.float64)
+    transformer = np.zeros((len(table_rows), len(TRANSFORMER_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows,
+            columns,
+            ("idx", "i_node", "j_node", "r", "x", "gt", "bt", "b", "tap", "shift", "run_stat", "i_p", "i_q", "j_p", "j_q", "i_c", "j_c"),
+        )
         transformer[:, TRANSFORMER_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         transformer[:, TRANSFORMER_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
         transformer[:, TRANSFORMER_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
@@ -765,8 +775,14 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     )
 
     columns, table_rows = _rows_for(rows, "ACGenerator")
-    gen = np.zeros((len(table_rows), len(GEN_COLS)), dtype=np.float64)
+    gen = np.zeros((len(table_rows), len(GEN_COLS)), dtype=np.float64, order="F")
+    rated_capacity = np.empty(0, dtype=np.float64)
     if table_rows:
+        _preload_numeric_columns(
+            table_rows,
+            columns,
+            ("idx", "node", "p_set", "q_set", "v_set", "alpha", "run_stat", "p_max", "p_min", "q_max", "q_min", "rated_capacity", "p", "q", "current"),
+        )
         gen[:, GEN_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         gen[:, GEN_COLS["node"]] = _int_column(table_rows, columns, "node")
         gen[:, GEN_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", CTRL_CODE, "PQ")
@@ -802,7 +818,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     gen_p_min = _float_column(table_rows, columns, "p_min", np.nan) / p_base
     gen_q_min = _float_column(table_rows, columns, "q_min", np.nan) / p_base
     gen_q_max = _float_column(table_rows, columns, "q_max", np.nan) / p_base
-    rated_capacity = _float_column(table_rows, columns, "rated_capacity", np.nan) / p_base
+    # 复用已解析的 rated_capacity，避免重复转换
     q_limit_placeholder = (
         np.isfinite(gen_q_min)
         & np.isfinite(gen_q_max)
@@ -818,8 +834,13 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         gen_q_max[q_limit_placeholder] = rated_capacity[q_limit_placeholder]
 
     columns, table_rows = _rows_for(rows, "ACLoad")
-    load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64)
+    load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows,
+            columns,
+            ("idx", "node", "p_set", "pbase", "pv0", "pv1", "pv2", "qbase", "qv0", "qv1", "qv2", "run_stat", "p", "q", "current"),
+        )
         load[:, LOAD_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         load[:, LOAD_COLS["node"]] = _int_column(table_rows, columns, "node")
         load[:, LOAD_COLS["pbase"]] = _aliased_float_column(
@@ -850,8 +871,13 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     load_names = _names_from_rows(table_rows, columns, "load", load[:, LOAD_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACShuntCompensator")
-    shunt = np.zeros((len(table_rows), len(SHUNT_COLS)), dtype=np.float64)
+    shunt = np.zeros((len(table_rows), len(SHUNT_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows,
+            columns,
+            ("idx", "node", "q_set", "g_set", "b_set", "v_set", "run_stat", "p", "q", "current"),
+        )
         shunt[:, SHUNT_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         shunt[:, SHUNT_COLS["node"]] = _int_column(table_rows, columns, "node")
         shunt[:, SHUNT_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", SHUNT_CODE, "Q")
@@ -874,8 +900,9 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     shunt_names = _names_from_rows(table_rows, columns, "shunt", shunt[:, SHUNT_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "ACZeroBranch")
-    zero_branch = np.zeros((len(table_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64)
+    zero_branch = np.zeros((len(table_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(table_rows, columns, ("idx", "i_node", "j_node", "run_stat", "p", "q", "current"))
         zero_branch[:, ZERO_BRANCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         zero_branch[:, ZERO_BRANCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
         zero_branch[:, ZERO_BRANCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
@@ -969,9 +996,92 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "break_name": breaker_names,
         "acac_name": acac_names,
     }
-    sanitize_ac_voltage_setpoints(ppc)
+    # 常规全合法设定点快速短路，异常时走完整 sanitize_ac_voltage_setpoints
+    need_sanitize = bool(acac.shape[0])
+    if not need_sanitize and gen.shape[0]:
+        gv = gen[:, GEN_COLS["v_set"]]
+        need_sanitize = not bool(np.all((gv >= MIN_VOLTAGE_SETPOINT) & (gv <= MAX_VOLTAGE_SETPOINT)))
+    if not need_sanitize and shunt.shape[0]:
+        sv_ctrl = shunt[:, SHUNT_COLS["control_type"]] == SHUNT_V
+        if np.any(sv_ctrl):
+            sv = shunt[sv_ctrl, SHUNT_COLS["v_set"]]
+            need_sanitize = not bool(np.all((sv >= MIN_VOLTAGE_SETPOINT) & (sv <= MAX_VOLTAGE_SETPOINT)))
+    if need_sanitize:
+        sanitize_ac_voltage_setpoints(ppc)
     ppc["_setpoints_preverified"] = True
-    ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
+    if (
+        three_winding_transformer.shape[0] == 0
+        and zero_branch.shape[0] == 0
+        and switch.shape[0] == 0
+        and breaker.shape[0] == 0
+        and acac.shape[0] == 0
+    ):
+        bus_ids_32 = bus[:, BUS_COLS["idx"]].astype(np.int32, copy=False)
+        bus_run_col = bus[:, BUS_COLS["run_stat"]]
+        bus_active = (bus_run_col >= 1.0) & (bus_run_col < 2.0)
+        node_lookup, _ = _make_node_lookup_and_unique(bus_ids_32)
+        empty_term = TerminalDeviceTopologyInput(_EMPTY_INT, _EMPTY_INT, _EMPTY_BOOL)
+        br_term = (
+            TerminalDeviceTopologyInput(
+                _map_node_positions(branch[:, BRANCH_COLS["i_node"]], node_lookup),
+                _map_node_positions(branch[:, BRANCH_COLS["j_node"]], node_lookup),
+                (branch[:, BRANCH_COLS["run_stat"]] >= 1.0) & (branch[:, BRANCH_COLS["run_stat"]] < 2.0),
+            )
+            if branch.shape[0]
+            else empty_term
+        )
+        xf_term = (
+            TerminalDeviceTopologyInput(
+                _map_node_positions(transformer[:, TRANSFORMER_COLS["i_node"]], node_lookup),
+                _map_node_positions(transformer[:, TRANSFORMER_COLS["j_node"]], node_lookup),
+                (transformer[:, TRANSFORMER_COLS["run_stat"]] >= 1.0)
+                & (transformer[:, TRANSFORMER_COLS["run_stat"]] < 2.0),
+            )
+            if transformer.shape[0]
+            else empty_term
+        )
+        gen_single = (
+            SingleDeviceTopologyInput(
+                _map_node_positions(gen[:, GEN_COLS["node"]], node_lookup),
+                (gen[:, GEN_COLS["run_stat"]] >= 1.0) & (gen[:, GEN_COLS["run_stat"]] < 2.0),
+            )
+            if gen.shape[0]
+            else SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+        )
+        load_single = (
+            SingleDeviceTopologyInput(
+                _map_node_positions(load[:, LOAD_COLS["node"]], node_lookup),
+                (load[:, LOAD_COLS["run_stat"]] >= 1.0) & (load[:, LOAD_COLS["run_stat"]] < 2.0),
+            )
+            if load.shape[0]
+            else SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+        )
+        shunt_single = (
+            SingleDeviceTopologyInput(
+                _map_node_positions(shunt[:, SHUNT_COLS["node"]], node_lookup),
+                (shunt[:, SHUNT_COLS["run_stat"]] >= 1.0) & (shunt[:, SHUNT_COLS["run_stat"]] < 2.0),
+            )
+            if shunt.shape[0]
+            else SingleDeviceTopologyInput(_EMPTY_INT, _EMPTY_BOOL)
+        )
+        ppc["_topology_input"] = GridTopologyInput(
+            bus_ids_32,
+            bus_active,
+            node_lookup,
+            terminals={
+                "branch": br_term,
+                "transformer": xf_term,
+                "three_winding_transformer_ij": empty_term,
+                "three_winding_transformer_ik": empty_term,
+                "zero_branch": empty_term,
+                "switch": empty_term,
+                "break": empty_term,
+                "acac": empty_term,
+            },
+            singles={"gen": gen_single, "load": load_single, "shunt": shunt_single},
+        )
+    else:
+        ppc["_topology_input"] = build_ac_topology_input_ppc(ppc)
     return ppc
 
 

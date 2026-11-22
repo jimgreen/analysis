@@ -1,7 +1,10 @@
+import io
 import re
 import threading
 import weakref
 from pathlib import Path
+
+import numpy as np
 
 from paths import resolve_project_file
 
@@ -201,31 +204,101 @@ class EBook():
 
 
 class _FlatTableRows:
-    """Lazy row view backed by a flat token list from bulk block splitting.
+    """Lazy row view backed by flat tokens or raw UTF-8 bytes from bulk block parsing.
 
-    Column readers (EFileTableRows) slice ``tokens[col + 1 :: stride]`` directly
-    in C without constructing per-row Python lists. Any row-level iteration or
-    indexing materializes standard mutable Python row lists once and releases
-    the flat buffer so in-place callers (e.g. contingency mutation) stay exact.
+    Column readers (EFileTableRows) either load all numeric columns in one C++
+    ``np.loadtxt`` pass from ``_raw_bytes`` or slice ``tokens[col + 1 :: stride]``
+    directly without constructing per-row Python lists. Any row-level iteration
+    or indexing materializes standard mutable Python row lists once and releases
+    the backing buffers so in-place callers (e.g. contingency mutation) stay exact.
     """
 
-    __slots__ = ("_tokens", "_stride", "_nrows", "_rows")
+    __slots__ = ("_tokens", "_raw_bytes", "_bytes_tokens", "_stride", "_nrows", "_rows")
 
-    def __init__(self, tokens, stride: int, nrows: int):
+    def __init__(self, tokens, stride: int, nrows: int, *, raw_bytes=None):
         self._tokens = tokens
+        self._raw_bytes = raw_bytes
+        self._bytes_tokens = None
         self._stride = int(stride)
         self._nrows = int(nrows)
         self._rows = None
+
+    def _ensure_bytes_tokens(self):
+        if self._rows is not None:
+            return None
+        btoks = self._bytes_tokens
+        if btoks is not None:
+            return btoks
+        if self._raw_bytes is None:
+            return None
+        btoks = self._raw_bytes.split()
+        stride = self._stride
+        nrows = self._nrows
+        if len(btoks) != nrows * stride or btoks[0::stride].count(b"#") != nrows:
+            self._materialize()
+            return None
+        self._bytes_tokens = btoks
+        return btoks
 
     def _materialize(self):
         rows = self._rows
         if rows is None:
             tokens = self._tokens
             stride = self._stride
-            rows = [tokens[i + 1 : i + stride] for i in range(0, self._nrows * stride, stride)]
+            if tokens is not None:
+                rows = [tokens[i + 1 : i + stride] for i in range(0, self._nrows * stride, stride)]
+            elif self._raw_bytes is not None:
+                text = self._raw_bytes.decode("utf8")
+                raw_tokens = text.split()
+                if len(raw_tokens) == self._nrows * stride and raw_tokens[0::stride].count("#") == self._nrows:
+                    rows = [raw_tokens[i + 1 : i + stride] for i in range(0, self._nrows * stride, stride)]
+                else:
+                    rows = []
+                    for raw_line in text.splitlines():
+                        line = raw_line.strip()
+                        if not line or line[0] != "#":
+                            continue
+                        rows.append(line[1:].split())
+            else:
+                rows = []
             self._rows = rows
             self._tokens = None
+            self._raw_bytes = None
+            self._bytes_tokens = None
         return rows
+
+    def load_numeric_columns(self, col_indices):
+        """对二进制原始块一次性批量调用 NumPy C 解析器读取多个数值列。"""
+        if self._rows is not None or self._raw_bytes is None or self._nrows < 64 or not col_indices:
+            return None
+        usecols = tuple(int(c) + 1 for c in col_indices)
+        if any(u <= 0 or u >= self._stride for u in usecols):
+            return None
+        try:
+            arr = np.loadtxt(
+                io.BytesIO(self._raw_bytes),
+                comments=None,
+                usecols=usecols,
+                dtype=np.float64,
+                ndmin=2,
+            )
+        except ValueError:
+            return None
+        if arr.shape != (self._nrows, len(usecols)):
+            return None
+        return arr
+
+    def column_bytes_tokens(self, col: int):
+        """按需返回单列原始 bytes token 列表（不解码 UTF-8）。"""
+        if self._rows is not None:
+            return None
+        col_idx = int(col)
+        if col_idx < 0 or col_idx + 1 >= self._stride:
+            return None
+        btoks = self._ensure_bytes_tokens()
+        if btoks is None:
+            return None
+        return btoks[col_idx + 1 :: self._stride]
 
     def column_tokens(self, col: int):
         if self._rows is not None:
@@ -233,7 +306,12 @@ class _FlatTableRows:
         col_idx = int(col)
         if col_idx < 0 or col_idx + 1 >= self._stride:
             return None
-        return self._tokens[col_idx + 1 :: self._stride]
+        if self._tokens is not None:
+            return self._tokens[col_idx + 1 :: self._stride]
+        col_b = self.column_bytes_tokens(col_idx)
+        if col_b is None:
+            return None
+        return b"\n".join(col_b).decode("utf8").split("\n")
 
     def __len__(self) -> int:
         return len(self._rows) if self._rows is not None else self._nrows
@@ -251,6 +329,89 @@ class _FlatTableRows:
         if isinstance(other, _FlatTableRows):
             return self._materialize() == other._materialize()
         return self._materialize() == other
+
+
+def _try_read_efile_rows_bulk_bytes(raw: bytes):
+    """二进制零切分块解析器：仅切出标准无引号无注释 E 文件的表体原始字节，延迟到列读取阶段按需解析。"""
+    if raw.startswith(b"\xef\xbb\xbf") or b"'" in raw or b"//" in raw:
+        return None
+    data = {}
+    pos = 0
+    n = len(raw)
+    while pos < n:
+        lt = raw.find(b"<", pos)
+        if lt < 0:
+            if raw[pos:].strip():
+                return None
+            break
+        if raw[pos:lt].strip():
+            return None
+        gt = raw.find(b">", lt + 1)
+        if gt < 0:
+            return None
+        block_name_b = raw[lt + 1 : gt]
+        if not block_name_b or block_name_b.startswith(b"/"):
+            return None
+        table_name_b = block_name_b
+        lv = 0
+        if b" lv " in block_name_b:
+            key_list = block_name_b.split(b" lv ")
+            table_name_b = key_list[0]
+            try:
+                lv = int(key_list[1].strip().split(b"=")[1])
+            except (IndexError, ValueError):
+                return None
+        end_tag = b"</" + table_name_b + b">"
+        end_pos = raw.find(end_tag, gt + 1)
+        if end_pos < 0:
+            return None
+        body = raw[gt + 1 : end_pos]
+        at = body.find(b"@")
+        if at < 0:
+            header = []
+            data_part = body.strip()
+        else:
+            if body[:at].strip():
+                return None
+            nl = body.find(b"\n", at)
+            if nl < 0:
+                header = body[at + 1 :].decode("utf8").split()
+                data_part = b""
+            else:
+                header = body[at + 1 : nl].decode("utf8").split()
+                data_part = body[nl + 1 :].strip()
+        if not data_part:
+            rows = []
+        else:
+            if b"\n\n" in data_part or b"\r\n\r\n" in data_part:
+                return None
+            stride = len(header) + 1
+            if stride <= 1:
+                return None
+            nrows = data_part.count(b"\n") + 1
+            # 校验每行均以 '#' 紧贴行首开头，且首行与末行列宽与表头匹配
+            if not data_part.startswith(b"#") or data_part.count(b"\n#") != nrows - 1:
+                return None
+            first_nl = data_part.find(b"\n")
+            first_line = data_part if first_nl < 0 else data_part[:first_nl]
+            first_toks = first_line.split()
+            if len(first_toks) != stride or first_toks[0] != b"#":
+                return None
+            if nrows > 1:
+                last_nl = data_part.rfind(b"\n")
+                last_toks = data_part[last_nl + 1 :].split()
+                if len(last_toks) != stride or last_toks[0] != b"#":
+                    return None
+            rows = _FlatTableRows(None, stride, nrows, raw_bytes=data_part)
+        table_name = table_name_b.decode("utf8")
+        data[table_name] = {
+            "table_name": table_name,
+            "header_list": header,
+            "rows": rows,
+            "lv": lv,
+        }
+        pos = end_pos + len(end_tag)
+    return data
 
 
 def _try_read_efile_rows_bulk(text: str):
@@ -328,9 +489,12 @@ def _try_read_efile_rows_bulk(text: str):
 
 def _read_efile_rows(file_path):
     file_path = resolve_project_file(file_path)
-    with open(file_path, mode="rt", encoding="utf8") as fp:
-        text = fp.read()
+    raw = Path(file_path).read_bytes()
+    bulk_bytes = _try_read_efile_rows_bulk_bytes(raw)
+    if bulk_bytes is not None:
+        return bulk_bytes
 
+    text = raw.decode("utf8")
     bulk = _try_read_efile_rows_bulk(text)
     if bulk is not None:
         return bulk

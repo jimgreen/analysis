@@ -37,6 +37,7 @@ from model.array_common import (
     _int_cell,
     _int_column,
     _names_from_rows,
+    _preload_numeric_columns,
     _raw_vbase_by_node,
     _rows_for,
     _scale_by_node,
@@ -445,7 +446,12 @@ def _build_dcac_from_rows(
     ac_raw_vbase, dc_raw_vbase, ac_current, dc_current = (
         _raw_vbase_maps(ac_ppc, dc_ppc) if vbase_maps is None else vbase_maps
     )
-    out = np.zeros((len(table_rows), len(DCAC_COLS)), dtype=np.float64)
+    _preload_numeric_columns(
+        table_rows,
+        columns,
+        ("idx", "ac_node", "dc_node", "r1", "r2", "p_ac_set", "p_dc_set", "q_ac_set", "v_ac_set", "v_dc_set", "run_stat", "dc_p", "ac_p", "ac_q", "dc_i", "ac_i"),
+    )
+    out = np.zeros((len(table_rows), len(DCAC_COLS)), dtype=np.float64, order="F")
     out[:, DCAC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
     out[:, DCAC_COLS["ac_node"]] = _int_column(table_rows, columns, "ac_node")
     out[:, DCAC_COLS["dc_node"]] = _int_column(table_rows, columns, "dc_node")

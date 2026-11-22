@@ -39,6 +39,7 @@ from model.array_common import (
     _int_column,
     _int_value,
     _name_array,
+    _preload_numeric_columns,
     _names_from_rows,
     _optional_ppc_vector,
     _raw_vbase_by_node,
@@ -356,8 +357,9 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     p_base, u_scale, p_scale, i_scale, p_base_kW = _base_from_rows(rows)
 
     columns, table_rows = _rows_for(rows, "DCNode")
-    bus = np.zeros((len(table_rows), len(BUS_COLS)), dtype=np.float64)
+    bus = np.zeros((len(table_rows), len(BUS_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(table_rows, columns, ("idx", "vbase", "voltage", "isl", "run_stat"))
         raw_vbase = _float_column(table_rows, columns, "vbase")
         bus[:, BUS_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         bus[:, BUS_COLS["vbase"]] = raw_vbase / u_scale
@@ -387,8 +389,9 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         return current_scale_by_node
 
     columns, table_rows = _rows_for(rows, "DCBranch")
-    branch = np.zeros((len(table_rows), len(BRANCH_COLS)), dtype=np.float64)
+    branch = np.zeros((len(table_rows), len(BRANCH_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(table_rows, columns, ("idx", "i_node", "j_node", "r", "run_stat", "i_p", "j_p", "current"))
         branch[:, BRANCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         branch[:, BRANCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
         branch[:, BRANCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
@@ -400,8 +403,11 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     branch_names = _names_from_rows(table_rows, columns, "branch", branch[:, BRANCH_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "DCLoad")
-    load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64)
+    load = np.zeros((len(table_rows), len(LOAD_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows, columns, ("idx", "node", "p_set", "pbase", "pv0", "pv1", "pv2", "run_stat", "p", "current")
+        )
         load[:, LOAD_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         load[:, LOAD_COLS["node"]] = _int_column(table_rows, columns, "node")
         p_set_column = "p_set" if "p_set" in columns else "pbase"
@@ -420,8 +426,11 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     load_names = _names_from_rows(table_rows, columns, "load", load[:, LOAD_COLS["idx"]])
 
     columns, table_rows = _rows_for(rows, "DCGenerator")
-    gen = np.zeros((len(table_rows), len(GEN_COLS)), dtype=np.float64)
+    gen = np.zeros((len(table_rows), len(GEN_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows, columns, ("idx", "node", "p_set", "v_set", "i_set", "run_stat", "p", "current", "p_min", "p_max", "rated_capacity", "alpha")
+        )
         gen[:, GEN_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         gen[:, GEN_COLS["node"]] = _int_column(table_rows, columns, "node")
         gen[:, GEN_COLS["control_type"]] = _code_column(table_rows, columns, "control_type", CTRL_CODE, "P")
@@ -447,8 +456,9 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     gen_alpha = _float_column(table_rows, columns, "alpha", 1.0)
 
     columns, table_rows = _rows_for(rows, "DCZeroBranch")
-    zero_branch = np.zeros((len(table_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64)
+    zero_branch = np.zeros((len(table_rows), len(ZERO_BRANCH_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(table_rows, columns, ("idx", "i_node", "j_node", "run_stat", "p", "current"))
         zero_branch[:, ZERO_BRANCH_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         zero_branch[:, ZERO_BRANCH_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
         zero_branch[:, ZERO_BRANCH_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")
@@ -470,8 +480,11 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
     )
 
     columns, table_rows = _rows_for(rows, "DCDCConverter")
-    dcdc = np.zeros((len(table_rows), len(DCDC_COLS)), dtype=np.float64)
+    dcdc = np.zeros((len(table_rows), len(DCDC_COLS)), dtype=np.float64, order="F")
     if table_rows:
+        _preload_numeric_columns(
+            table_rows, columns, ("idx", "i_node", "j_node", "r1", "r2", "p_set", "i_set", "v_set", "run_stat", "i_p", "j_p", "i_c", "j_c")
+        )
         dcdc[:, DCDC_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         dcdc[:, DCDC_COLS["i_node"]] = _int_column(table_rows, columns, "i_node")
         dcdc[:, DCDC_COLS["j_node"]] = _int_column(table_rows, columns, "j_node")

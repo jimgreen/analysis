@@ -390,3 +390,90 @@ def test_build_ac_ppc_from_mat_file_v5_fast_path_fallback_and_edge_cases(tmp_pat
         assert np.array_equal(got_topo.singles[key].run_mask, ref_topo.singles[key].run_mask)
 
 
+def test_efile_binary_bulk_loadtxt_and_lazy_bytes_names(tmp_path: Path):
+    """验证 >=64 行 E 模型文件走二进制 _FlatTableRows + np.loadtxt 批量解析、惰性名称快照独立性与 LF/SE 精确一致。"""
+    from model.ac_array_model import BUS_COLS, build_ac_ppc_from_efile_rows
+    from model.array_common import LazyNameArray
+    from model.meas_array_model import attach_device_pos_from_name_arrays, build_meas_ppc_from_e_file
+    from model.meas_type import DEVICE_TYPE_CODES
+
+    n_bus = 80
+    lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<ACNode>",
+        "@ idx name vbase voltage angle isl run_stat",
+    ]
+    for i in range(1, n_bus + 1):
+        lines.append(f"# {i} bus_{i} 110.0 110.0 0.0 0 1")
+    lines.append("</ACNode>")
+    lines.append("<ACBranch>")
+    lines.append("@ idx name i_node j_node r x b run_stat")
+    for i in range(1, n_bus):
+        lines.append(f"# {i} br_{i} {i} {i + 1} 0.01 0.05 0.02 1")
+    lines.append("</ACBranch>")
+    lines.append("<ACGenerator>")
+    lines.append("@ idx name node control_type p_set q_set v_set alpha run_stat")
+    lines.append("# 1 gen_1 1 SLACK 0.0 0.0 111.1 1.0 1")
+    lines.append("</ACGenerator>")
+    lines.append("<ACLoad>")
+    lines.append("@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat")
+    lines.append(f"# 1 load_1 {n_bus} 10.0 1.0 0.0 0.0 3.0 1.0 0.0 0.0 1")
+    lines.append("</ACLoad>")
+    e_path = tmp_path / "ac_80.e"
+    e_path.write_text("\n".join(lines) + "\n", encoding="utf8")
+
+    rows = _read_efile_rows(e_path)
+    bus_flat = rows["ACNode"]["rows"]
+    assert isinstance(bus_flat, _FlatTableRows)
+    assert bus_flat._raw_bytes is not None
+    assert bus_flat._rows is None
+
+    ppc = build_ac_ppc_from_efile_rows(e_path, rows)
+    # 数值列经 np.loadtxt 解析完成后，行列表与字节切分尚未触发（惰性保持）
+    assert bus_flat._rows is None
+    assert bus_flat._bytes_tokens is None
+    assert isinstance(ppc["bus_name"], LazyNameArray)
+    assert ppc["bus"].flags.f_contiguous
+    assert ppc["bus"].shape[0] == n_bus
+
+    # 即使随后外部物化并就地修改 rows，已构建 ppc["bus_name"] 快照仍不受影响
+    rows["ACNode"]["rows"][0][1] = "mutated_bus_1"
+    assert ppc["bus_name"].raw_bytes_list()[0] == b"bus_1"
+    assert ppc["bus_name"].tolist()[0] == "bus_1"
+
+    # 验证 bytes 零解码路径与 str 路径在 attach_device_pos_from_name_arrays 上逐位一致
+    meas_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value status"]
+    for i in range(1, n_bus + 1):
+        st = "0" if i % 4 != 0 else ("1" if i % 8 == 0 else "2")
+        meas_lines.append(f"# {i} m_{i} ACNode bus_{i} V 100.0 1 110.0 {st}")
+    meas_lines.append("</Measurement>")
+    meas_path = tmp_path / "status_80.meas"
+    meas_path.write_text("\n".join(meas_lines) + "\n", encoding="utf8")
+
+    ref_m = build_meas_ppc_from_efile_rows(meas_path, _read_efile_rows(meas_path))
+    fast_arr = build_meas_ppc_from_e_file(meas_path, include_strings=False, include_matrix=False)
+    fast_full = build_meas_ppc_from_e_file(meas_path, include_strings=True, include_matrix=True)
+    assert _try_parse_meas_ppc_bulk_bytes(meas_path, include_strings=False, include_matrix=False) is not None
+
+    for candidate in (fast_arr, fast_full):
+        assert np.array_equal(candidate["idx_array"], ref_m["idx_array"])
+        assert np.allclose(candidate["weight_array"], ref_m["weight_array"])
+        assert np.allclose(candidate["value_array"], ref_m["value_array"])
+        assert np.array_equal(candidate["valid_array"], ref_m["valid_array"])
+        assert np.array_equal(candidate["status_array"], ref_m["status_array"])
+        assert np.array_equal(candidate["device_type_code_array"], ref_m["device_type_code_array"])
+        assert np.array_equal(candidate["meas_type_code_array"], ref_m["meas_type_code_array"])
+    assert list(fast_full["device_type"]) == list(ref_m["device_type"])
+    assert list(fast_full["meas_type"]) == list(ref_m["meas_type"])
+    assert list(fast_full["name"]) == list(ref_m["name"])
+
+    pos_bytes = attach_device_pos_from_name_arrays(dict(fast_arr), {DEVICE_TYPE_CODES["ACNode"]: ppc["bus_name"]})
+    pos_strs = attach_device_pos_from_name_arrays(dict(fast_arr), {DEVICE_TYPE_CODES["ACNode"]: ppc["bus_name"].tolist()})
+    assert np.array_equal(pos_bytes, np.arange(n_bus, dtype=np.int64))
+    assert np.array_equal(pos_bytes, pos_strs)
+
+
+

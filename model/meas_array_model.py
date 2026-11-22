@@ -45,6 +45,18 @@ ANGLE_MEASUREMENT_TYPES = frozenset(MEAS_TYPE_NAMES[int(code)] for code in ANGLE
 
 _DEVICE_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in DEVICE_TYPE_CODES.items()}
 _MEAS_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in MEAS_TYPE_CODES.items()}
+_ANGLE_CODE_SET = frozenset(int(code) for code in ANGLE_MEASUREMENT_TYPE_CODES.tolist())
+_STATUS_BYTES_FAST_MAP = {
+    b"0": MEAS_STATUS_NORMAL,
+    b"NORMAL": MEAS_STATUS_NORMAL,
+    b"1": MEAS_STATUS_INVALID,
+    b"INVALID": MEAS_STATUS_INVALID,
+    b"2": MEAS_STATUS_PSEUDO,
+    b"PSEUDO": MEAS_STATUS_PSEUDO,
+    b"3": MEAS_STATUS_REMOVED,
+    b"REMOVED": MEAS_STATUS_REMOVED,
+}
+_BULK_CHUNK_BYTES = 262144
 _REQUIRED_COLUMNS = ("idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value")
 _REQUIRED_COLUMNS_BYTES = tuple(name.encode("utf8") for name in _REQUIRED_COLUMNS)
 
@@ -123,6 +135,8 @@ def _build_ppc(
     device_name_id: Optional[np.ndarray] = None,
     device_names: Optional[np.ndarray] = None,
     device_name_id_by_name: Optional[Dict[object, int]] = None,
+    device_name_id_by_bytes: Optional[Dict[bytes, int]] = None,
+    angle_mask: Optional[np.ndarray] = None,
     include_matrix: bool = True,
 ) -> Dict:
     count = int(idx.size)
@@ -170,13 +184,14 @@ def _build_ppc(
         device_type = np.asarray([], dtype=object)
         device_name = np.asarray([], dtype=object)
         meas_type = np.asarray([], dtype=object)
-    if device_name_id_by_name is None:
+    if device_name_id_by_name is None and (include_strings or device_name_id_by_bytes is None):
         device_name_id_by_name = dict(
             zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
         )
-    angle_mask = np.isin(meas_type_code, ANGLE_MEASUREMENT_TYPE_CODES)
+    if angle_mask is None:
+        angle_mask = np.isin(meas_type_code, ANGLE_MEASUREMENT_TYPE_CODES)
     if include_matrix:
-        meas = np.zeros((count, len(MEAS_COLS)), dtype=np.float64)
+        meas = np.zeros((count, len(MEAS_COLS)), dtype=np.float64, order="F")
         if count:
             meas[:, MEAS_COLS["idx"]] = idx.astype(np.float64, copy=False)
             meas[:, MEAS_COLS["device_type_code"]] = device_type_code.astype(np.float64, copy=False)
@@ -213,6 +228,7 @@ def _build_ppc(
         "device_name": device_name,
         "device_names": device_names,
         "device_name_id_by_name": device_name_id_by_name,
+        "device_name_id_by_bytes": device_name_id_by_bytes,
         "meas_type": meas_type,
         "rows_by_device_type_code": rows_by_device_type_code,
         "normalized": False,
@@ -262,9 +278,11 @@ def attach_device_pos_from_name_arrays(
     device_name_id = np.asarray(device_name_id, dtype=np.int64)
     device_names = np.asarray(device_names, dtype=object)
     device_name_id_by_name = ppc.get("device_name_id_by_name")
+    device_name_id_by_bytes = ppc.get("device_name_id_by_bytes")
     lookup_size = int(device_names.size)
     shared_lookup: Optional[np.ndarray] = None
     get_name_id = device_name_id_by_name.get if isinstance(device_name_id_by_name, dict) else None
+    get_bytes_id = device_name_id_by_bytes.get if isinstance(device_name_id_by_bytes, dict) else None
     for code, plan_names in name_arrays_by_type_code.items():
         rows = rows_by_code.get(int(code))
         if rows is None:
@@ -283,18 +301,36 @@ def attach_device_pos_from_name_arrays(
         if not np.all(unresolved):
             rows = rows[unresolved]
             rows_idx = rows.astype(np.intp, copy=False)
-        if get_name_id is not None:
-            # 优先使用只读列表视图，避免拷贝和逐元素拆箱
-            if isinstance(plan_names, (list, tuple)):
-                name_list = plan_names
-            elif hasattr(plan_names, "raw_str_list"):
-                raw_list = plan_names.raw_str_list()
-                name_list = raw_list if raw_list is not None else plan_names.tolist()
-            elif hasattr(plan_names, "tolist"):
-                name_list = plan_names.tolist()
-            else:
-                name_list = list(plan_names)
-            if not name_list:
+
+        # 优先使用零解码 bytes 名称直连（模型侧与量测侧均免去 UTF-8 解码与二次哈希）
+        active_getter = None
+        query_list = None
+        if get_bytes_id is not None and hasattr(plan_names, "raw_bytes_list"):
+            raw_bytes = plan_names.raw_bytes_list()
+            if raw_bytes is not None:
+                active_getter = get_bytes_id
+                query_list = raw_bytes
+        if active_getter is None:
+            if get_name_id is None and get_bytes_id is not None:
+                device_name_id_by_name = dict(
+                    zip(device_names.astype(object, copy=False).tolist(), range(lookup_size))
+                )
+                ppc["device_name_id_by_name"] = device_name_id_by_name
+                get_name_id = device_name_id_by_name.get
+            if get_name_id is not None:
+                if isinstance(plan_names, (list, tuple)):
+                    query_list = plan_names
+                elif hasattr(plan_names, "raw_str_list"):
+                    raw_list = plan_names.raw_str_list()
+                    query_list = raw_list if raw_list is not None else plan_names.tolist()
+                elif hasattr(plan_names, "tolist"):
+                    query_list = plan_names.tolist()
+                else:
+                    query_list = list(plan_names)
+                active_getter = get_name_id
+
+        if active_getter is not None:
+            if not query_list:
                 continue
             ids = device_name_id[rows_idx]
             all_ids_valid = int(ids.min()) >= 0 and int(ids.max()) < lookup_size
@@ -308,21 +344,37 @@ def attach_device_pos_from_name_arrays(
                 query_ids = ids[valid_ids].astype(np.intp, copy=False)
             if shared_lookup is None:
                 shared_lookup = np.full(lookup_size, -1, dtype=np.int64)
-            touched_ids = []
-            touched_pos = []
-            append_id = touched_ids.append
-            append_pos = touched_pos.append
-            for pos, name in enumerate(name_list):
-                name_id = get_name_id(name)
-                if name_id is None and not isinstance(name, str):
-                    name_id = get_name_id(str(name))
-                if name_id is not None and 0 <= name_id < lookup_size:
-                    append_id(name_id)
-                    append_pos(pos)
-            if not touched_ids:
-                continue
-            touched_ids_arr = np.asarray(touched_ids, dtype=np.intp)
-            shared_lookup[touched_ids_arr] = np.asarray(touched_pos, dtype=np.int64)
+
+            mapped = list(map(active_getter, query_list))
+            n_q = len(mapped)
+            if None not in mapped:
+                touched_ids_arr = np.asarray(mapped, dtype=np.intp)
+                if touched_ids_arr.size and int(touched_ids_arr.min()) >= 0 and int(touched_ids_arr.max()) < lookup_size:
+                    shared_lookup[touched_ids_arr] = np.arange(n_q, dtype=np.int64)
+                else:
+                    valid_m = (touched_ids_arr >= 0) & (touched_ids_arr < lookup_size)
+                    touched_ids_arr = touched_ids_arr[valid_m]
+                    if touched_ids_arr.size == 0:
+                        continue
+                    shared_lookup[touched_ids_arr] = np.flatnonzero(valid_m).astype(np.int64, copy=False)
+            else:
+                touched_ids = []
+                touched_pos = []
+                append_id = touched_ids.append
+                append_pos = touched_pos.append
+                for pos, name_id in enumerate(mapped):
+                    if name_id is None and active_getter is get_name_id:
+                        item = query_list[pos]
+                        if not isinstance(item, str):
+                            name_id = active_getter(str(item))
+                    if name_id is not None and 0 <= name_id < lookup_size:
+                        append_id(name_id)
+                        append_pos(pos)
+                if not touched_ids:
+                    continue
+                touched_ids_arr = np.asarray(touched_ids, dtype=np.intp)
+                shared_lookup[touched_ids_arr] = np.asarray(touched_pos, dtype=np.int64)
+
             target_pos = shared_lookup[query_ids]
             shared_lookup[touched_ids_arr] = -1
             matched = target_pos >= 0
@@ -567,9 +619,11 @@ def _try_parse_meas_ppc_bulk_bytes(
     include_strings: bool = False,
     include_matrix: bool = True,
 ) -> Optional[Dict]:
-    """标准无引号 <Measurement> 块的高速字节批量解析器（同时支持数组模式与全字符串模式）。
+    """标准无引号 <Measurement> 块的分块高速字节批量解析器（支持数组模式、全字符串模式与 status 列）。
 
-    当文件含单引号、status 列、块内空行/注释或列宽不一致时返回 None 并回退逐行解析器。
+    按约 256 KB 分块切分并即时释放临时 bytes token，保持工作集在 L2/L3 Cache 内，
+    同时触发块级常量短路。遇到引号、块内空行/注释、未知 status 文本或列宽不一致时
+    返回 None 自动回退逐行解析器。
     """
     try:
         raw = source.read_bytes()
@@ -598,22 +652,15 @@ def _try_parse_meas_ppc_bulk_bytes(
         return None
     if include_strings and b"name" not in header_index:
         return None
-    if b"status" in header_index:
-        return None
     data_bytes = body[header_end + 1 :].strip()
+    del raw, body
     if not data_bytes:
         return _empty_meas_ppc(source, include_matrix=include_matrix)
     if b"\n\n" in data_bytes or b"\r\n\r\n" in data_bytes or b"//" in data_bytes:
         return None
+
     n_rows = data_bytes.count(b"\n") + 1
     ncols = len(header) + 1
-    tokens = data_bytes.split()
-    if len(tokens) != n_rows * ncols:
-        return None
-    # 直接计数 '#' 校验行首标记，避免构造临时 set
-    if tokens[0::ncols].count(b"#") != n_rows:
-        return None
-
     idx_pos = header_index[b"idx"] + 1
     dev_type_pos = header_index[b"dev_type"] + 1
     dev_name_pos = header_index[b"dev_name"] + 1
@@ -621,63 +668,224 @@ def _try_parse_meas_ppc_bulk_bytes(
     weight_pos = header_index[b"weight"] + 1
     valid_pos = header_index[b"valid"] + 1
     value_pos = header_index[b"value"] + 1
+    status_pos = header_index[b"status"] + 1 if b"status" in header_index else -1
+    name_col_pos = header_index[b"name"] + 1 if include_strings else -1
 
-    try:
-        idx_array = np.fromiter(map(int, tokens[idx_pos::ncols]), dtype=np.int64, count=n_rows)
-        weight_toks = tokens[weight_pos::ncols]
-        first_weight = weight_toks[0]
-        if weight_toks.count(first_weight) == n_rows:
-            weight_values = np.full(n_rows, float(first_weight), dtype=np.float64)
+    idx_array = np.empty(n_rows, dtype=np.int64)
+    weight_values = np.empty(n_rows, dtype=np.float64)
+    value_values = np.empty(n_rows, dtype=np.float64)
+    valid_values = np.empty(n_rows, dtype=bool)
+    status_values = np.empty(n_rows, dtype=np.int16)
+    device_type_code_array = np.empty(n_rows, dtype=np.int16)
+    meas_type_code_array = np.empty(n_rows, dtype=np.int16)
+    device_name_id = np.empty(n_rows, dtype=np.int32)
+
+    dt_code_map = dict(_DEVICE_TYPE_CODES_BYTES)
+    mt_code_map = dict(_MEAS_TYPE_CODES_BYTES)
+    name_to_id: Dict[bytes, int] = {}
+    unique_name_bytes = []
+    has_angle_meas = False
+
+    if include_strings:
+        name_chunks = []
+        dt_local_id_arr = np.empty(n_rows, dtype=np.int32)
+        mt_local_id_arr = np.empty(n_rows, dtype=np.int32)
+        dt_tok_to_local: Dict[bytes, int] = {}
+        dt_local_tokens = []
+        mt_tok_to_local: Dict[bytes, int] = {}
+        mt_local_tokens = []
+
+    data_len = len(data_bytes)
+    pos = 0
+    row_off = 0
+    chunk_size = _BULK_CHUNK_BYTES
+    while pos < data_len:
+        end = pos + chunk_size
+        if end < data_len:
+            nl = data_bytes.find(b"\n", end)
+            end = data_len if nl < 0 else nl
         else:
-            weight_values = np.fromiter(map(float, weight_toks), dtype=np.float64, count=n_rows)
-        value_values = np.fromiter(map(float, tokens[value_pos::ncols]), dtype=np.float64, count=n_rows)
-    except ValueError:
+            end = data_len
+        chunk = data_bytes[pos:end]
+        pos = end + 1
+        if not chunk:
+            continue
+        c_rows = chunk.count(b"\n") + 1
+        tokens = chunk.split()
+        if len(tokens) != c_rows * ncols or tokens[0::ncols].count(b"#") != c_rows:
+            return None
+        row_end = row_off + c_rows
+        if row_end > n_rows:
+            return None
+
+        try:
+            idx_array[row_off:row_end] = np.fromiter(
+                map(int, tokens[idx_pos::ncols]), dtype=np.int64, count=c_rows
+            )
+            weight_toks = tokens[weight_pos::ncols]
+            first_weight = weight_toks[0]
+            if weight_toks.count(first_weight) == c_rows:
+                weight_values[row_off:row_end] = float(first_weight)
+            else:
+                weight_values[row_off:row_end] = np.fromiter(
+                    map(float, weight_toks), dtype=np.float64, count=c_rows
+                )
+            value_values[row_off:row_end] = np.fromiter(
+                map(float, tokens[value_pos::ncols]), dtype=np.float64, count=c_rows
+            )
+        except ValueError:
+            return None
+
+        valid_toks = tokens[valid_pos::ncols]
+        all_valid_chunk = valid_toks.count(b"1") == c_rows
+        if all_valid_chunk:
+            valid_values[row_off:row_end] = True
+        else:
+            valid_values[row_off:row_end] = np.fromiter(
+                map(b"1".__eq__, valid_toks), dtype=bool, count=c_rows
+            )
+
+        if status_pos >= 0:
+            st_toks = tokens[status_pos::ncols]
+            st0 = st_toks[0]
+            sc0 = _STATUS_BYTES_FAST_MAP.get(st0)
+            if sc0 is not None and st_toks.count(st0) == c_rows:
+                status_values[row_off:row_end] = sc0
+                if sc0 in (MEAS_STATUS_INVALID, MEAS_STATUS_REMOVED):
+                    valid_values[row_off:row_end] = False
+            else:
+                st_local_map = {}
+                for tok in dict.fromkeys(st_toks):
+                    code = _STATUS_BYTES_FAST_MAP.get(tok)
+                    if code is None:
+                        code = _STATUS_BYTES_FAST_MAP.get(tok.upper())
+                    if code is None:
+                        return None
+                    st_local_map[tok] = code
+                sc_arr = np.fromiter(map(st_local_map.__getitem__, st_toks), dtype=np.int16, count=c_rows)
+                status_values[row_off:row_end] = sc_arr
+                inactive = (sc_arr == MEAS_STATUS_INVALID) | (sc_arr == MEAS_STATUS_REMOVED)
+                if np.any(inactive):
+                    valid_values[row_off:row_end] &= ~inactive
+        else:
+            if all_valid_chunk:
+                status_values[row_off:row_end] = MEAS_STATUS_NORMAL
+            else:
+                status_values[row_off:row_end] = np.where(
+                    valid_values[row_off:row_end], MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID
+                )
+
+        dev_toks = tokens[dev_type_pos::ncols]
+        dt0 = dev_toks[0]
+        if dev_toks.count(dt0) == c_rows:
+            dt_c0 = dt_code_map.get(dt0, 0)
+            device_type_code_array[row_off:row_end] = dt_c0
+            if include_strings:
+                lid = dt_tok_to_local.get(dt0)
+                if lid is None:
+                    lid = len(dt_local_tokens)
+                    dt_tok_to_local[dt0] = lid
+                    dt_local_tokens.append(dt0)
+                dt_local_id_arr[row_off:row_end] = lid
+        else:
+            dt_uniq_chunk = list(dict.fromkeys(dev_toks))
+            for tok in dt_uniq_chunk:
+                if tok not in dt_code_map:
+                    dt_code_map[tok] = 0
+            device_type_code_array[row_off:row_end] = np.fromiter(
+                map(dt_code_map.__getitem__, dev_toks), dtype=np.int16, count=c_rows
+            )
+            if include_strings:
+                for tok in dt_uniq_chunk:
+                    if tok not in dt_tok_to_local:
+                        dt_tok_to_local[tok] = len(dt_local_tokens)
+                        dt_local_tokens.append(tok)
+                dt_local_id_arr[row_off:row_end] = np.fromiter(
+                    map(dt_tok_to_local.__getitem__, dev_toks), dtype=np.int32, count=c_rows
+                )
+
+        meas_toks = tokens[meas_type_pos::ncols]
+        mt_uniq_chunk = list(dict.fromkeys(meas_toks))
+        for tok in mt_uniq_chunk:
+            code = mt_code_map.get(tok)
+            if code is None:
+                code = _MEAS_TYPE_CODES_BYTES.get(tok.upper(), 0)
+                mt_code_map[tok] = code
+            if not has_angle_meas and code in _ANGLE_CODE_SET:
+                has_angle_meas = True
+        meas_type_code_array[row_off:row_end] = np.fromiter(
+            map(mt_code_map.__getitem__, meas_toks), dtype=np.int16, count=c_rows
+        )
+        if include_strings:
+            for tok in mt_uniq_chunk:
+                if tok not in mt_tok_to_local:
+                    mt_tok_to_local[tok] = len(mt_local_tokens)
+                    mt_local_tokens.append(tok)
+            mt_local_id_arr[row_off:row_end] = np.fromiter(
+                map(mt_tok_to_local.__getitem__, meas_toks), dtype=np.int32, count=c_rows
+            )
+
+        name_toks = tokens[dev_name_pos::ncols]
+        new_names = [tok for tok in dict.fromkeys(name_toks) if tok not in name_to_id]
+        if new_names:
+            base_id = len(unique_name_bytes)
+            unique_name_bytes.extend(new_names)
+            name_to_id.update(zip(new_names, range(base_id, base_id + len(new_names))))
+        device_name_id[row_off:row_end] = np.fromiter(
+            map(name_to_id.__getitem__, name_toks), dtype=np.int32, count=c_rows
+        )
+
+        if include_strings:
+            name_chunks.append(b"\n".join(tokens[name_col_pos::ncols]))
+
+        row_off = row_end
+
+    if row_off != n_rows:
         return None
 
-    valid_toks = tokens[valid_pos::ncols]
-    if valid_toks.count(b"1") == n_rows:
-        valid_values = np.ones(n_rows, dtype=bool)
-        status_values = np.full(n_rows, MEAS_STATUS_NORMAL, dtype=np.int16)
-    else:
-        valid_values = np.fromiter(map(b"1".__eq__, valid_toks), dtype=bool, count=n_rows)
-        status_values = np.where(valid_values, MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID).astype(np.int16, copy=False)
-
-    dev_get = _DEVICE_TYPE_CODES_BYTES.get
-    dev_toks = tokens[dev_type_pos::ncols]
-    dev_uniq = list(dict.fromkeys(dev_toks))
-    dev_map = {tok: dev_get(tok, 0) for tok in dev_uniq}
-    device_type_code_array = np.fromiter(map(dev_map.__getitem__, dev_toks), dtype=np.int16, count=n_rows)
-
-    meas_get = _MEAS_TYPE_CODES_BYTES.get
-    meas_toks = tokens[meas_type_pos::ncols]
-    meas_uniq = list(dict.fromkeys(meas_toks))
-    meas_map = {tok: meas_get(tok, meas_get(tok.upper(), 0)) for tok in meas_uniq}
-    meas_type_code_array = np.fromiter(map(meas_map.__getitem__, meas_toks), dtype=np.int16, count=n_rows)
-
-    name_toks = tokens[dev_name_pos::ncols]
-    unique_name_bytes = list(dict.fromkeys(name_toks))
-    name_to_id = dict(zip(unique_name_bytes, range(len(unique_name_bytes))))
-    device_name_id = np.fromiter(map(name_to_id.__getitem__, name_toks), dtype=np.int32, count=n_rows)
-    # 所有 token 经 bytes.split() 切分，必定不含换行符，可整块一次性 UTF-8 解码
+    # 仅解码唯一设备名（经 bytes.split 切分必定不含换行符，可整块一次性 UTF-8 解码）
     device_names_list = b"\n".join(unique_name_bytes).decode("utf8").split("\n")
     device_names_arr = np.asarray(device_names_list, dtype=object)
 
     if include_strings:
-        name_col_pos = header_index[b"name"] + 1
-        name_arr = np.asarray(b"\n".join(tokens[name_col_pos::ncols]).decode("utf8").split("\n"), dtype=object)
-        dev_str_map = {tok: tok.decode("utf8") for tok in dev_uniq}
-        device_type_arr = np.asarray(list(map(dev_str_map.__getitem__, dev_toks)), dtype=object)
+        name_arr = np.asarray(b"\n".join(name_chunks).decode("utf8").split("\n"), dtype=object)
+        dt_labels = np.asarray([tok.decode("utf8") for tok in dt_local_tokens], dtype=object)
+        device_type_arr = dt_labels[dt_local_id_arr]
         device_name_arr = device_names_arr[device_name_id]
-        meas_str_map = {}
-        for tok in meas_uniq:
-            text_tok = tok.decode("utf8")
-            meas_str_map[tok] = text_tok if dev_get is not None and meas_get(tok, 0) != 0 else text_tok.upper()
-        meas_type_arr = np.asarray(list(map(meas_str_map.__getitem__, meas_toks)), dtype=object)
+        mt_labels = np.asarray(
+            [
+                tok.decode("utf8") if _MEAS_TYPE_CODES_BYTES.get(tok, 0) != 0 else tok.decode("utf8").upper()
+                for tok in mt_local_tokens
+            ],
+            dtype=object,
+        )
+        meas_type_arr = mt_labels[mt_local_id_arr]
+        device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
     else:
         name_arr = device_type_arr = device_name_arr = meas_type_arr = None
+        device_name_id_by_name = None
 
-    rows_by_code = _rows_by_device_type_code_fast(device_type_code_array)
-    device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
+    # 若按设备类型已分块连续，直接 arange 切片免去 argsort
+    change = np.flatnonzero(device_type_code_array[1:] != device_type_code_array[:-1]) + 1
+    if change.size == 0:
+        rows_by_code = {int(device_type_code_array[0]): np.arange(n_rows, dtype=np.int64)}
+    else:
+        starts = np.empty(change.size + 1, dtype=np.int64)
+        starts[0] = 0
+        starts[1:] = change
+        block_codes = device_type_code_array[starts].tolist()
+        if len(set(block_codes)) == len(block_codes):
+            stops = np.empty(change.size + 1, dtype=np.int64)
+            stops[:-1] = change
+            stops[-1] = n_rows
+            rows_by_code = {
+                int(code): np.arange(int(s0), int(e0), dtype=np.int64)
+                for code, s0, e0 in zip(block_codes, starts.tolist(), stops.tolist())
+            }
+        else:
+            rows_by_code = _rows_by_device_type_code_fast(device_type_code_array)
+
+    angle_mask = None if has_angle_meas else np.zeros(n_rows, dtype=bool)
     return _build_ppc(
         source=source,
         idx=idx_array,
@@ -696,6 +904,8 @@ def _try_parse_meas_ppc_bulk_bytes(
         device_name_id=device_name_id,
         device_names=device_names_arr,
         device_name_id_by_name=device_name_id_by_name,
+        device_name_id_by_bytes=name_to_id,
+        angle_mask=angle_mask,
         include_matrix=include_matrix,
     )
 
@@ -1242,6 +1452,9 @@ def copy_meas_ppc(ppc: Dict) -> Dict:
     name_ids = ppc.get("device_name_id_by_name")
     if isinstance(name_ids, dict):
         copied["device_name_id_by_name"] = dict(name_ids)
+    byte_name_ids = ppc.get("device_name_id_by_bytes")
+    if isinstance(byte_name_ids, dict):
+        copied["device_name_id_by_bytes"] = dict(byte_name_ids)
     return copied
 
 
