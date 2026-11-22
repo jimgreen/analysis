@@ -79,6 +79,7 @@ class SEScaleProfile:
     screen_primary_cap: int
     screen_verify_cap: int
     screen_verify_cap_rich: int
+    screen_selinv_switch_k: int
     frozen_max_steps: int
     local_warm_frozen_max_dx: float
     local_warm_frozen_max_rms: float
@@ -123,11 +124,12 @@ class SEScaleProfile:
         # 高置信度独立批删单轮上限与初筛局部峰值/回代上限按状态数自适应缩放（覆盖 10 ~ 100k+ 节点）
         batch_max = max(16, min(8192, ns // 16)) if ns >= 384 else max(16, ns // 8)
         primary_cap = min(16384, max(256, ns // 10))
-        # 单轮精确回代上限设为全网选元求逆交叉点（256）：
-        # - 待回代局部峰值 < 256 时完整回代零切碎；
-        # - 待回代局部峰值 >= 256 且无足够免回代强峰时，大网自动切换为 1 次全网选元求逆，避免截断多轮求解；
+        # 单轮精确回代上限与全网选元求逆切换点解耦：
+        # - 大网回代上限 384 可单轮清空中等盲区中段 200~384 条候选，避免触发冗余的提前全网选元求逆；
+        # - 仅当无足够免回代强峰且未截断待回代局部峰值 >= 512（与全网选元求逆实测交叉点齐平）时自动切全网选元求逆；
         # - 当免回代强峰已足够丰富时，大网/超大网将附加回代压缩至 1 个缓存分块（16~32 条）。
-        verify_cap = 256 if ns > 5000 else min(192, max(128, ns // 1024))
+        verify_cap = 384 if ns > 5000 else min(192, max(128, ns // 1024))
+        selinv_switch_k = 512
         if ns > 60000:
             verify_cap_rich = 16
         elif ns > 5000:
@@ -155,6 +157,7 @@ class SEScaleProfile:
             screen_primary_cap=primary_cap,
             screen_verify_cap=verify_cap,
             screen_verify_cap_rich=verify_cap_rich,
+            screen_selinv_switch_k=selinv_switch_k,
             frozen_max_steps=5,
             local_warm_frozen_max_dx=0.60,
             local_warm_frozen_max_rms=2e-2,
@@ -1955,11 +1958,12 @@ def _supernodal_selected_inverse_from_cholmod(factor, *, aat_operand=None, _allo
             e_c = indptr[cand + 1]
             first_sub = indices[s_p + 1]
             cand = cand[(first_sub == cand) & (indices[e_p - 1] == indices[e_c - 1])]
+            idx_mv = memoryview(indices)
             for j in cand.tolist():
                 s_prev = int(indptr[j - 1])
                 e_prev = int(indptr[j])
                 e_cur = int(indptr[j + 1])
-                if indices[s_prev + 1 : e_prev].tobytes() == indices[e_prev:e_cur].tobytes():
+                if idx_mv[s_prev + 1 : e_prev] == idx_mv[e_prev:e_cur]:
                     is_start[j] = False
     sn_starts_arr = np.flatnonzero(is_start).astype(np.int32, copy=False)
     sn_starts = sn_starts_arr.tolist()
@@ -2865,7 +2869,34 @@ def exact_leverage_for_candidate_rows(
         data = H_sub.data
         lev = np.empty(k, dtype=np.float64)
 
-        # 快速路径：原生 CHOLMOD 因子半边前代 solve_L（省去一半三角代与反置换）
+        # 快速路径 1：低秩 WoodburyRemovalSolver 半边前代恒等式（实测提速 ~2.6x，免分配 (n, k) 大矩阵）：
+        # h_j^T (G_0^-1 + U M^-1 U^T) h_j = ||L_0^-1 (P h_j)||_2^2 + (h_j^T U) M^-1 (h_j^T U)^T
+        if getattr(cholmod_factor, "is_woodbury_solver", False):
+            base_fac = getattr(cholmod_factor, "_factor", None)
+            wb_U = getattr(cholmod_factor, "_U", None)
+            if (
+                base_fac is not None
+                and wb_U is not None
+                and hasattr(base_fac, "solve_L")
+                and hasattr(base_fac, "P")
+            ):
+                base_lev = exact_leverage_for_candidate_rows(H_csr, rows, base_fac, chunk_size=chunk_size)
+                if base_lev is not None and base_lev.size == k:
+                    if getattr(cholmod_factor, "_is_single", False):
+                        v_wb = np.asarray(H_sub @ wb_U, dtype=np.float64).ravel()
+                        lev_wb = base_lev + float(getattr(cholmod_factor, "_single_scale", 0.0)) * (v_wb * v_wb)
+                    else:
+                        m_chol_wb = getattr(cholmod_factor, "_m_chol", None)
+                        if m_chol_wb is not None:
+                            V_wb = np.asarray(H_sub @ wb_U, dtype=np.float64)
+                            X_wb = CHO_SOLVE(m_chol_wb, V_wb.T, check_finite=False).T
+                            lev_wb = base_lev + np.sum(V_wb * X_wb, axis=1)
+                        else:
+                            lev_wb = None
+                    if lev_wb is not None and np.all(np.isfinite(lev_wb)):
+                        return lev_wb
+
+        # 快速路径 2：原生 CHOLMOD 因子半边前代 solve_L（省去一半三角代与反置换）
         if (
             not getattr(cholmod_factor, "is_woodbury_solver", False)
             and hasattr(cholmod_factor, "solve_L")
@@ -3988,15 +4019,14 @@ def screen_initial_bad_data_fast(
             elif len(secondary) < cap:
                 secondary.append(r_idx)
 
-        # 大网且无大量免回代强峰时，若待精确回代的局部峰值候选已超过全网选元求逆交叉点（>=256），
-        # 直接返回 "need_full" 走 1 次全网超节点选元求逆，一次性算出全部量测精确归一化残差并单轮大批量剔除，
-        # 既快于多次截断 solve_L 回代，又避免被迫切分成多轮 WLS 估计。
+        # 大网且无大量免回代强峰时，仅当待精确回代的局部峰值候选达到全网选元求逆交叉点（>=512），
+        # 才返回 "need_full" 走 1 次全网超节点选元求逆，避免中段 250~400 条候选取道触发冗余的第 2 次选元求逆。
         rich_gate = 64 if n_state_cur > 20000 else 128
         if (
             n_state_cur > 5000
             and n_state_cur <= scale_prof.sparse_leverage_max_state
             and len(direct_rows_list) < rich_gate
-            and uncapped_verify_count >= cap
+            and uncapped_verify_count >= scale_prof.screen_selinv_switch_k
             and cap >= 256
             and not getattr(cur_cholmod_factor, "is_woodbury_solver", False)
         ):

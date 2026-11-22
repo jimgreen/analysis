@@ -2244,7 +2244,7 @@ def test_se_adaptive_scale_profile_solveL_nesdis_and_simplicial_selinv():
     assert p20k_ac.woodbury_max_rank == 48 and p20k_ac.coarse_early_stop_enabled is True
     assert p100k.sparse_leverage_max_state >= 250000
     assert p100k.exact_leverage_use_sparse_rhs is False
-    assert p100k.screen_verify_cap_rich == 16 and p100k.screen_verify_cap == 256
+    assert p100k.screen_verify_cap_rich == 16 and p100k.screen_verify_cap == 384 and p100k.screen_selinv_switch_k == 512
     assert p100k.exact_leverage_chunk_size <= p20k_ac.exact_leverage_chunk_size <= p2k.exact_leverage_chunk_size
 
     if CHOLMOD_CHOLESKY is None or CHOLMOD_ANALYZE_AAT is None:
@@ -2333,7 +2333,7 @@ def test_ultra_scale_observability_no_4096_truncation_and_fast_screen_rich_peaks
     assert p250k.sparse_leverage_max_state >= 250000
     assert p250k.batch_max_base == 8192
     assert p250k.screen_primary_cap == 16384
-    assert p250k.screen_verify_cap == 256 and p250k.screen_verify_cap_rich == 16
+    assert p250k.screen_verify_cap == 384 and p250k.screen_verify_cap_rich == 16 and p250k.screen_selinv_switch_k == 512
 
     if CHOLMOD_CHOLESKY is None:
         pytest.skip("CHOLMOD unavailable")
@@ -2440,6 +2440,21 @@ def test_woodbury_incremental_u_col_cache_and_zero_backsolve_leverage():
     dx3 = solve_woodbury_after_row_removal(H, w, rem_seq[:3], rhs1, cfac2, u_col_cache=cache)
     assert col_counts[-1] == 4
     assert np.allclose(dx3, dx_exact, rtol=1e-11, atol=1e-11)
+
+    # 验证 WoodburyRemovalSolver 半边 solve_L 精确杠杆快速路径（单删 b=1 与批删 b=3）均逐位一致
+    from secore.se_math import exact_leverage_for_candidate_rows
+    cand_check = np.arange(0, rid, max(1, rid // 32), dtype=np.intp)
+    for rem_sub in (rem_seq[:1], rem_seq[:3]):
+        _, wb_sub = solve_woodbury_after_row_removal(H, w, rem_sub, rhs1, fac, return_solver=True)
+        assert wb_sub is not None
+        lev_wb_fast = exact_leverage_for_candidate_rows(H, cand_check, wb_sub)
+        w_sub = w.copy()
+        w_sub[rem_sub] = 0.0
+        G_sub, _ = build_normal_equations(H, np.zeros(rid), w_sub, dense_gain_limit=0)
+        lev_sub_exact = measurement_leverage(H, np.linalg.inv(G_sub.toarray()))
+        assert lev_wb_fast is not None
+        assert np.allclose(lev_wb_fast, lev_sub_exact[cand_check], rtol=1e-11, atol=1e-11)
+
 
 
 

@@ -7886,7 +7886,9 @@ class HybridStateEstimator:
         existing_sorted = np.fromiter(active_keys_raw, dtype=np.int64, count=len(active_keys_raw))
         if existing_sorted.size > 1:
             existing_sorted.sort()
-        added_keys: set = set()
+        # AC 侧、DC 侧与 DCACConverter 换流器设备类型码完全互斥，各自内部已完成保序去重，
+        # 无需将数万条 AC/DC 键装箱进 Python set 再跨侧全量排序查重。
+        conv_added_keys: set = set()
         allowed_codes_by_device = {
             DEVICE_TYPE_ACGenerator: (MEAS_TYPE_P_GEN, MEAS_TYPE_Q_GEN),
             DEVICE_TYPE_ACLoad: (MEAS_TYPE_P_LOAD, MEAS_TYPE_Q_LOAD),
@@ -7976,21 +7978,13 @@ class HybridStateEstimator:
             sel_val = val_arr[selected]
             cand_keys = pack_key_array(sel_dt, sel_dp, sel_mt)
             valid_mask = cand_keys >= 0
-            # 向量化排除已存在的有效量测键
+            # 向量化排除已存在的有效量测键（AC/DC 两侧设备类型码完全互斥，无需跨侧查重）
             if existing_sorted.size > 0 and np.any(valid_mask):
                 pos = np.searchsorted(existing_sorted, cand_keys)
                 in_existing = (pos < existing_sorted.size) & (
                     existing_sorted[np.minimum(pos, existing_sorted.size - 1)] == cand_keys
                 )
                 valid_mask &= ~in_existing
-            if added_keys and np.any(valid_mask):
-                added_sorted = np.fromiter(added_keys, dtype=np.int64, count=len(added_keys))
-                added_sorted.sort()
-                pos_a = np.searchsorted(added_sorted, cand_keys)
-                in_added = (pos_a < added_sorted.size) & (
-                    added_sorted[np.minimum(pos_a, added_sorted.size - 1)] == cand_keys
-                )
-                valid_mask &= ~in_added
             if not np.any(valid_mask):
                 return
             sel_dt = sel_dt[valid_mask]
@@ -8069,7 +8063,6 @@ class HybridStateEstimator:
             dp_chunks.append(sel_dp)
             mt_chunks.append(sel_mt)
             val_chunks.append(sel_val)
-            added_keys.update(cand_keys.tolist())
 
         append_from_side_estimator("ac", self._ac_sub_estimator)
         append_from_side_estimator("dc", self._dc_sub_estimator)
@@ -8087,7 +8080,7 @@ class HybridStateEstimator:
             if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
                 continue
             key = pack_key(device_type_code, device_pos, meas_type_code)
-            if key < 0 or key in active_keys_raw or key in added_keys:
+            if key < 0 or key in active_keys_raw or key in conv_added_keys:
                 continue
             if meas_type_code == MEAS_TYPE_V and voltage_covered(device_type_code, device_pos, meas_type_code):
                 continue
@@ -8095,7 +8088,7 @@ class HybridStateEstimator:
             conv_dp.append(device_pos)
             conv_mt.append(meas_type_code)
             conv_val.append(float(spec.value))
-            added_keys.add(key)
+            conv_added_keys.add(key)
         if conv_dt:
             dt_chunks.append(np.asarray(conv_dt, dtype=np.int16))
             dp_chunks.append(np.asarray(conv_dp, dtype=np.int64))
