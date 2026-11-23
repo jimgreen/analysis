@@ -1870,6 +1870,7 @@ class CholmodAAtNormalEquationSolver:
         rhs: np.ndarray,
         return_factor_diag: bool = False,
         damping: float = 0.0,
+        allow_slow_fallback: bool = True,
     ) -> Tuple[np.ndarray, np.ndarray]:
         if not is_sparse_matrix(A):
             raise TypeError("CholmodAAtNormalEquationSolver requires a sparse weighted transpose matrix")
@@ -1906,6 +1907,9 @@ class CholmodAAtNormalEquationSolver:
                 self._cholmod_pattern = None
                 self._last_normal_operand = None
                 self._active_backend = None
+        if not allow_slow_fallback:
+            self._active_backend = None
+            return np.full(np.asarray(rhs, dtype=np.float64).shape, np.nan, dtype=np.float64), None
         gain = A_csc @ A_csc.T
         if float(damping) > 0.0:
             gain = gain + SP_EYE(gain.shape[0], format="csc", dtype=np.float64) * float(damping)
@@ -2880,9 +2884,17 @@ def compute_normalized_residuals_for_bad_data(
     res = np.asarray(residual, dtype=np.float64)
     w = np.asarray(weights, dtype=np.float64)
     R_diag = 1.0 / np.maximum(w, 1e-12)
+    pseudo_arr = None
+    if is_pseudo is not None:
+        p_tmp = np.asarray(is_pseudo, dtype=bool)
+        if p_tmp.size == res.size:
+            pseudo_arr = p_tmp
     if leverage is None:
         omega_diag = np.maximum(R_diag, 1e-12)
-        return np.abs(res) / np.sqrt(omega_diag), np.zeros(res.size, dtype=bool)
+        normalized = np.abs(res) / np.sqrt(omega_diag)
+        if pseudo_arr is not None and np.any(pseudo_arr):
+            normalized[pseudo_arr] = 0.0
+        return normalized, np.zeros(res.size, dtype=bool)
 
     lev = np.asarray(leverage, dtype=np.float64)
     raw_omega = R_diag - lev
@@ -2891,12 +2903,11 @@ def compute_normalized_residuals_for_bad_data(
     normalized = np.abs(res) / np.sqrt(omega_diag)
     if np.any(critical_mask):
         suppress = critical_mask & (np.abs(res) <= float(critical_noise_sigma) * np.sqrt(R_diag))
-        if is_pseudo is not None:
-            pseudo_arr = np.asarray(is_pseudo, dtype=bool)
-            if pseudo_arr.size == res.size:
-                suppress |= critical_mask & pseudo_arr
         if np.any(suppress):
             normalized[suppress] = 0.0
+    if pseudo_arr is not None and np.any(pseudo_arr):
+        # 伪量测、零注入/功率平衡量测及内部物理等式约束绝不参与坏数据排除
+        normalized[pseudo_arr] = 0.0
     return normalized, critical_mask
 
 
@@ -3733,11 +3744,13 @@ def screen_bad_data_after_removal(
                 )
                 local_only_shift = unmoved_rms <= 1e-2
 
+    batch_too_large_for_woodbury = (not isinstance(remove_pos, (int, np.integer))) and len(remove_pos) > 128
     if (
         prev_leverage is None
         or prev_H is None
         or cur_H is None
         or cur_cholmod_factor is None
+        or batch_too_large_for_woodbury
         or (float(state_delta_inf) > float(max_state_delta) and not local_only_shift)
     ):
         lb_hit = _try_lower_bound_screen()
@@ -4939,3 +4952,438 @@ def build_normal_equations(
     if triangular_mode == "lower":
         gain = np.tril(gain)
     return gain, rhs
+
+
+def select_island_fixed_voltage_reference_buses(
+    sample_pos: np.ndarray,
+    sample_val: np.ndarray,
+    component_by_pos: np.ndarray,
+    n_components: int,
+    node_island_pos: np.ndarray,
+    island_alive_mask: Optional[np.ndarray] = None,
+    node_degree: Optional[np.ndarray] = None,
+    node_ids: Optional[np.ndarray] = None,
+    *,
+    voltage_min: float = 0.1,
+    voltage_max: float = 1.9,
+    healthy_min: float = 0.8,
+    healthy_max: float = 1.2,
+    outlier_tol: float = 0.15,
+) -> Dict[int, float]:
+    """按电气拓扑岛选取合理有效电压量测数最多的拓扑母线，并计算其稳健均值作为定电压参考。
+
+    参数说明：
+    - ``sample_pos`` / ``sample_val``: 全部真实有效电压量测（含母线节点 ``V`` 及关联支路/变压器/开关/
+      断路器/发负荷/变流器等端口电压量测）对应的求解节点位置 ``solver_pos`` 与标幺电压值。
+    - ``component_by_pos``: 节点 ``solver_pos`` 到零阻抗拓扑母线编号（``0 .. n_components-1``）的映射。
+    - ``node_island_pos`` / ``island_alive_mask``: 节点所属电气岛编号与活动岛掩码。
+    - 合理性筛选优先采用 ``[max(voltage_min, healthy_min), min(voltage_max, healthy_max)]``（默认 ``[0.8, 1.2]``）；
+      若某电气岛无落入健康区间的样本，则自动回退到 ``[voltage_min, voltage_max]``。
+    - 当选定母线的合理有效电压量测数 ``>= 3`` 时，先剔除与中位数偏差超过 ``outlier_tol`` 的离群坏数据后再取算术平均，
+      既拉平随机偏差，又免疫坏数据污染定电压基准。
+    """
+    n_comp = int(n_components)
+    comp_by_pos = np.asarray(component_by_pos, dtype=np.int64)
+    n_nodes = int(comp_by_pos.size)
+    if n_comp <= 0 or n_nodes == 0:
+        return {}
+    pos_arr = np.asarray(sample_pos, dtype=np.int64)
+    val_arr = np.asarray(sample_val, dtype=np.float64)
+    if pos_arr.size == 0 or val_arr.size != pos_arr.size:
+        return {}
+
+    isl_by_pos = np.asarray(node_island_pos, dtype=np.int64)
+    if isl_by_pos.size != n_nodes:
+        return {}
+    v_lo = float(voltage_min)
+    v_hi = float(voltage_max)
+    if v_lo > v_hi:
+        v_lo, v_hi = v_hi, v_lo
+
+    # 1. 基础有效性与物理上下界过滤
+    valid = (
+        (pos_arr >= 0)
+        & (pos_arr < n_nodes)
+        & np.isfinite(val_arr)
+        & (val_arr >= v_lo)
+        & (val_arr <= v_hi)
+    )
+    if not np.any(valid):
+        return {}
+    pos_v = pos_arr[valid]
+    val_v = val_arr[valid]
+    isl_v = isl_by_pos[pos_v]
+    isl_valid = isl_v >= 0
+    if island_alive_mask is not None:
+        alive_arr = np.asarray(island_alive_mask, dtype=bool)
+        isl_valid &= (isl_v < alive_arr.size)
+        if np.any(isl_valid):
+            isl_valid[isl_valid] &= alive_arr[isl_v[isl_valid]]
+    if not np.any(isl_valid):
+        return {}
+    pos_v = pos_v[isl_valid]
+    val_v = val_v[isl_valid]
+    isl_v = isl_v[isl_valid]
+    comp_v = comp_by_pos[pos_v]
+    comp_ok = (comp_v >= 0) & (comp_v < n_comp)
+    if not np.any(comp_ok):
+        return {}
+    pos_v = pos_v[comp_ok]
+    val_v = val_v[comp_ok]
+    isl_v = isl_v[comp_ok]
+    comp_v = comp_v[comp_ok]
+
+    # 2. 按岛优先采用健康运行区间 [h_lo, h_hi]；若某岛无健康命中则回退至 [v_lo, v_hi]
+    h_lo = max(v_lo, float(healthy_min))
+    h_hi = min(v_hi, float(healthy_max))
+    if h_lo <= h_hi:
+        healthy_mask = (val_v >= h_lo) & (val_v <= h_hi)
+        if np.any(healthy_mask):
+            max_isl = int(isl_v.max())
+            isl_has_healthy = np.zeros(max_isl + 1, dtype=bool)
+            isl_has_healthy[isl_v[healthy_mask]] = True
+            keep_mask = healthy_mask | (~isl_has_healthy[isl_v])
+            pos_v = pos_v[keep_mask]
+            val_v = val_v[keep_mask]
+            isl_v = isl_v[keep_mask]
+            comp_v = comp_v[keep_mask]
+
+    if comp_v.size == 0:
+        return {}
+
+    # 3. 向量化统计每条拓扑母线的合理有效电压量测数、总关联度与最小节点 ID
+    comp_counts = np.bincount(comp_v, minlength=n_comp)
+    cand_comps = np.flatnonzero(comp_counts > 0).astype(np.int64, copy=False)
+    if cand_comps.size == 0:
+        return {}
+
+    valid_node_mask = (comp_by_pos >= 0) & (comp_by_pos < n_comp) & (isl_by_pos >= 0)
+    node_idx_range = np.flatnonzero(valid_node_mask)
+    node_comps = comp_by_pos[node_idx_range]
+    comp_isl = np.full(n_comp, -1, dtype=np.int64)
+    comp_isl[node_comps] = isl_by_pos[node_idx_range]
+
+    comp_deg = np.zeros(n_comp, dtype=np.int64)
+    if node_degree is not None:
+        deg_arr = np.asarray(node_degree, dtype=np.int64)
+        if deg_arr.size == n_nodes:
+            np.add.at(comp_deg, node_comps, deg_arr[node_idx_range])
+
+    comp_min_id = np.full(n_comp, np.iinfo(np.int64).max, dtype=np.int64)
+    if node_ids is not None:
+        id_arr = np.asarray(node_ids, dtype=np.int64)
+        if id_arr.size == n_nodes:
+            np.minimum.at(comp_min_id, node_comps, id_arr[node_idx_range])
+        else:
+            np.minimum.at(comp_min_id, node_comps, node_idx_range)
+    else:
+        np.minimum.at(comp_min_id, node_comps, node_idx_range)
+
+    cand_isl = comp_isl[cand_comps]
+    cand_ok = cand_isl >= 0
+    if not np.any(cand_ok):
+        return {}
+    cand_comps = cand_comps[cand_ok]
+    cand_isl = cand_isl[cand_ok]
+    cand_counts = comp_counts[cand_comps]
+    cand_deg = comp_deg[cand_comps]
+    cand_min_id = comp_min_id[cand_comps]
+
+    # 按岛分组，优先量测数最多、次之拓扑母线总关联度最高、再按最小节点 ID 确定性破平
+    order = np.lexsort((cand_min_id, -cand_deg, -cand_counts, cand_isl))
+    sorted_isl = cand_isl[order]
+    sorted_comps = cand_comps[order]
+    first_in_island = np.empty(sorted_isl.size, dtype=bool)
+    first_in_island[0] = True
+    first_in_island[1:] = sorted_isl[1:] != sorted_isl[:-1]
+    chosen_comps = sorted_comps[first_in_island]
+
+    # 4. 为每岛选定的定电压母线计算稳健均值（>=3 条时先剔除偏离中位数 > outlier_tol 的离群坏数据）
+    chosen_set = set(int(c) for c in chosen_comps.tolist())
+    chosen_mask = np.isin(comp_v, chosen_comps)
+    sel_comps = comp_v[chosen_mask]
+    sel_vals = val_v[chosen_mask]
+    out: Dict[int, float] = {}
+    tol = float(outlier_tol)
+    for comp_id in chosen_comps.tolist():
+        c_int = int(comp_id)
+        if c_int not in chosen_set:
+            continue
+        vals = sel_vals[sel_comps == c_int]
+        if vals.size == 0:
+            continue
+        if vals.size >= 3 and tol > 0.0:
+            med = float(np.median(vals))
+            inliers = vals[np.abs(vals - med) <= tol]
+            ref_v = float(np.mean(inliers)) if inliers.size > 0 else med
+        else:
+            ref_v = float(np.mean(vals))
+        ref_v = min(max(ref_v, v_lo), v_hi)
+        out[c_int] = ref_v
+    return out
+
+
+def run_huber_irls_warmup(
+    evaluate_fn,
+    residual_fn,
+    jacobian_fn,
+    x0: np.ndarray,
+    base_weights: np.ndarray,
+    protected_mask: np.ndarray,
+    *,
+    v_cols: Optional[np.ndarray] = None,
+    a_cols: Optional[np.ndarray] = None,
+    v_min: float = 0.1,
+    v_max: float = 1.9,
+    a_min_rad: float = -float(np.deg2rad(270.0)),
+    a_max_rad: float = float(np.deg2rad(270.0)),
+    max_iter: int = 15,
+    huber_k: float = 3.0,
+    tol: float = 1e-4,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """当初始纯 WLS 未收敛时，执行轻量 Huber IRLS 稳健热身，抑制大坏数据拉偏并产出稳健状态与残差。
+
+    仅对非保护真实量测（``~protected_mask``）按 Huber 准则降权，物理等式约束与伪量测权重保持不变；
+    求解完成后交回精确纯 WLS 迭代获取严格的最小二乘解。
+    """
+    x = np.array(x0, dtype=np.float64, copy=True)
+    w_base = np.asarray(base_weights, dtype=np.float64)
+    prot = np.asarray(protected_mask, dtype=bool)
+    n_meas = int(w_base.size)
+    if x.size == 0 or n_meas == 0:
+        return None
+    vc = np.asarray(v_cols, dtype=np.intp) if v_cols is not None else np.empty(0, dtype=np.intp)
+    ac = np.asarray(a_cols, dtype=np.intp) if a_cols is not None else np.empty(0, dtype=np.intp)
+
+    def _oob(vec: np.ndarray) -> bool:
+        if vc.size:
+            vp = vec[vc]
+            if (not np.all(np.isfinite(vp))) or float(vp.min()) < v_min or float(vp.max()) > v_max:
+                return True
+        if ac.size:
+            ap = vec[ac]
+            if (not np.all(np.isfinite(ap))) or float(ap.min()) < a_min_rad or float(ap.max()) > a_max_rad:
+                return True
+        return False
+
+    if _oob(x):
+        return None
+
+    z_est = np.empty(n_meas, dtype=np.float64)
+    res = np.empty(n_meas, dtype=np.float64)
+    cand_z = np.empty(n_meas, dtype=np.float64)
+    cand_r = np.empty(n_meas, dtype=np.float64)
+    sqrt_w = np.sqrt(np.maximum(w_base, 0.0))
+
+    evaluate_fn(x, z_est)
+    residual_fn(z_est, res)
+    if not np.all(np.isfinite(res)):
+        return None
+
+    def _huber_weights(r_vec: np.ndarray) -> np.ndarray:
+        s = sqrt_w * np.abs(r_vec)
+        big = (~prot) & (w_base > 0.0) & (s > huber_k)
+        if not np.any(big):
+            return w_base
+        w_eff = w_base.copy()
+        w_eff[big] = w_base[big] * (huber_k / s[big])
+        return w_eff
+
+    use_aat = True
+    aat_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True, ordering_method="auto", multi_solve=True)
+    aat_plan = None
+    normal_solver = NormalEquationSolver()
+    lam = 0.0
+
+    for _it in range(1, max(1, int(max_iter)) + 1):
+        if _oob(x):
+            break
+        H = jacobian_fn(x)
+        w_cur = _huber_weights(res)
+        obj = float(np.dot(w_cur, res * res))
+        if not np.isfinite(obj):
+            break
+        norm_op = None
+        gain = None
+        if use_aat and is_sparse_matrix(H):
+            try:
+                if aat_plan is None or tuple(H.shape) != aat_plan.shape or int(H.nnz) != int(aat_plan.h_indices.size):
+                    aat_plan = CholmodAAtNormalEquationPlan.from_jacobian(H)
+                norm_op, rhs = aat_plan.assemble(
+                    H,
+                    res,
+                    w_cur,
+                    uniform_weight=None,
+                    weights_are_uniform=False,
+                    weighted_residual=None,
+                    assume_fixed_weights=False,
+                    copy_rhs=False,
+                    assume_pattern_matches=True,
+                )
+            except Exception:
+                use_aat = False
+                aat_plan = None
+        if norm_op is None:
+            gain, rhs = build_normal_equations(H, res, w_cur)
+
+        accepted = False
+        try_lam = lam
+        for _ls in range(10):
+            if norm_op is not None:
+                dx, _ = aat_solver.solve(norm_op, rhs, return_factor_diag=False, damping=try_lam)
+            else:
+                if try_lam > 0.0:
+                    if is_sparse_matrix(gain):
+                        g_solve = gain + SP_EYE(gain.shape[0], format="csc", dtype=np.float64) * try_lam
+                    else:
+                        g_solve = np.array(gain, dtype=np.float64, copy=True)
+                        g_solve[np.diag_indices_from(g_solve)] += try_lam
+                else:
+                    g_solve = gain
+                dx, _ = normal_solver.solve(g_solve, rhs, return_factor_diag=False)
+            if dx.size == 0 or not np.all(np.isfinite(dx)):
+                try_lam = max(try_lam * 10.0, 1e-3)
+                if try_lam > 1e5:
+                    break
+                continue
+            max_dx = float(np.max(np.abs(dx)))
+            if max_dx < tol and try_lam == 0.0:
+                return x, res, z_est
+            s = 1.0
+            if vc.size:
+                dv_m = float(np.max(np.abs(dx[vc])))
+                if dv_m > 0.35:
+                    s = min(s, 0.35 / dv_m)
+            if ac.size:
+                da_m = float(np.max(np.abs(dx[ac])))
+                if da_m > 0.75:
+                    s = min(s, 0.75 / da_m)
+            cand = x + s * dx
+            if _oob(cand):
+                try_lam = max(try_lam * 10.0, 1e-3)
+                if try_lam > 1e5:
+                    break
+                continue
+            evaluate_fn(cand, cand_z)
+            residual_fn(cand_z, cand_r)
+            cand_obj = float(np.dot(w_cur, cand_r * cand_r))
+            if np.isfinite(cand_obj) and cand_obj <= obj + max(1e-12, 1e-10 * (abs(obj) + 1.0)):
+                x = cand
+                z_est, cand_z = cand_z, z_est
+                res, cand_r = cand_r, res
+                accepted = True
+                if s == 1.0:
+                    lam = 0.0 if try_lam <= 1e-5 else try_lam * 0.25
+                else:
+                    lam = max(try_lam, 1e-3)
+                if max_dx < tol and try_lam > 0.0:
+                    lam = 0.0
+                break
+            try_lam = max(try_lam * 5.0, 1e-3)
+            if try_lam > 1e5:
+                break
+        if not accepted:
+            break
+    return x, res, z_est
+
+
+def compute_active_column_degrees(
+    H,
+    active_mask: np.ndarray,
+    weights: np.ndarray,
+) -> Optional[np.ndarray]:
+    """统计当前活跃（有效且权重大于零）量测在稀疏雅可比矩阵各状态列上的非零覆盖度。"""
+    if H is None or not is_sparse_matrix(H):
+        return None
+    n_rows, n_cols = int(H.shape[0]), int(H.shape[1])
+    if n_cols == 0:
+        return np.empty(0, dtype=np.int32)
+    mask_arr = np.asarray(active_mask, dtype=bool)
+    w_arr = np.asarray(weights, dtype=np.float64)
+    if mask_arr.size != n_rows or w_arr.size != n_rows:
+        return None
+    act = mask_arr & (w_arr > 0.0)
+    H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+    act_rows = np.flatnonzero(act)
+    if act_rows.size == 0:
+        return np.zeros(n_cols, dtype=np.int32)
+    sub = H_csr[act_rows]
+    return np.bincount(sub.indices, minlength=n_cols).astype(np.int32, copy=False)
+
+
+def filter_batch_preserving_column_coverage(
+    H_csr,
+    candidate_rows: Sequence[int],
+    col_degrees: Optional[np.ndarray],
+) -> Tuple[List[int], List[int]]:
+    """按候选顺序贪心筛选不会使任何状态列活跃覆盖度归零的安全删除子批。
+
+    返回 ``(safe_local_indices, blocked_local_indices)``，均为 ``candidate_rows`` 的局部下标。
+    单条或多条删除若会导致原本有支撑的状态列覆盖度归零，必然引起正规方程严格奇异，
+    此处在 O(nnz) 微秒级前置拦截，避免删除临界量测或同时删除临界量测对。
+    """
+    n_cand = len(candidate_rows)
+    if n_cand == 0 or H_csr is None or col_degrees is None:
+        return list(range(n_cand)), []
+    indptr = H_csr.indptr
+    indices = H_csr.indices
+    n_rows = int(H_csr.shape[0])
+    n_cols = int(col_degrees.size)
+    pending_dec: Dict[int, int] = {}
+    safe_idx: List[int] = []
+    blocked_idx: List[int] = []
+    for local_i, raw_row in enumerate(candidate_rows):
+        r = int(raw_row)
+        if not (0 <= r < n_rows):
+            safe_idx.append(local_i)
+            continue
+        cols = indices[indptr[r] : indptr[r + 1]]
+        if cols.size == 0:
+            safe_idx.append(local_i)
+            continue
+        # 去重以防稀疏矩阵存在重复列项
+        uniq_cols = cols if cols.size <= 1 else np.unique(cols)
+        would_zero = False
+        for c_val in uniq_cols:
+            c = int(c_val)
+            if 0 <= c < n_cols:
+                deg = int(col_degrees[c])
+                if deg > 0 and (deg - pending_dec.get(c, 0)) <= 1:
+                    would_zero = True
+                    break
+        if would_zero:
+            blocked_idx.append(local_i)
+        else:
+            safe_idx.append(local_i)
+            for c_val in uniq_cols:
+                c = int(c_val)
+                if 0 <= c < n_cols and int(col_degrees[c]) > 0:
+                    pending_dec[c] = pending_dec.get(c, 0) + 1
+    return safe_idx, blocked_idx
+
+
+def check_active_structural_full_rank(
+    H,
+    active_mask: np.ndarray,
+    weights: np.ndarray,
+) -> bool:
+    """检查剔除坏数据后的活跃雅可比子矩阵是否保持结构列满秩（防临界对/临界环致奇异）。"""
+    if H is None or not is_sparse_matrix(H):
+        return True
+    n_rows, n_cols = int(H.shape[0]), int(H.shape[1])
+    if n_cols == 0:
+        return True
+    mask_arr = np.asarray(active_mask, dtype=bool)
+    w_arr = np.asarray(weights, dtype=np.float64)
+    if mask_arr.size != n_rows or w_arr.size != n_rows:
+        return True
+    act_rows = np.flatnonzero(mask_arr & (w_arr > 0.0))
+    if act_rows.size < n_cols:
+        return False
+    H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+    sub = H_csr[act_rows]
+    # 快速短路：任意列覆盖度为 0 则必然结构秩亏
+    if np.any(np.bincount(sub.indices, minlength=n_cols) == 0):
+        return False
+    return int(sparse_structural_rank(sub)) >= n_cols
+

@@ -4,7 +4,73 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from model.meas_type import DEVICE_TYPE_CODES, DEVICE_TYPE_NAMES, MEAS_TYPE_NAMES
+from model.meas_type import (
+    DEVICE_TYPE_ACBreakConstraint,
+    DEVICE_TYPE_ACPowerBalance,
+    DEVICE_TYPE_ACSwitchConstraint,
+    DEVICE_TYPE_ACZeroBranchConstraint,
+    DEVICE_TYPE_CODES,
+    DEVICE_TYPE_DCBreakConstraint,
+    DEVICE_TYPE_DCSwitchConstraint,
+    DEVICE_TYPE_DCZeroBranchConstraint,
+    DEVICE_TYPE_NAMES,
+    MEAS_TYPE_NAMES,
+    MEAS_TYPE_P_AC,
+    MEAS_TYPE_P_BALANCE,
+    MEAS_TYPE_P_DC,
+    MEAS_TYPE_P_FROM,
+    MEAS_TYPE_P_GEN,
+    MEAS_TYPE_P_IN,
+    MEAS_TYPE_P_LOAD,
+    MEAS_TYPE_P_OUT,
+    MEAS_TYPE_P_THIRD,
+    MEAS_TYPE_P_TO,
+    MEAS_TYPE_Q_AC,
+    MEAS_TYPE_Q_BALANCE,
+    MEAS_TYPE_Q_FROM,
+    MEAS_TYPE_Q_GEN,
+    MEAS_TYPE_Q_LOAD,
+    MEAS_TYPE_Q_THIRD,
+    MEAS_TYPE_Q_TO,
+    MEAS_TYPE_V,
+    MEAS_TYPE_V_AC,
+    MEAS_TYPE_V_DC,
+    MEAS_TYPE_V_FROM,
+    MEAS_TYPE_V_GEN,
+    MEAS_TYPE_V_LOAD,
+    MEAS_TYPE_V_THIRD,
+    MEAS_TYPE_V_TO,
+)
+
+VOLTAGE_PSEUDO_MEAS_TYPE_CODES = (
+    MEAS_TYPE_V,
+    MEAS_TYPE_V_FROM,
+    MEAS_TYPE_V_TO,
+    MEAS_TYPE_V_THIRD,
+    MEAS_TYPE_V_LOAD,
+    MEAS_TYPE_V_GEN,
+    MEAS_TYPE_V_DC,
+    MEAS_TYPE_V_AC,
+)
+POWER_PSEUDO_MEAS_TYPE_CODES = (
+    MEAS_TYPE_P_FROM,
+    MEAS_TYPE_Q_FROM,
+    MEAS_TYPE_P_TO,
+    MEAS_TYPE_Q_TO,
+    MEAS_TYPE_P_THIRD,
+    MEAS_TYPE_Q_THIRD,
+    MEAS_TYPE_P_LOAD,
+    MEAS_TYPE_Q_LOAD,
+    MEAS_TYPE_P_GEN,
+    MEAS_TYPE_Q_GEN,
+    MEAS_TYPE_P_DC,
+    MEAS_TYPE_P_AC,
+    MEAS_TYPE_Q_AC,
+    MEAS_TYPE_P_IN,
+    MEAS_TYPE_P_OUT,
+)
+_VOLTAGE_PSEUDO_CODE_SET = frozenset(VOLTAGE_PSEUDO_MEAS_TYPE_CODES)
+_POWER_PSEUDO_CODE_SET = frozenset(POWER_PSEUDO_MEAS_TYPE_CODES)
 
 MEAS_STATUS_NORMAL = 0
 MEAS_STATUS_INVALID = 1
@@ -355,6 +421,39 @@ def measurement_table_status_code(table: MeasurementTable) -> np.ndarray:
     return table.status_code
 
 
+def measurement_table_bad_data_protected_mask(table: MeasurementTable) -> np.ndarray:
+    """返回坏数据辨识与剔除阶段不可删除的受保护掩码（含伪量测、零注入/功率平衡量测及内部物理等式约束）。"""
+    status_code = measurement_table_status_code(table)
+    protected = status_code == MEAS_STATUS_PSEUDO
+    dt_code = getattr(table, "device_type_code", None)
+    if dt_code is not None and int(np.asarray(dt_code).size) == protected.size:
+        dt_arr = np.asarray(dt_code, dtype=np.int16)
+        constraint_mask = (
+            (dt_arr == DEVICE_TYPE_ACPowerBalance)
+            | (dt_arr == DEVICE_TYPE_ACZeroBranchConstraint)
+            | (dt_arr == DEVICE_TYPE_ACSwitchConstraint)
+            | (dt_arr == DEVICE_TYPE_ACBreakConstraint)
+            | (dt_arr == DEVICE_TYPE_DCZeroBranchConstraint)
+            | (dt_arr == DEVICE_TYPE_DCSwitchConstraint)
+            | (dt_arr == DEVICE_TYPE_DCBreakConstraint)
+        )
+        if np.any(constraint_mask):
+            protected = protected | constraint_mask
+    mt_code = getattr(table, "meas_type_code", None)
+    if mt_code is not None and int(np.asarray(mt_code).size) == protected.size:
+        mt_arr = np.asarray(mt_code, dtype=np.int16)
+        balance_mt_mask = (mt_arr == MEAS_TYPE_P_BALANCE) | (mt_arr == MEAS_TYPE_Q_BALANCE)
+        if np.any(balance_mt_mask):
+            protected = protected | balance_mt_mask
+    dt_names = getattr(table, "device_type", None)
+    if dt_names is not None and int(np.asarray(dt_names).size) == protected.size:
+        dt_obj = np.asarray(dt_names, dtype=object)
+        dc_balance_mask = (dt_obj == "ACPowerBalance") | (dt_obj == "DCPowerBalance")
+        if np.any(dc_balance_mask):
+            protected = protected | dc_balance_mask
+    return protected
+
+
 def measurement_table_from_measurements(
     measurements: Sequence[Measurement],
     *,
@@ -521,6 +620,53 @@ class BadDataItem:
     estimated_value: float
     measured_value: float
     row_pos: int = -1
+
+
+def normalize_pseudo_measurement_arrays(
+    meas_type_code: np.ndarray,
+    values: np.ndarray,
+    weights: np.ndarray,
+    *,
+    weight_v: float,
+    weight_pq: float,
+    preserve_explicit_pq_weight: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """统一规范不可观测区域伪量测的值与权重：
+    - 电压类伪量测：值统一为 1.0，权重统一为 weight_v（默认 0.1）；
+    - 有功/无功类伪量测：值统一为 0.0，权重默认使用 weight_pq（默认 0.01）。
+    """
+    codes = np.asarray(meas_type_code, dtype=np.int16)
+    out_values = np.array(values, dtype=np.float64, copy=True)
+    out_weights = np.array(weights, dtype=np.float64, copy=True)
+    if codes.size == 0:
+        return out_values, out_weights
+    v_mask = np.isin(codes, VOLTAGE_PSEUDO_MEAS_TYPE_CODES)
+    if np.any(v_mask):
+        out_values[v_mask] = 1.0
+        out_weights[v_mask] = float(weight_v)
+    pq_mask = np.isin(codes, POWER_PSEUDO_MEAS_TYPE_CODES)
+    if np.any(pq_mask):
+        out_values[pq_mask] = 0.0
+        if not preserve_explicit_pq_weight:
+            out_weights[pq_mask] = float(weight_pq)
+    return out_values, out_weights
+
+
+def normalize_pseudo_measurement_object(
+    measurement: Measurement,
+    *,
+    weight_v: float,
+    weight_pq: float,
+) -> Measurement:
+    """统一规范单条伪量测对象的值与权重。"""
+    code = int(getattr(measurement, "meas_type_code", 0))
+    if code in _VOLTAGE_PSEUDO_CODE_SET:
+        measurement.value = 1.0
+        measurement.weight = float(weight_v)
+    elif code in _POWER_PSEUDO_CODE_SET:
+        measurement.value = 0.0
+        measurement.weight = float(weight_pq)
+    return measurement
 
 
 def print_iteration_header() -> None:

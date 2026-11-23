@@ -44,7 +44,8 @@ SE_PARAMS = algorithm_parameters.StateEstimationParameters(
     flat_start=True,
     bad_threshold=3.0,
     max_remove=10,
-    pseudo_measurement_weight=1e-3,
+    pseudo_measurement_weight_v=0.1,
+    pseudo_measurement_weight_pq=0.01,
     targeted_pseudo_measurement_max=200,
     targeted_pseudo_measurement_redundancy_ratio=0.0,
     targeted_pseudo_measurement_step=10,
@@ -2677,6 +2678,809 @@ def test_native_kernels_equivalence_and_env_fallback(monkeypatch):
         Gu_ref = np.triu(G_ref)
         assert np.allclose(Gu_nat, Gu_ref, rtol=1e-13, atol=1e-13)
         assert np.allclose(a_fast, a_nat, rtol=1e-14, atol=1e-14)
+
+
+def test_missing_voltage_column_defaults_to_one_pu(tmp_path):
+    """验证 E 文件节点表缺少 voltage 列（或为空）时按标幺 1.0 p.u. 初始化，而非 1.0/vbase。"""
+    from model.ac_array_model import build_ac_ppc_from_e_file
+    from model.dc_array_model import build_dc_ppc_from_e_file
+
+    ac_text = (
+        "<Model>\n"
+        "@ name p_base u_unit p_unit i_unit\n"
+        "# ac_no_v 100 V kW A\n"
+        "</Model>\n"
+        "<ACNode>\n"
+        "@ idx name vbase angle isl run_stat\n"
+        "# 1 n1 380 0 0 1\n"
+        "# 2 n2 380 0 0 1\n"
+        "</ACNode>\n"
+    )
+    ac_file = tmp_path / "ac_no_v.e"
+    ac_file.write_text(ac_text, encoding="utf-8")
+    ac_ppc = build_ac_ppc_from_e_file(ac_file)
+    ac_v = ac_ppc["bus"][:, ac_ppc["bus_cols"]["voltage"]]
+    assert np.allclose(ac_v, 1.0)
+
+    dc_text = (
+        "<Model>\n"
+        "@ name p_base u_unit p_unit i_unit\n"
+        "# dc_no_v 100 V kW A\n"
+        "</Model>\n"
+        "<DCNode>\n"
+        "@ idx name vbase isl run_stat\n"
+        "# 1 d1 750 0 1\n"
+        "# 2 d2 750 0 1\n"
+        "</DCNode>\n"
+    )
+    dc_file = tmp_path / "dc_no_v.e"
+    dc_file.write_text(dc_text, encoding="utf-8")
+    dc_ppc = build_dc_ppc_from_e_file(dc_file)
+    dc_v = dc_ppc["bus"][:, dc_ppc["bus_cols"]["voltage"]]
+    assert np.allclose(dc_v, 1.0)
+
+
+def test_internal_constraint_measurements_protected_from_bad_data_removal():
+    """验证内部物理约束（ACPowerBalance、零阻抗/开关/断路器约束）受坏数据不可删保护。"""
+    from model.meas_model import (
+        MEAS_STATUS_NORMAL,
+        MEAS_STATUS_PSEUDO,
+        MeasurementTable,
+        measurement_table_bad_data_protected_mask,
+    )
+    from model.meas_type import (
+        DEVICE_TYPE_ACBreakConstraint,
+        DEVICE_TYPE_ACNode,
+        DEVICE_TYPE_ACPowerBalance,
+        DEVICE_TYPE_ACSwitchConstraint,
+        DEVICE_TYPE_ACZeroBranchConstraint,
+        DEVICE_TYPE_DCBreakConstraint,
+        DEVICE_TYPE_DCNode,
+        DEVICE_TYPE_DCSwitchConstraint,
+        DEVICE_TYPE_DCZeroBranchConstraint,
+    )
+
+    dt = np.array(
+        [
+            DEVICE_TYPE_ACNode,
+            DEVICE_TYPE_ACNode,
+            DEVICE_TYPE_ACPowerBalance,
+            DEVICE_TYPE_ACZeroBranchConstraint,
+            DEVICE_TYPE_ACSwitchConstraint,
+            DEVICE_TYPE_ACBreakConstraint,
+            DEVICE_TYPE_DCNode,
+            DEVICE_TYPE_DCZeroBranchConstraint,
+            DEVICE_TYPE_DCSwitchConstraint,
+            DEVICE_TYPE_DCBreakConstraint,
+        ],
+        dtype=np.int16,
+    )
+    st = np.array(
+        [
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_PSEUDO,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+            MEAS_STATUS_NORMAL,
+        ],
+        dtype=np.int16,
+    )
+    tbl = MeasurementTable(
+        idx=np.arange(dt.size, dtype=np.int64),
+        name=np.asarray([], dtype=object),
+        device_type=np.asarray([], dtype=object),
+        device_name=np.asarray([], dtype=object),
+        meas_type=np.asarray([], dtype=object),
+        weight=np.ones(dt.size, dtype=np.float64),
+        valid=np.ones(dt.size, dtype=bool),
+        value=np.zeros(dt.size, dtype=np.float64),
+        device_type_code=dt,
+        angle_mask=np.zeros(dt.size, dtype=bool),
+        status_code=st,
+    )
+    mask = measurement_table_bad_data_protected_mask(tbl)
+    expected = np.array([False, True, True, True, True, True, False, True, True, True], dtype=bool)
+    assert np.array_equal(mask, expected)
+
+
+def test_se_iteration_divergence_bounds_and_max_iter_exit(tmp_path):
+    """验证迭代次数上限（默认200）、电压上下界与相角上下界越界立即判定失败退出。"""
+    # 1. 验证 load_se_parameters 默认值（max_iter=200, voltage=[0.1, 1.9], angle=[-270, 270]）
+    para_text = (
+        "<StateEstimationParameter>\n"
+        "@ name value\n"
+        "# tol 1e-6\n"
+        "# diff_step 1e-6\n"
+        "# flat_start true\n"
+        "# bad_threshold 4.0\n"
+        "# max_remove 10\n"
+        "# pseudo_measurement_weight 1e-2\n"
+        "# targeted_pseudo_measurement_max 50\n"
+        "# voltage_floor 0.1\n"
+        "# min_current_voltage 0.1\n"
+        "# power_flow_tol 1e-6\n"
+        "# power_flow_max_iter 50\n"
+        "# power_flow_min_voltage 0.1\n"
+        "</StateEstimationParameter>\n"
+    )
+    para_file = tmp_path / "se_default.para"
+    para_file.write_text(para_text, encoding="utf-8")
+    loaded = algorithm_parameters.load_se_parameters(para_file)
+    assert loaded.max_iter == 200
+    assert loaded.voltage_min == pytest.approx(0.1)
+    assert loaded.voltage_max == pytest.approx(1.9)
+    assert loaded.angle_min_deg == pytest.approx(-270.0)
+    assert loaded.angle_max_deg == pytest.approx(270.0)
+
+    # 2. 验证 AC / DC / Hybrid 在电压或相角超界时立即退出并判定失败
+    ac_dir = tmp_path / "ac_bounds"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(6, ac_dir)
+    ac_est = ACStateEstimator(
+        ac_e,
+        ac_m,
+        parameters=SE_PARAMS,
+        voltage_min=0.1,
+        voltage_max=1.9,
+        angle_min_deg=-270.0,
+        angle_max_deg=270.0,
+    )
+    x_v_high = ac_est.initial_state().copy()
+    x_v_high[ac_est.n_angle] = 1.95
+    res_v_high = ac_est.estimate(x0=x_v_high)
+    assert not res_v_high.converged
+    assert res_v_high.iterations == 1
+
+    x_a_high = ac_est.initial_state().copy()
+    if ac_est.n_angle > 0:
+        x_a_high[0] = np.deg2rad(275.0)
+        res_a_high = ac_est.estimate(x0=x_a_high)
+        assert not res_a_high.converged
+        assert res_a_high.iterations == 1
+
+    dc_dir = tmp_path / "dc_bounds"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(6, dc_dir)
+    dc_est = DCStateEstimator(
+        dc_e,
+        dc_m,
+        parameters=SE_PARAMS,
+        voltage_min=0.1,
+        voltage_max=1.9,
+    )
+    x_dc_low = dc_est.initial_state().copy()
+    x_dc_low[0] = 0.05
+    res_dc_low = dc_est.estimate(x0=x_dc_low)
+    assert not res_dc_low.converged
+    assert res_dc_low.iterations == 1
+
+    hy_dir = tmp_path / "hy_bounds"
+    hy_dir.mkdir(parents=True, exist_ok=True)
+    hy_e, hy_m = _generate_hybrid_case(6, 4, hy_dir)
+    hy_est = HybridStateEstimator(
+        hy_e,
+        hy_m,
+        parameters=SE_PARAMS,
+        voltage_min=0.1,
+        voltage_max=1.9,
+        angle_min_deg=-270.0,
+        angle_max_deg=270.0,
+    )
+    x_hy_high = hy_est.initial_state().copy()
+    x_hy_high[hy_est.voltage_cols[0]] = 2.05
+    res_hy_high = hy_est.estimate(x0=x_hy_high)
+    assert not res_hy_high.converged
+    assert res_hy_high.iterations == 1
+
+    # 3. 验证最大迭代次数超限退出（设为 1 轮且极严容差确保不收敛退出）
+    ac_est_iter1 = ACStateEstimator(
+        ac_e,
+        ac_m,
+        parameters=SE_PARAMS,
+        max_iter=1,
+        tol=1e-15,
+        flat_start=True,
+    )
+    res_iter1 = ac_est_iter1.estimate()
+    assert res_iter1.iterations <= 1
+
+
+def test_bad_data_batch_backoff_prevents_ping_pong(tmp_path, monkeypatch):
+    """验证大批量剔除试探失败时自动折半收缩并退避，不再反复以同一大批量撞墙死循环。"""
+    dc_dir = tmp_path / "dc_backoff"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(25, dc_dir, seed=2025)
+    # 在 .meas 文件中给 4 条相互远离的节点电压量测注入大坏数据，制造批删场景
+    lines = dc_m.read_text(encoding="utf-8").splitlines()
+    injected = 0
+    new_lines = []
+    v_seen = 0
+    for ln in lines:
+        if ln.startswith("#") and " DCNode " in ln and " V " in ln:
+            if v_seen % 6 == 0 and injected < 4:
+                parts = ln.split()
+                parts[-1] = f"{float(parts[-1]) * 1.60:.6f}"
+                ln = " ".join(parts)
+                injected += 1
+            v_seen += 1
+        new_lines.append(ln)
+    assert injected == 4
+    dc_m.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS, flat_start=True)
+    orig_estimate = est.estimate
+    batch_trial_sizes = []
+    accepted_dropped = [0]
+
+    def _wrapped_estimate(*args, **kwargs):
+        w_ov = kwargs.get("_weight_override")
+        if w_ov is not None:
+            total_dropped = int(np.count_nonzero(np.asarray(w_ov) == 0.0))
+            delta = total_dropped - accepted_dropped[0]
+            if delta >= 2:
+                batch_trial_sizes.append(delta)
+                # 强制模拟单轮批删 >=2 条发散，验证自动折半退避后仍可平稳收敛
+                res = orig_estimate(*args, **kwargs)
+                res.converged = False
+                return res
+            res = orig_estimate(*args, **kwargs)
+            if res.converged:
+                accepted_dropped[0] = total_dropped
+            return res
+        return orig_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(est, "estimate", _wrapped_estimate)
+    res, removed = est.estimate_with_bad_data_removal(threshold=4.0, max_remove=10)
+    assert res.converged
+    assert len(removed) >= 2
+    # 批删试探失败一次后应收缩 dynamic_batch_cap 并进入退避，不会反复以同大批量撞墙
+    assert len(batch_trial_sizes) <= 2
+
+
+def test_island_fixed_voltage_bus_selection_and_robust_average(tmp_path):
+    """验证每拓扑岛选取合理有效电压量测最多的母线设为定电压母线，含跨设备/断路器双端汇总与稳健去极值均值。"""
+    from secore.se_math import select_island_fixed_voltage_reference_buses
+
+    # 1. 单元测试核心选优算法：2 个电气岛，岛 0 中母线 1 有 4 条合理电压（含 1 条离群坏数据 1.19 -> 过滤后均值 1.00），
+    #    母线 0 只有 2 条，母线 2 有 5 条但全为不合理越界坏数据 1.60（应被合理性筛选排除）；
+    #    岛 1 只有母线 3（2 条均值 0.98）。
+    sample_pos = np.array([0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3], dtype=np.int64)
+    sample_val = np.array(
+        [
+            1.02, 1.04,             # comp 0: 2 条
+            0.99, 1.00, 1.01, 1.19, # comp 1: 4 条合理，其中 1.19 偏离中位数 1.005 > 0.15 被剔除 -> 均值 1.00
+            1.60, 1.62, 1.58, 1.65, 1.70, # comp 2: 5 条均超出 [0.8, 1.2] 不合理区间
+            0.96, 1.00,             # comp 3 (岛 1): 2 条 -> 均值 0.98
+        ],
+        dtype=np.float64,
+    )
+    comp_by_pos = np.array([0, 1, 2, 3], dtype=np.int64)
+    isl_by_pos = np.array([0, 0, 0, 1], dtype=np.int64)
+    alive = np.array([True, True], dtype=bool)
+    chosen = select_island_fixed_voltage_reference_buses(
+        sample_pos,
+        sample_val,
+        comp_by_pos,
+        4,
+        isl_by_pos,
+        island_alive_mask=alive,
+    )
+    assert set(chosen.keys()) == {1, 3}
+    assert chosen[1] == pytest.approx(1.00, abs=1e-9)
+    assert chosen[3] == pytest.approx(0.98, abs=1e-9)
+
+    # 2. 端到端 AC 验证：给某母线额外挂接多条支路 V_FROM/V_TO 与发/负荷电压量测，确认该母线被选为定电压母线，
+    #    电压估计值等于其合理有效电压量测均值，且注入到该母线的一条大坏数据（+60%）既不污染定电压基准又能被精准剔除
+    ac_dir = tmp_path / "ac_ref_v"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(9, ac_dir, seed=2026)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    # 找到 bus_5 的真实电压值，并给连向 bus_5 的支路添加多条 V_FROM/V_TO 使其成为电压测点数最多的母线
+    bus5_v = None
+    max_idx = 0
+    for ln in lines:
+        if ln.startswith("#"):
+            parts = ln.split()
+            max_idx = max(max_idx, int(parts[1]))
+            if " ACNode bus_5 V " in ln:
+                bus5_v = float(parts[-1])
+    assert bus5_v is not None
+    # 在 </Measurement> 前追加 4 条与 bus_5 关联的支路端电压（带正负对称偏差，均值精确等于 bus5_v）+ 1 条不合理大坏数据
+    extra_meas = []
+    # 查找挂在 bus_5 的支路名（bus_5 对应 idx=5，在 3x3 网格中连向 bus_2/bus_4/bus_6/bus_8）
+    e_lines = ac_e.read_text(encoding="utf-8").splitlines()
+    br_to_5 = []
+    br_from_5 = []
+    for ln in e_lines:
+        if ln.startswith("#") and " br_" in ln:
+            parts = ln.split()
+            if parts[3] == "5":
+                br_from_5.append(parts[2])
+            elif parts[4] == "5":
+                br_to_5.append(parts[2])
+    offsets = [-0.02, -0.01, +0.01, +0.02]
+    k = 0
+    for bname in br_from_5:
+        max_idx += 1
+        extra_meas.append(f"# {max_idx} extra_vf_{max_idx} ACBranch {bname} V_FROM 100.0 1 {bus5_v * (1.0 + offsets[k % 4]):.6f}")
+        k += 1
+    for bname in br_to_5:
+        max_idx += 1
+        extra_meas.append(f"# {max_idx} extra_vt_{max_idx} ACBranch {bname} V_TO 100.0 1 {bus5_v * (1.0 + offsets[k % 4]):.6f}")
+        k += 1
+    # 追加 1 条明显不合理的大坏数据（+60%）挂在 bus_5 上
+    max_idx += 1
+    bad_idx = max_idx
+    extra_meas.append(f"# {bad_idx} bad_v_bus5 ACNode bus_5 V 100.0 1 {bus5_v * 1.60:.6f}")
+    out_lines = [ln for ln in lines if ln.strip() != "</Measurement>"] + extra_meas + ["</Measurement>"]
+    ac_m.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+    ac_est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS, flat_start=True)
+    # 确认 bus_5 被选为定电压参考母线，且其定电压值未被 +60% 坏数据拉偏
+    bus5_pos = int(np.nonzero(np.asarray(ac_est._ac_node_names) == "bus_5")[0][0])
+    assert bus5_pos in ac_est.ref_voltages
+    assert abs(float(ac_est.ref_voltages[bus5_pos]) - bus5_v / 110.0) < 1e-2
+    res_ac, rem_ac = ac_est.estimate_with_bad_data_removal(threshold=3.5, max_remove=5)
+    assert res_ac.converged
+    assert any(int(item.measurement.idx) == bad_idx for item in rem_ac)
+
+    # 3. 端到端 DC 验证：每岛存在合理有效电压量测时选出定电压母线并稳定收敛
+    dc_dir = tmp_path / "dc_ref_v"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(9, dc_dir, seed=2027)
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS, flat_start=True)
+    assert len(dc_est.ref_voltages) >= 1
+    res_dc = dc_est.estimate()
+    assert res_dc.converged
+
+
+def test_ac_initial_state_nonflat_rebases_angles_without_reference_tear(tmp_path):
+    """验证不含相角量测且参考母线初始相角非零时，initial_state(flat=False) 一致平移全岛相角无断层。"""
+    ac_dir = tmp_path / "ac_rebase"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(6, ac_dir, seed=2028)
+    est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS, flat_start=True)
+    # 人为给全网 file_theta 叠加统一偏置 -20°，验证打包/解包后所有节点间相角差严格守恒
+    orig_theta = np.linspace(-0.35, -0.25, est.n_nodes)
+    est.file_theta = orig_theta.copy()
+    x_nonflat = est.initial_state(flat=False)
+    th_unpacked, _ = est._unpack_state(x_nonflat)
+    ref_pos = int(next(iter(est.ref_idx)))
+    assert abs(float(th_unpacked[ref_pos])) < 1e-12
+    expected_shifted = orig_theta - orig_theta[ref_pos]
+    assert np.allclose(th_unpacked, expected_shifted, atol=1e-12)
+
+
+def test_default_max_iter_200_and_unconverged_bad_data_circuit_breaker(tmp_path):
+    """验证缺省 max_iter 为 200，且持续不收敛时坏数据剔除自动熔断不陷入超长循环。"""
+    para_path = tmp_path / "se_default.para"
+    para_path.write_text(
+        "<StateEstimationParameter>\n"
+        "@ name value\n"
+        "# tol 1e-6\n"
+        "# diff_step 1e-6\n"
+        "# flat_start true\n"
+        "# bad_threshold 4.0\n"
+        "# max_remove 100\n"
+        "# pseudo_measurement_weight 1e-3\n"
+        "# targeted_pseudo_measurement_max 50\n"
+        "# voltage_floor 0.1\n"
+        "# min_current_voltage 1e-3\n"
+        "# power_flow_tol 1e-7\n"
+        "# power_flow_max_iter 50\n"
+        "# power_flow_min_voltage 0.1\n"
+        "</StateEstimationParameter>\n",
+        encoding="utf-8",
+    )
+    loaded = algorithm_parameters.load_se_parameters(para_path)
+    assert loaded.max_iter == 200
+
+    # 构造带多条坏数据但 max_iter=1 持续无法收敛的场景，确认外层熔断不会循环跑满 max_remove=50 次
+    ac_dir = tmp_path / "ac_cb"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(9, ac_dir, seed=2029)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    injected = 0
+    for ln in lines:
+        if ln.startswith("#") and " ACBranch " in ln and " P_FROM " in ln and injected < 6:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) + 25.0:.6f}"
+            edited.append(" ".join(parts))
+            injected += 1
+        else:
+            edited.append(ln)
+    ac_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    cb_params = SE_PARAMS.with_overrides(max_iter=1, max_remove=50, bad_threshold=2.0)
+    est = ACStateEstimator(ac_e, ac_m, parameters=cb_params, flat_start=True)
+    call_count = 0
+    orig_est = est.estimate
+
+    def _counted_estimate(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return orig_est(*args, **kwargs)
+
+    est.estimate = _counted_estimate
+    res, removed = est.estimate_with_bad_data_removal(threshold=2.0, max_remove=50)
+    assert not res.converged
+    assert call_count <= 25
+    assert len(removed) <= 10
+
+
+def test_pseudo_measurement_split_weights_and_default_values(tmp_path):
+    """验证伪量测双权重参数（V=0.1, PQ=0.01）与默认值（电压伪量测=1.0、有功/无功伪量测=0.0）。"""
+    # 1. 验证 load_se_parameters 缺省读取与自定义覆盖
+    para_default = tmp_path / "se_split_default.para"
+    para_default.write_text(
+        "<StateEstimationParameter>\n"
+        "@ name value\n"
+        "# tol 1e-6\n"
+        "# diff_step 1e-6\n"
+        "# flat_start true\n"
+        "# bad_threshold 4.0\n"
+        "# max_remove 10\n"
+        "# targeted_pseudo_measurement_max 50\n"
+        "# voltage_floor 0.1\n"
+        "# min_current_voltage 1e-3\n"
+        "# power_flow_tol 1e-7\n"
+        "# power_flow_max_iter 50\n"
+        "# power_flow_min_voltage 0.1\n"
+        "</StateEstimationParameter>\n",
+        encoding="utf-8",
+    )
+    loaded = algorithm_parameters.load_se_parameters(para_default)
+    assert loaded.pseudo_measurement_weight_v == pytest.approx(0.1)
+    assert loaded.pseudo_measurement_weight_pq == pytest.approx(0.01)
+    overridden = loaded.with_overrides(pseudo_measurement_weight_v=0.25, pseudo_measurement_weight_pq=0.02)
+    assert overridden.pseudo_measurement_weight_v == pytest.approx(0.25)
+    assert overridden.pseudo_measurement_weight_pq == pytest.approx(0.02)
+
+    # 2. 端到端 AC 盲区验证：移除部分节点的真实 V 与 P/Q 量测，确认生成的电压伪量测为 1.0@0.25、有功无功伪量测为 0.0@0.02
+    ac_dir = tmp_path / "ac_pseudo_split"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(9, ac_dir, seed=2030)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    # 去掉 bus_6、bus_7 的所有真实量测制造不可观测盲区
+    filtered = [ln for ln in lines if not (ln.startswith("#") and (" bus_6 " in ln or " bus_7 " in ln or " load_6 " in ln or " load_7 " in ln))]
+    ac_m.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+
+    p_custom = SE_PARAMS.with_overrides(pseudo_measurement_weight_v=0.25, pseudo_measurement_weight_pq=0.02)
+    est = ACStateEstimator(ac_e, ac_m, parameters=p_custom, flat_start=True)
+    tbl = est._active_measurement_table_ref()
+    from model.meas_model import (
+        MEAS_STATUS_PSEUDO,
+        POWER_PSEUDO_MEAS_TYPE_CODES,
+        VOLTAGE_PSEUDO_MEAS_TYPE_CODES,
+        measurement_table_status_code,
+    )
+    st = measurement_table_status_code(tbl)
+    mt = np.asarray(tbl.meas_type_code, dtype=np.int16)
+    is_pseudo = st == MEAS_STATUS_PSEUDO
+    v_pseudo = is_pseudo & np.isin(mt, VOLTAGE_PSEUDO_MEAS_TYPE_CODES)
+    pq_pseudo = is_pseudo & np.isin(mt, POWER_PSEUDO_MEAS_TYPE_CODES)
+    assert np.any(v_pseudo)
+    assert np.any(pq_pseudo)
+    assert np.allclose(tbl.value[v_pseudo], 1.0)
+    assert np.allclose(tbl.weight[v_pseudo], 0.25)
+    assert np.allclose(tbl.value[pq_pseudo], 0.0)
+    assert np.allclose(tbl.weight[pq_pseudo], 0.02)
+    res = est.estimate()
+    assert res.converged
+
+
+def test_zero_branch_topology_pseudo_weight_matches_pq_param(tmp_path):
+    """验证零阻抗支路/断路器有功无功伪量测权重与 pseudo_measurement_weight_pq 保持一致，不再乘 1e-4 异常降权。"""
+    from model.meas_model import (
+        MEAS_STATUS_PSEUDO,
+        POWER_PSEUDO_MEAS_TYPE_CODES,
+        measurement_table_status_code,
+    )
+    from model.meas_type import DEVICE_TYPE_ACBreak, DEVICE_TYPE_ACZeroBranch, DEVICE_TYPE_DCBreak, DEVICE_TYPE_DCZeroBranch
+
+    ac_params = SE_PARAMS.with_overrides(pseudo_measurement_weight_v=0.1, pseudo_measurement_weight_pq=0.01)
+
+    # 1. AC 含无量测 ACZeroBranch 的自包含模型
+    ac_dir = tmp_path / "ac_zbr_pseudo"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(9, ac_dir, seed=2031)
+    ac_text = ac_e.read_text(encoding="utf-8")
+    ac_text = ac_text.replace(
+        "</ACNode>",
+        "# 10 bus_10 110.0 110.0 0.0 1 1\n</ACNode>",
+    )
+    ac_text += "\n<ACZeroBranch>\n@ idx name i_node j_node run_stat\n# 1 zbr_1 9 10 1\n</ACZeroBranch>\n"
+    ac_e.write_text(ac_text, encoding="utf-8")
+
+    ac_est = ACStateEstimator(ac_e, ac_m, parameters=ac_params, flat_start=True)
+    ac_tbl = ac_est._active_measurement_table_ref()
+    ac_st = measurement_table_status_code(ac_tbl)
+    ac_dt = np.asarray(ac_tbl.device_type_code, dtype=np.int16)
+    ac_mt = np.asarray(ac_tbl.meas_type_code, dtype=np.int16)
+    ac_topo_pq = (
+        (ac_st == MEAS_STATUS_PSEUDO)
+        & np.isin(ac_dt, (DEVICE_TYPE_ACZeroBranch, DEVICE_TYPE_ACBreak))
+        & np.isin(ac_mt, POWER_PSEUDO_MEAS_TYPE_CODES)
+    )
+    assert np.any(ac_topo_pq)
+    assert np.allclose(ac_tbl.weight[ac_topo_pq], 0.01)
+    assert np.allclose(ac_tbl.value[ac_topo_pq], 0.0)
+    ac_res = ac_est.estimate()
+    assert ac_res.converged
+
+    # 2. DC 含无量测 DCZeroBranch 的自包含模型
+    dc_dir = tmp_path / "dc_zbr_pseudo"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(9, dc_dir, seed=2032)
+    dc_text = dc_e.read_text(encoding="utf-8")
+    dc_text = dc_text.replace(
+        "</DCNode>",
+        "# 10 dcbus_10 100.0 100.0 1 1\n</DCNode>",
+    )
+    dc_text += "\n<DCZeroBranch>\n@ idx name i_node j_node run_stat\n# 1 dczbr_1 9 10 1\n</DCZeroBranch>\n"
+    dc_e.write_text(dc_text, encoding="utf-8")
+
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=ac_params, flat_start=True)
+    dc_tbl = dc_est._active_measurement_table_ref()
+    dc_st = measurement_table_status_code(dc_tbl)
+    dc_dt = np.asarray(dc_tbl.device_type_code, dtype=np.int16)
+    dc_mt = np.asarray(dc_tbl.meas_type_code, dtype=np.int16)
+    dc_topo_pq = (
+        (dc_st == MEAS_STATUS_PSEUDO)
+        & np.isin(dc_dt, (DEVICE_TYPE_DCZeroBranch, DEVICE_TYPE_DCBreak))
+        & np.isin(dc_mt, POWER_PSEUDO_MEAS_TYPE_CODES)
+    )
+    assert np.any(dc_topo_pq)
+    assert np.allclose(dc_tbl.weight[dc_topo_pq], 0.01)
+    assert np.allclose(dc_tbl.value[dc_topo_pq], 0.0)
+    dc_res = dc_est.estimate()
+    assert dc_res.converged
+
+
+def test_bad_data_removal_prevents_singularity_on_critical_pair_and_column_loss(tmp_path):
+    """验证坏数据剔除三道防奇异护栏：拦截列覆盖归零、拆分临界量测对并保持最终系统满秩非奇异。"""
+    from scipy.sparse import csr_matrix
+    from secore.se_math import (
+        check_active_structural_full_rank,
+        compute_active_column_degrees,
+        filter_batch_preserving_column_coverage,
+    )
+
+    # 1. 单元测试：列覆盖防奇异筛选与结构秩检查
+    # 3 个状态，4 条量测：row 0 独占 col 0（单条临界量测）；row 1 与 row 2 共同覆盖 col 1（临界对）；row 3 覆盖 col 2
+    H_toy = csr_matrix(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    act = np.ones(4, dtype=bool)
+    w = np.ones(4, dtype=np.float64)
+    deg = compute_active_column_degrees(H_toy, act, w)
+    assert np.array_equal(deg, np.asarray([1, 2, 2], dtype=np.int32))
+    # 候选顺序 [row 0, row 1, row 2]：row 0 必被拦截；row 1 可安全删，但 row 2 随后因 col 1 剩余度=1 必被拦截
+    safe_idx, blocked_idx = filter_batch_preserving_column_coverage(H_toy, [0, 1, 2], deg)
+    assert safe_idx == [1]
+    assert blocked_idx == [0, 2]
+    assert check_active_structural_full_rank(H_toy, np.asarray([True, False, True, True]), w) is True
+    assert check_active_structural_full_rank(H_toy, np.asarray([True, False, False, True]), w) is False
+
+    # 2. 端到端 AC 验证：向多条关联量测（含冗余与末端节点量测）同时注入大幅坏数据，验证删坏后原问题保持满秩收敛
+    ac_dir = tmp_path / "ac_anti_singular"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(9, ac_dir, seed=2033)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    for ln in lines:
+        if ln.startswith("#") and (" ACNode bus_9 V " in ln or " ACBranch br_12 P_TO " in ln or " ACBranch br_12 Q_TO " in ln):
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) + 80.0:.6f}"
+            edited.append(" ".join(parts))
+        else:
+            edited.append(ln)
+    ac_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(bad_threshold=3.5, max_remove=20), flat_start=True)
+    res, rem = est.estimate_with_bad_data_removal(threshold=3.5, max_remove=20)
+    assert res.converged
+    assert len(rem) >= 1
+    obs = est.observability_analysis(res.x, res.measurement_plan_tables)
+    assert obs.observable
+    assert not bool(getattr(res, "_undamped_spd_failed", False))
+
+    # 3. 端到端 DC 验证：同理验证删坏后保持满秩可观测收敛
+    dc_dir = tmp_path / "dc_anti_singular"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(9, dc_dir, seed=2034)
+    dc_lines = dc_m.read_text(encoding="utf-8").splitlines()
+    dc_edited = []
+    for ln in dc_lines:
+        if ln.startswith("#") and (" DCNode dcbus_9 V " in ln or " DCBranch dcbr_12 P_TO " in ln):
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) + 80.0:.6f}"
+            dc_edited.append(" ".join(parts))
+        else:
+            dc_edited.append(ln)
+    dc_m.write_text("\n".join(dc_edited) + "\n", encoding="utf-8")
+
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS.with_overrides(bad_threshold=3.5, max_remove=20), flat_start=True)
+    dc_res, dc_rem = dc_est.estimate_with_bad_data_removal(threshold=3.5, max_remove=20)
+    assert dc_res.converged
+    assert len(dc_rem) >= 1
+    dc_obs = dc_est.observability_analysis(dc_res.x, dc_res.measurement_plan_tables)
+    assert dc_obs.observable
+    assert not bool(getattr(dc_res, "_undamped_spd_failed", False))
+
+
+def test_bad_data_limits_per_round_total_and_zero_injection_protection(tmp_path):
+    """验证坏数据双上限默认推导、单步/总上限严格约束及零注入量测不可删保护。"""
+    import algorithm_parameters
+    from model.meas_model import MeasurementTable, measurement_table_bad_data_protected_mask
+    from model.meas_type import (
+        DEVICE_TYPE_ACNode,
+        DEVICE_TYPE_ACPowerBalance,
+        MEAS_TYPE_P_BALANCE,
+        MEAS_TYPE_Q_BALANCE,
+        MEAS_TYPE_V,
+    )
+
+    # 1. 验证默认公式：per_round = max(1, min(20, int(N*0.001))), total = max(1, min(100, int(N*0.005)))
+    assert algorithm_parameters.resolve_bad_data_limits(300) == (1, 1)
+    assert algorithm_parameters.resolve_bad_data_limits(10000) == (50, 10)
+    assert algorithm_parameters.resolve_bad_data_limits(250000) == (100, 20)
+    assert algorithm_parameters.resolve_bad_data_limits(250000, max_remove=15, max_remove_per_round=4) == (15, 4)
+    assert algorithm_parameters.resolve_bad_data_limits(250000, max_remove=0) == (0, 0)
+    assert algorithm_parameters.resolve_bad_data_limits(0) == (0, 0)
+
+    # 验证 se.para 缺省 max_remove / max_remove_per_round 读取为 None，显式配置则精确保留
+    para_auto = tmp_path / "se_auto.para"
+    para_auto.write_text(
+        "<StateEstimationParameter>\n"
+        "@ name value\n"
+        "# tol 1e-6\n"
+        "# diff_step 1e-6\n"
+        "# flat_start false\n"
+        "# bad_threshold 3.0\n"
+        "# targeted_pseudo_measurement_max 50\n"
+        "# voltage_floor 0.1\n"
+        "# min_current_voltage 0.1\n"
+        "# power_flow_tol 1e-8\n"
+        "# power_flow_max_iter 50\n"
+        "# power_flow_min_voltage 0.1\n"
+        "</StateEstimationParameter>\n",
+        encoding="utf-8",
+    )
+    loaded_auto = algorithm_parameters.load_se_parameters(para_auto)
+    assert loaded_auto.max_remove is None
+    assert loaded_auto.max_remove_per_round is None
+
+    para_custom = tmp_path / "se_custom.para"
+    para_custom.write_text(
+        "<StateEstimationParameter>\n"
+        "@ name value\n"
+        "# tol 1e-6\n"
+        "# diff_step 1e-6\n"
+        "# flat_start false\n"
+        "# bad_threshold 3.0\n"
+        "# max_remove 30\n"
+        "# max_remove_per_round 5\n"
+        "# targeted_pseudo_measurement_max 50\n"
+        "# voltage_floor 0.1\n"
+        "# min_current_voltage 0.1\n"
+        "# power_flow_tol 1e-8\n"
+        "# power_flow_max_iter 50\n"
+        "# power_flow_min_voltage 0.1\n"
+        "</StateEstimationParameter>\n",
+        encoding="utf-8",
+    )
+    loaded_custom = algorithm_parameters.load_se_parameters(para_custom)
+    assert loaded_custom.max_remove == 30
+    assert loaded_custom.max_remove_per_round == 5
+
+    # 2. 验证零注入/功率平衡量测无论按 device_type_code、meas_type_code 还是 device_type 名称均受保护
+    tbl = MeasurementTable(
+        idx=np.asarray([1, 2, 3, 4], dtype=np.int64),
+        name=np.asarray(["v1", "pbal", "qbal", "dcbal"], dtype=object),
+        device_type=np.asarray(["ACNode", "ACNode", "ACPowerBalance", "DCPowerBalance"], dtype=object),
+        device_name=np.asarray(["b1", "b1", "b2", "dcb1"], dtype=object),
+        meas_type=np.asarray(["V", "P_BALANCE", "Q_BALANCE", "P_BALANCE"], dtype=object),
+        weight=np.asarray([100.0, 10.0, 10.0, 10.0], dtype=np.float64),
+        valid=np.ones(4, dtype=bool),
+        value=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        device_type_code=np.asarray([DEVICE_TYPE_ACNode, DEVICE_TYPE_ACNode, DEVICE_TYPE_ACPowerBalance, 0], dtype=np.int16),
+        angle_mask=np.zeros(4, dtype=bool),
+        meas_type_code=np.asarray([MEAS_TYPE_V, MEAS_TYPE_P_BALANCE, MEAS_TYPE_Q_BALANCE, 0], dtype=np.int16),
+    )
+    prot = measurement_table_bad_data_protected_mask(tbl)
+    assert prot.tolist() == [False, True, True, True]
+    # 即使非临界零注入行有极大残差，compute_normalized_residuals_for_bad_data 也必须归零抑制
+    from secore.se_math import compute_normalized_residuals_for_bad_data
+
+    norm_noncrit, crit_noncrit = compute_normalized_residuals_for_bad_data(
+        np.asarray([0.5, 50.0, 50.0, 50.0], dtype=np.float64),
+        tbl.weight,
+        0.2 / tbl.weight,
+        is_pseudo=prot,
+    )
+    assert not np.any(crit_noncrit)
+    assert norm_noncrit[0] > 4.0
+    assert norm_noncrit[1] == 0.0 and norm_noncrit[2] == 0.0 and norm_noncrit[3] == 0.0
+
+    # 3. 端到端 AC 验证：注入 6 条大幅坏数据，验证每轮排除数 <= max_remove_per_round、总排除数 <= max_remove 且零注入不受影响
+    ac_dir = tmp_path / "ac_per_round_limits"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(25, ac_dir, seed=2039)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    injected = 0
+    for ln in lines:
+        if ln.startswith("#") and " ACBranch " in ln and " P_FROM " in ln and injected < 6:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) + 200.0 + injected * 30.0:.6f}"
+            edited.append(" ".join(parts))
+            injected += 1
+        else:
+            edited.append(ln)
+    assert injected == 6
+    ac_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    # 3a. 严格限额测试：每轮最多 2 条、总数最多 4 条
+    est_cap = ACStateEstimator(
+        ac_e,
+        ac_m,
+        parameters=SE_PARAMS.with_overrides(bad_threshold=3.5, max_remove=4, max_remove_per_round=2),
+        flat_start=True,
+    )
+    prev_zero = 0
+    step_deltas = []
+    orig_est = est_cap.estimate
+
+    def _wrapped_est(*args, **kwargs):
+        nonlocal prev_zero
+        w = kwargs.get("_weight_override", None)
+        if w is not None:
+            cur_zero = int(np.count_nonzero(np.asarray(w) == 0.0))
+            if cur_zero > prev_zero:
+                step_deltas.append(cur_zero - prev_zero)
+                prev_zero = cur_zero
+        return orig_est(*args, **kwargs)
+
+    est_cap.estimate = _wrapped_est
+    res_cap, rem_cap = est_cap.estimate_with_bad_data_removal(threshold=3.5, max_remove=4, max_remove_per_round=2)
+    assert res_cap.converged
+    assert len(rem_cap) == 4
+    assert step_deltas and max(step_deltas) <= 2
+    assert all(str(item.measurement.device_type) != "ACPowerBalance" for item in rem_cap)
+
+    # 3b. 充裕限额测试：每轮最多 2 条、总数最多 10 条 -> 应清空 6 条后因最大残差 <= threshold 提前收敛退出
+    est_full = ACStateEstimator(
+        ac_e,
+        ac_m,
+        parameters=SE_PARAMS.with_overrides(bad_threshold=3.5, max_remove=10, max_remove_per_round=2),
+        flat_start=True,
+    )
+    res_full, rem_full = est_full.estimate_with_bad_data_removal(threshold=3.5, max_remove=10, max_remove_per_round=2)
+    assert res_full.converged
+    assert 6 <= len(rem_full) <= 10
+    rem_items_after, _ = est_full.identify_bad_data(res_full, threshold=3.5)
+    assert len(rem_items_after) == 0
+    assert all(str(item.measurement.device_type) != "ACPowerBalance" for item in rem_full)
+
+
+
+
+
+
+
 
 
 

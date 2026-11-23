@@ -78,6 +78,7 @@ class FluidStateEstimator:
         flat_start: Optional[bool] = None,
         bad_threshold: Optional[float] = None,
         max_remove: Optional[int] = None,
+        max_remove_per_round: Optional[int] = None,
         parameter_file=DEFAULT_SE_PARAMETER_FILE,
         parameters: Optional[StateEstimationParameters] = None,
         verbose: bool = False,
@@ -87,13 +88,17 @@ class FluidStateEstimator:
         self.network = network
         self.measurement_file = None if measurement_file is None else Path(measurement_file)
         self._provided_measurements = measurements
-        self.params = (parameters or load_se_parameters(parameter_file)).with_overrides(
+        override_kwargs = dict(
             tol=tol,
             max_iter=max_iter,
             flat_start=flat_start,
             bad_threshold=bad_threshold,
-            max_remove=max_remove,
         )
+        if max_remove is not None:
+            override_kwargs["max_remove"] = max_remove
+        if max_remove_per_round is not None:
+            override_kwargs["max_remove_per_round"] = max_remove_per_round
+        self.params = (parameters or load_se_parameters(parameter_file)).with_overrides(**override_kwargs)
         self.tol = float(self.params.tol)
         self.max_iter = int(self.params.max_iter)
         self.bad_threshold = float(self.params.bad_threshold)
@@ -1246,7 +1251,7 @@ class FluidStateEstimator:
                     device_type,
                     device_name,
                     meas_type,
-                    self.params.pseudo_measurement_weight,
+                    self.params.pseudo_measurement_weight_pq,
                     True,
                     float(value),
                     status=MEAS_STATUS_PSEUDO,

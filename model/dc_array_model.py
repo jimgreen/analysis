@@ -363,13 +363,21 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         raw_vbase = _float_column(table_rows, columns, "vbase")
         bus[:, BUS_COLS["idx"]] = _int_column(table_rows, columns, "idx")
         bus[:, BUS_COLS["vbase"]] = raw_vbase / u_scale
-        raw_voltage = _float_column(table_rows, columns, "voltage", 1.0)
-        bus[:, BUS_COLS["voltage"]] = np.divide(
-            raw_voltage,
-            raw_vbase,
-            out=np.ones_like(raw_voltage),
-            where=np.abs(raw_vbase) > 1e-12,
-        )
+        if "voltage" in columns:
+            raw_voltage = _float_column(table_rows, columns, "voltage", np.nan)
+            missing_voltage = ~np.isfinite(raw_voltage)
+            if np.any(missing_voltage):
+                raw_voltage = raw_voltage.copy()
+                raw_voltage[missing_voltage] = raw_vbase[missing_voltage]
+            bus[:, BUS_COLS["voltage"]] = np.divide(
+                raw_voltage,
+                raw_vbase,
+                out=np.ones_like(raw_voltage),
+                where=np.abs(raw_vbase) > 1e-12,
+            )
+        else:
+            # 节点表未提供 voltage 列时，默认按标幺 1.0 p.u.（物理电压等于基准电压）初始化
+            bus[:, BUS_COLS["voltage"]] = 1.0
         bus[:, BUS_COLS["isl"]] = _float_column(table_rows, columns, "isl", 0.0)
         bus[:, BUS_COLS["run_stat"]] = _float_column(table_rows, columns, "run_stat", 1.0)
     bus_names = _names_from_rows(table_rows, columns, "bus", bus[:, BUS_COLS["idx"]])
