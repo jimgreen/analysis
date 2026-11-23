@@ -16,6 +16,7 @@ from scipy.linalg.lapack import dtrtri as DTRTRI
 from scipy.sparse import coo_matrix as SP_COO_MATRIX
 from scipy.sparse import csc_matrix as SP_CSC_MATRIX
 from scipy.sparse import csr_matrix as SP_CSR_MATRIX
+from scipy.sparse import eye as SP_EYE
 from scipy.sparse import issparse as SP_ISSPARSE
 from scipy.sparse import tril as SP_TRIL
 from scipy.sparse.csgraph import connected_components as SP_CONNECTED_COMPONENTS
@@ -39,6 +40,31 @@ try:
 except Exception:
     CHOLMOD_CHOLESKY_AAT = None
     CHOLMOD_ANALYZE_AAT = None
+
+try:
+    from .mkl_pardiso import (
+        MKLPardisoFactor,
+        build_upper_csr_from_aat,
+        get_linear_solver_preference,
+        is_mkl_pardiso_available,
+    )
+except Exception:
+    MKLPardisoFactor = None
+    build_upper_csr_from_aat = None
+    get_linear_solver_preference = lambda: "auto"  # noqa: E731
+    is_mkl_pardiso_available = lambda: False  # noqa: E731
+
+try:
+    from .native_kernels import (
+        leverage_from_selected_inv_native as NATIVE_LEVERAGE_FROM_SELECTED_INV,
+        supernodal_selected_inverse_native as NATIVE_SUPERNODAL_SELECTED_INVERSE,
+    )
+except Exception:
+    NATIVE_LEVERAGE_FROM_SELECTED_INV = None
+    NATIVE_SUPERNODAL_SELECTED_INVERSE = None
+
+# MKL PARDISO 符号分析存在固定初始化开销，仅在中大规模状态数上启用，小网保留 CHOLMOD/LAPACK 极速路径
+_PARDISO_MIN_STATE_COUNT = 2000
 
 
 ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
@@ -1710,7 +1736,7 @@ class CholmodAAtNormalEquationPlan:
 
 
 class CholmodAAtNormalEquationSolver:
-    """Prototype normal-equation solver backed by CHOLMOD ``A A.T`` factorization."""
+    """正规方程稀疏正定求解器：中大规模优先使用多线程 MKL PARDISO，小规模或无 MKL 自动回退 CHOLMOD ``A A.T`` / SciPy。"""
 
     def __init__(
         self,
@@ -1721,11 +1747,60 @@ class CholmodAAtNormalEquationSolver:
         self._cholmod_factor = None
         self._cholmod_pattern = None
         self._cholmod_disabled = False
+        self._pardiso_factor = None
+        self._pardiso_upper_pattern = None
+        self._pardiso_disabled = False
+        self._active_backend = None
         self._last_normal_operand = None
         self.assume_fixed_pattern = bool(assume_fixed_pattern)
         self.ordering_method = str(ordering_method or "auto")
         self.multi_solve = bool(multi_solve)
         self._fallback_solver = NormalEquationSolver(assume_fixed_pattern=assume_fixed_pattern)
+
+    def _reset_pardiso(self) -> None:
+        # 仅解除当前求解器对因子的引用，避免提前 close() 销毁外部（如 prev_cholmod_factor / WoodburyRemovalSolver）
+        # 仍在复用的有效句柄；当引用计数归零时由 MKLPardisoFactor.__del__ 自动调用 phase=-1 释放内存。
+        self._pardiso_factor = None
+        self._pardiso_upper_pattern = None
+
+    def __del__(self) -> None:
+        self._reset_pardiso()
+
+    def _should_use_pardiso(self, n_state: int, nnz_a: int = 0) -> bool:
+        if self._pardiso_disabled or MKLPardisoFactor is None or build_upper_csr_from_aat is None:
+            return False
+        pref = get_linear_solver_preference()
+        if pref in ("cholmod", "scipy"):
+            return False
+        if pref == "pardiso":
+            return bool(is_mkl_pardiso_available())
+        # auto 模式：极稀疏小中 DC 网（avg_nnz < 10.5 且 ns < 80000）CHOLMOD AMD 更轻快；
+        # 其余中大规模稠密耦合网及 80k+ 超大网启用多线程 MKL PARDISO
+        ns = int(n_state)
+        if ns < _PARDISO_MIN_STATE_COUNT:
+            return False
+        if nnz_a > 0 and ns < 80000 and (float(nnz_a) / float(ns)) < 10.5:
+            return False
+        return bool(is_mkl_pardiso_available())
+
+    def _solve_sparse_pardiso(self, A_csc, rhs: np.ndarray, damping: float = 0.0):
+        beta = float(damping)
+        n_state = int(A_csc.shape[0])
+        prev_pattern = self._pardiso_upper_pattern
+        ia, ja, a, new_pattern = build_upper_csr_from_aat(
+            A_csc,
+            damping=beta,
+            cached_pattern=prev_pattern,
+        )
+        need_new_factor = (self._pardiso_factor is None) or (new_pattern is not prev_pattern)
+        if need_new_factor:
+            self._reset_pardiso()
+            self._pardiso_factor = MKLPardisoFactor(n_state, ia, ja, upper_pattern=new_pattern)
+            self._pardiso_upper_pattern = new_pattern
+        self._pardiso_factor.factorize_inplace(a, aat_operand=A_csc, damping=beta)
+        self._last_normal_operand = A_csc
+        self._active_backend = "pardiso"
+        return self._pardiso_factor.solve(rhs), None
 
     @staticmethod
     def _sparse_pattern(matrix) -> Tuple[Tuple[int, int], int, np.ndarray, np.ndarray]:
@@ -1799,27 +1874,49 @@ class CholmodAAtNormalEquationSolver:
         if not is_sparse_matrix(A):
             raise TypeError("CholmodAAtNormalEquationSolver requires a sparse weighted transpose matrix")
         A_csc = A if getattr(A, "format", None) == "csc" else A.tocsc()
-        if not self._cholmod_disabled and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None):
+        pref = get_linear_solver_preference()
+        if self._should_use_pardiso(int(A_csc.shape[0]), int(A_csc.nnz)):
             try:
-                return self._solve_sparse_cholmod_aat(A_csc, rhs, damping=damping)
+                return self._solve_sparse_pardiso(A_csc, rhs, damping=damping)
+            except (TypeError, AttributeError):
+                self._reset_pardiso()
+                self._pardiso_disabled = True
+            except Exception:
+                # 数值奇异/病态仅本次回退，避免后续健康矩阵永久丧失 PARDISO 加速
+                self._reset_pardiso()
+                self._active_backend = None
+        if (
+            pref != "scipy"
+            and not self._cholmod_disabled
+            and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None)
+        ):
+            try:
+                sol, diag = self._solve_sparse_cholmod_aat(A_csc, rhs, damping=damping)
+                self._active_backend = "cholmod"
+                return sol, diag
             except (TypeError, AttributeError):
                 # 仅在接口不兼容时禁用 CHOLMOD；数值奇异/病态仅本次回退，避免后续健康矩阵永久退化到慢速 SuperLU
                 self._cholmod_factor = None
                 self._cholmod_pattern = None
                 self._last_normal_operand = None
+                self._active_backend = None
                 self._cholmod_disabled = True
             except Exception:
                 self._cholmod_factor = None
                 self._cholmod_pattern = None
                 self._last_normal_operand = None
+                self._active_backend = None
         gain = A_csc @ A_csc.T
         if float(damping) > 0.0:
             gain = gain + SP_EYE(gain.shape[0], format="csc", dtype=np.float64) * float(damping)
+        self._active_backend = "fallback"
         return self._fallback_solver.solve(gain.tocsc(), rhs, return_factor_diag=return_factor_diag)
 
     @property
     def last_cholmod_factor(self):
-        """返回最近一次成功分解的 CHOLMOD 因子对象（供坏数据杠杆计算复用）。"""
+        """返回最近一次成功分解的稀疏正定因子对象（PARDISO 或 CHOLMOD，供坏数据杠杆计算与 Woodbury 复用）。"""
+        if self._active_backend == "pardiso" and self._pardiso_factor is not None:
+            return self._pardiso_factor
         return self._cholmod_factor
 
     @property
@@ -1828,7 +1925,12 @@ class CholmodAAtNormalEquationSolver:
         return self._last_normal_operand
 
     def solve_with_cached_factor(self, rhs: np.ndarray) -> Optional[np.ndarray]:
-        """直接复用当前 CHOLMOD 数值因子执行稀疏前代/回代，不重新分解。"""
+        """直接复用当前 PARDISO 或 CHOLMOD 数值因子执行稀疏前代/回代，不重新分解。"""
+        if self._active_backend == "pardiso" and self._pardiso_factor is not None and not self._pardiso_disabled:
+            try:
+                return np.asarray(self._pardiso_factor.solve(rhs), dtype=np.float64)
+            except Exception:
+                return None
         if self._cholmod_factor is None or self._cholmod_disabled:
             return None
         try:
@@ -1943,6 +2045,14 @@ def _supernodal_selected_inverse_from_cholmod(factor, *, aat_operand=None, _allo
     l_diag = np.asarray(L.diagonal(), dtype=np.float64)
     if l_diag.size != n or np.any(l_diag <= 0.0) or not np.all(np.isfinite(l_diag)):
         return None, None
+
+    # 优先走 C++17 + BLAS-3 原生超节点 Takahashi 选元求逆（零外部依赖，失败或关闭时自动回退纯 Python）
+    if NATIVE_SUPERNODAL_SELECTED_INVERSE is not None:
+        zdata_native = NATIVE_SUPERNODAL_SELECTED_INVERSE(L)
+        if zdata_native is not None:
+            Z_low = SP_CSC_MATRIX((zdata_native, indices, indptr), shape=(n, n), copy=False)
+            Z_low.has_sorted_indices = True
+            return Z_low, factor.P()
 
     # 向量化识别尾部稀疏模式相同的连续列作为超节点（factor.L() 原生保留 supernodal 块结构）
     col_len = np.diff(indptr)
@@ -2401,6 +2511,14 @@ def _measurement_leverage_from_selected_inv(
     H_csr = H.tocsr() if getattr(H, "format", None) != "csr" else H
     inv_P = np.empty(P.size, dtype=np.int32)
     inv_P[P] = np.arange(P.size, dtype=np.int32)
+
+    # 优先走 OpenMP 并行原生内核直接计算 h_i^T Z_low h_i（免构建 H_p 与 SpMM 临时大矩阵；
+    # 若极罕见遇到数值抵消缺失项，自动返回 None 并无缝落入下方 SpMM + CHOLMOD 回代补齐路径）
+    if not _force_spmm and NATIVE_LEVERAGE_FROM_SELECTED_INV is not None:
+        lev_native = NATIVE_LEVERAGE_FROM_SELECTED_INV(H_csr, Z_low, inv_P)
+        if lev_native is not None:
+            return lev_native
+
     hp_indices = inv_P[H_csr.indices]
     # 复制 data/indptr 以避免 sort_indices() 原地改动调用方的 H
     H_p = SP_CSR_MATRIX(
@@ -2717,8 +2835,10 @@ def measurement_leverage_for_bad_data(
     ):
         try:
             factor = cholmod_factor
+            if factor is not None and getattr(factor, "is_mkl_pardiso_factor", False):
+                factor = factor.materialize_cholmod_factor(ordering_method=scale_prof.aat_ordering_method)
             if factor is None:
-                if gain is None:
+                if gain is None or CHOLMOD_CHOLESKY is None:
                     return None
                 gain_csc = gain if getattr(gain, "format", None) == "csc" else gain.tocsc()
                 factor = CHOLMOD_CHOLESKY(gain_csc)
@@ -2877,8 +2997,10 @@ def exact_leverage_for_candidate_rows(
             if (
                 base_fac is not None
                 and wb_U is not None
-                and hasattr(base_fac, "solve_L")
-                and hasattr(base_fac, "P")
+                and (
+                    (hasattr(base_fac, "solve_L") and hasattr(base_fac, "P"))
+                    or getattr(base_fac, "is_mkl_pardiso_factor", False)
+                )
             ):
                 base_lev = exact_leverage_for_candidate_rows(H_csr, rows, base_fac, chunk_size=chunk_size)
                 if base_lev is not None and base_lev.size == k:
@@ -2896,7 +3018,36 @@ def exact_leverage_for_candidate_rows(
                     if lev_wb is not None and np.all(np.isfinite(lev_wb)):
                         return lev_wb
 
-        # 快速路径 2：原生 CHOLMOD 因子半边前代 solve_L（省去一半三角代与反置换）
+        # 快速路径 2A：多线程 MKL PARDISO 因子半边前代（phase=331 直接解 L y = P b，免手动置换）
+        if getattr(cholmod_factor, "is_mkl_pardiso_factor", False):
+            try:
+                p_step = max(step, 64) if chunk_size is None else step
+                rhs_buf_f = np.zeros((n, min(k, p_step)), dtype=np.float64, order="F")
+                ok_p = True
+                for start in range(0, k, p_step):
+                    end = min(start + p_step, k)
+                    b = end - start
+                    rhs = rhs_buf_f if b == rhs_buf_f.shape[1] else rhs_buf_f[:, :b]
+                    rhs.fill(0.0)
+                    for col in range(b):
+                        j = start + col
+                        s = int(indptr[j])
+                        e = int(indptr[j + 1])
+                        if e > s:
+                            rhs[indices[s:e], col] = data[s:e]
+                    y = np.asarray(cholmod_factor.solve_L_unpermuted(rhs), dtype=np.float64)
+                    if y.ndim == 1:
+                        y = y[:, None]
+                    if y.shape != (n, b) or not np.all(np.isfinite(y)):
+                        ok_p = False
+                        break
+                    lev[start:end] = np.einsum("ij,ij->j", y, y)
+                if ok_p:
+                    return lev
+            except Exception:
+                pass
+
+        # 快速路径 2B：原生 CHOLMOD 因子半边前代 solve_L（省去一半三角代与反置换）
         if (
             not getattr(cholmod_factor, "is_woodbury_solver", False)
             and hasattr(cholmod_factor, "solve_L")
@@ -3864,9 +4015,13 @@ def screen_initial_bad_data_fast(
     truncated = False
     n_state_cur = int(cur_H.shape[1])
     scale_prof = SEScaleProfile.for_problem(n_state_cur, int(res.size), int(cur_H.nnz))
+    is_pardiso_fac = bool(getattr(cur_cholmod_factor, "is_mkl_pardiso_factor", False))
+    # 多线程 MKL PARDISO 半边前代快 2.3~4.1x，单轮回代上限与全网选元求逆切换点相应放宽至 768 / 1536
+    eff_verify_cap = 768 if (is_pardiso_fac and n_state_cur > 5000) else scale_prof.screen_verify_cap
+    eff_selinv_switch_k = 1536 if (is_pardiso_fac and n_state_cur > 5000) else scale_prof.screen_selinv_switch_k
     # 回代预算严格控制在全网选元求逆交叉点以下；若外部显式传入更小上限则尊重外部上限
     req_cap = max(int(max_candidates), 1)
-    cap = min(req_cap, scale_prof.screen_verify_cap) if req_cap >= 128 else req_cap
+    cap = min(req_cap, eff_verify_cap) if req_cap >= 128 else req_cap
     direct_enabled = (
         scale_prof.direct_strong_peaks_enabled
         if allow_direct_strong_peaks is None
@@ -4019,14 +4174,16 @@ def screen_initial_bad_data_fast(
             elif len(secondary) < cap:
                 secondary.append(r_idx)
 
-        # 大网且无大量免回代强峰时，仅当待精确回代的局部峰值候选达到全网选元求逆交叉点（>=512），
-        # 才返回 "need_full" 走 1 次全网超节点选元求逆，避免中段 250~400 条候选取道触发冗余的第 2 次选元求逆。
+        # 大网且无大量免回代强峰时，仅当待精确回代的局部峰值候选达到全网选元求逆交叉点，
+        # 且当前环境具备 CHOLMOD 选元求逆能力时，才返回 "need_full" 走 1 次全网超节点选元求逆。
         rich_gate = 64 if n_state_cur > 20000 else 128
+        can_sparse_selinv = (not is_pardiso_fac) or (CHOLMOD_ANALYZE is not None or CHOLMOD_CHOLESKY is not None)
         if (
             n_state_cur > 5000
             and n_state_cur <= scale_prof.sparse_leverage_max_state
+            and can_sparse_selinv
             and len(direct_rows_list) < rich_gate
-            and uncapped_verify_count >= scale_prof.screen_selinv_switch_k
+            and uncapped_verify_count >= eff_selinv_switch_k
             and cap >= 256
             and not getattr(cur_cholmod_factor, "is_woodbury_solver", False)
         ):
@@ -4585,7 +4742,11 @@ class NormalEquationSolver:
         """Solve normal equations, preferring sparse SPD Cholesky when available."""
         if is_sparse_matrix(gain):
             gain_csc = gain if getattr(gain, "format", None) == "csc" else gain.tocsc()
-            if not self._cholmod_disabled and (CHOLMOD_ANALYZE is not None or CHOLMOD_CHOLESKY is not None):
+            if (
+                get_linear_solver_preference() != "scipy"
+                and not self._cholmod_disabled
+                and (CHOLMOD_ANALYZE is not None or CHOLMOD_CHOLESKY is not None)
+            ):
                 try:
                     return self._solve_sparse_cholmod(gain_csc, rhs)
                 except Exception:

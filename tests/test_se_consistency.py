@@ -2456,6 +2456,231 @@ def test_woodbury_incremental_u_col_cache_and_zero_backsolve_leverage():
         assert np.allclose(lev_wb_fast, lev_sub_exact[cand_check], rtol=1e-11, atol=1e-11)
 
 
+def test_mkl_pardiso_cpu_vendor_and_arch_compatibility_policy():
+    """验证 MKL PARDISO 跨架构（x86_64/ARM64）与跨 CPU 厂商（Intel/AMD）兼容策略。"""
+    from secore.mkl_pardiso import _should_allow_mkl_on_cpu
+
+    # Intel x86_64 正常启用
+    ok, _ = _should_allow_mkl_on_cpu(arch="amd64", cpu_vendor="GenuineIntel", mkl_major=2025, preference="auto")
+    assert ok
+    # AMD x86_64 + oneMKL >= 2021（已原生开放 AVX2/AVX-512）正常启用
+    ok, _ = _should_allow_mkl_on_cpu(arch="x86_64", cpu_vendor="AuthenticAMD", mkl_major=2024, preference="auto")
+    assert ok
+    # AMD x86_64 + 旧版 MKL (< 2021) 自动安全回退 CHOLMOD
+    ok, reason = _should_allow_mkl_on_cpu(arch="x86_64", cpu_vendor="AuthenticAMD", mkl_major=2020, preference="auto")
+    assert not ok and "legacy_mkl_on_non_intel" in reason
+    # ARM64 / aarch64 自动跳过
+    ok, reason = _should_allow_mkl_on_cpu(arch="aarch64", cpu_vendor="ARM", mkl_major=2025, preference="auto")
+    assert not ok and "unsupported_arch" in reason
+    # 环境变量显式指定 cholmod / scipy 时关闭 PARDISO
+    ok, reason = _should_allow_mkl_on_cpu(arch="amd64", cpu_vendor="GenuineIntel", mkl_major=2025, preference="cholmod")
+    assert not ok and "disabled_by_env" in reason
+
+
+def test_mkl_pardiso_factor_solve_leverage_and_woodbury_equivalence(monkeypatch):
+    """验证 MKL PARDISO 单/多右端求解、phase=331 半边杠杆及 Woodbury 锚点复用与精确解等价。"""
+    from scipy import sparse
+    from secore.mkl_pardiso import (
+        MKLPardisoFactor,
+        build_upper_csr_from_aat,
+        is_mkl_pardiso_available,
+    )
+    from secore.se_math import (
+        CholmodAAtNormalEquationSolver,
+        build_normal_equations,
+        exact_leverage_for_candidate_rows,
+        measurement_leverage,
+        measurement_leverage_for_bad_data,
+        solve_woodbury_after_row_removal,
+    )
+
+    if not is_mkl_pardiso_available():
+        pytest.skip("当前环境未安装或未启用 MKL PARDISO")
+
+    rng = np.random.default_rng(20261123)
+    n = 120
+    rows, cols, vals = [], [], []
+    rid = 0
+    for i in range(n):
+        rows.append(rid)
+        cols.append(i)
+        vals.append(1.0)
+        rid += 1
+        if i + 1 < n:
+            rows.extend([rid, rid])
+            cols.extend([i, i + 1])
+            vals.extend([1.0, -1.0])
+            rid += 1
+        if i + 7 < n:
+            rows.extend([rid, rid])
+            cols.extend([i, i + 7])
+            vals.extend([0.8, -0.6])
+            rid += 1
+    H = sparse.csr_matrix((vals, (rows, cols)), shape=(rid, n), dtype=np.float64)
+    w = rng.uniform(0.5, 4.0, size=rid)
+    A = H.multiply(np.sqrt(w)[:, None]).T.tocsc()
+
+    ia, ja, a, pat = build_upper_csr_from_aat(A)
+    pfac = MKLPardisoFactor(n, ia, ja)
+    try:
+        pfac.factorize_inplace(a, aat_operand=A)
+        G_dense = (A @ A.T).toarray()
+        G_inv = np.linalg.inv(G_dense)
+
+        rhs1 = rng.normal(size=n)
+        rhs4 = rng.normal(size=(n, 4))
+        assert np.allclose(pfac(rhs1), G_inv @ rhs1, rtol=1e-10, atol=1e-10)
+        assert np.allclose(pfac(rhs4), G_inv @ rhs4, rtol=1e-10, atol=1e-10)
+
+        # 验证 phase=331 半边杠杆快速路径与稠密精确值一致
+        cand = np.arange(0, rid, 5, dtype=np.intp)
+        lev_exact = measurement_leverage(H, G_inv)
+        lev_p = exact_leverage_for_candidate_rows(H, cand, pfac)
+        assert lev_p is not None
+        assert np.allclose(lev_p, lev_exact[cand], rtol=1e-10, atol=1e-10)
+
+        # 验证 WoodburyRemovalSolver 复用 MKLPardisoFactor 锚点的单删与批删半边杠杆
+        for rem_sub in ([15], [15, 42, 77]):
+            dx_wb, wb_solver = solve_woodbury_after_row_removal(
+                H, w, rem_sub, rhs1, pfac, return_solver=True
+            )
+            assert dx_wb is not None and wb_solver is not None
+            w_sub = w.copy()
+            w_sub[rem_sub] = 0.0
+            G_sub, _ = build_normal_equations(H, np.zeros(rid), w_sub, dense_gain_limit=0)
+            G_sub_inv = np.linalg.inv(G_sub.toarray())
+            assert np.allclose(dx_wb, G_sub_inv @ rhs1, rtol=1e-10, atol=1e-10)
+            lev_wb = exact_leverage_for_candidate_rows(H, cand, wb_solver)
+            assert lev_wb is not None
+            assert np.allclose(lev_wb, measurement_leverage(H, G_sub_inv)[cand], rtol=1e-10, atol=1e-10)
+
+        # 验证按需物化 CHOLMOD 选元求逆（稀疏分支）与精确杠杆一致
+        lev_sel = measurement_leverage_for_bad_data(
+            H, None, cholmod_factor=pfac, aat_operand=A, sparse_threshold=32
+        )
+        assert lev_sel is not None
+        assert np.allclose(lev_sel, lev_exact, rtol=1e-10, atol=1e-10)
+
+        # 验证固定模式复分解（更换权值）复用同一掩码与符号分析，以及 cholesky_AAt_inplace 协议
+        w2 = rng.uniform(0.5, 4.0, size=rid)
+        A2 = H.multiply(np.sqrt(w2)[:, None]).T.tocsc()
+        ia2, ja2, a2, pat2 = build_upper_csr_from_aat(A2, cached_pattern=pat)
+        assert pat2 is pat
+        pfac.factorize_inplace(a2, aat_operand=A2)
+        assert np.allclose(pfac(rhs1), np.linalg.solve((A2 @ A2.T).toarray(), rhs1), rtol=1e-10, atol=1e-10)
+        w3 = rng.uniform(0.5, 4.0, size=rid)
+        A3 = H.multiply(np.sqrt(w3)[:, None]).T.tocsc()
+        pfac.cholesky_AAt_inplace(A3)
+        assert np.allclose(pfac(rhs1), np.linalg.solve((A3 @ A3.T).toarray(), rhs1), rtol=1e-10, atol=1e-10)
+    finally:
+        pfac.close()
+
+    # 验证 SE_LINEAR_SOLVER=pardiso / cholmod 路由与解等价
+    monkeypatch.setenv("SE_LINEAR_SOLVER", "pardiso")
+    s_p = CholmodAAtNormalEquationSolver()
+    dx_p, _ = s_p.solve(A, rhs1)
+    assert getattr(s_p.last_cholmod_factor, "is_mkl_pardiso_factor", False)
+    assert np.allclose(s_p.solve_with_cached_factor(rhs1), dx_p, rtol=1e-12, atol=1e-12)
+
+    monkeypatch.setenv("SE_LINEAR_SOLVER", "cholmod")
+    s_c = CholmodAAtNormalEquationSolver()
+    dx_c, _ = s_c.solve(A, rhs1)
+    assert not getattr(s_c.last_cholmod_factor, "is_mkl_pardiso_factor", False)
+    assert np.allclose(dx_p, dx_c, rtol=1e-10, atol=1e-10)
+
+
+def test_native_kernels_equivalence_and_env_fallback(monkeypatch):
+    """验证 secore._native 三个原生算子与纯 Python 路径机器精度等价及 SE_NATIVE_KERNELS=off 回退。"""
+    from scipy import sparse
+    from sksparse.cholmod import analyze_AAt
+    from secore.mkl_pardiso import build_upper_csr_from_aat
+    from secore.native_kernels import (
+        assemble_aat_upper_csr_native,
+        is_native_kernels_available,
+        leverage_from_selected_inv_native,
+        supernodal_selected_inverse_native,
+    )
+    from secore.se_math import (
+        _measurement_leverage_from_selected_inv,
+        _supernodal_selected_inverse_from_cholmod,
+        measurement_leverage,
+    )
+
+    if not is_native_kernels_available():
+        pytest.skip("当前环境未编译 secore._native 扩展")
+
+    rng = np.random.default_rng(20261124)
+    n = 180
+    rows, cols, vals = [], [], []
+    rid = 0
+    for i in range(n):
+        rows.append(rid)
+        cols.append(i)
+        vals.append(1.0)
+        rid += 1
+        for step in (1, 2, 11):
+            if i + step < n:
+                rows.extend([rid, rid])
+                cols.extend([i, i + step])
+                vals.extend([1.0, -0.7])
+                rid += 1
+    H = sparse.csr_matrix((vals, (rows, cols)), shape=(rid, n), dtype=np.float64)
+    w = rng.uniform(0.5, 5.0, size=rid)
+    A = H.multiply(np.sqrt(w)[:, None]).T.tocsc()
+
+    # 1. 验证 Takahashi 选元求逆与杠杆点积在原生 vs 纯 Python 回退模式下逐位等价
+    fac = analyze_AAt(A, ordering_method="nesdis")
+    fac.cholesky_AAt_inplace(A)
+    L = fac.L().tocsc()
+    L.sort_indices()
+    P = np.asarray(fac.P(), dtype=np.int32)
+    inv_P = np.empty(n, dtype=np.int32)
+    inv_P[P] = np.arange(n, dtype=np.int32)
+
+    zdata_c = supernodal_selected_inverse_native(L)
+    assert zdata_c is not None
+    Z_c = sparse.csc_matrix((zdata_c, L.indices, L.indptr), shape=(n, n), copy=False)
+    Z_c.has_sorted_indices = True
+    lev_c = leverage_from_selected_inv_native(H, Z_c, inv_P)
+    assert lev_c is not None
+
+    # 关闭原生核走纯 Python 回退，验证结果与稠密精确解一致
+    monkeypatch.setenv("SE_NATIVE_KERNELS", "off")
+    assert not is_native_kernels_available()
+    Z_py, P_py = _supernodal_selected_inverse_from_cholmod(fac)
+    lev_py = _measurement_leverage_from_selected_inv(H, Z_py, P_py, cholmod_factor=fac)
+    lev_exact = measurement_leverage(H, np.linalg.inv((A @ A.T).toarray()))
+    assert np.allclose(Z_c.data, Z_py.data, rtol=1e-12, atol=1e-12)
+    assert np.allclose(lev_c, lev_py, rtol=1e-12, atol=1e-12)
+    assert np.allclose(lev_c, lev_exact, rtol=1e-11, atol=1e-11)
+
+    # 2. 验证固定模式上三角 AAt 数值装配（含 masked-weight 置零与 damping > 0）
+    monkeypatch.setenv("SE_NATIVE_KERNELS", "on")
+    assert is_native_kernels_available()
+    ia, ja, a0, pat = build_upper_csr_from_aat(A)
+    w_masked = w.copy()
+    w_masked[::9] = 0.0
+    A_masked = H.multiply(np.sqrt(w_masked)[:, None]).T.tocsc()
+    # 保持与 A 相同的稀疏拓扑结构（将置零列的 data 填 0.0）
+    A_same_pat = A.copy()
+    scale_col = np.sqrt(w_masked / w)
+    col_nnz = np.diff(A_same_pat.indptr)
+    A_same_pat.data = A_same_pat.data * np.repeat(scale_col, col_nnz)
+
+    for beta in (0.0, 1e-4):
+        a_nat = assemble_aat_upper_csr_native(A_same_pat, ia, ja, damping=beta)
+        assert a_nat is not None
+        _, _, a_fast, pat2 = build_upper_csr_from_aat(A_same_pat, damping=beta, cached_pattern=pat)
+        assert pat2 is pat
+        G_ref = (A_masked @ A_masked.T).toarray() + beta * np.eye(n)
+        Gu_nat = sparse.csr_matrix((a_nat, ja, ia), shape=(n, n)).toarray()
+        Gu_ref = np.triu(G_ref)
+        assert np.allclose(Gu_nat, Gu_ref, rtol=1e-13, atol=1e-13)
+        assert np.allclose(a_fast, a_nat, rtol=1e-14, atol=1e-14)
+
+
+
+
 
 
 

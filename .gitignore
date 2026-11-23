@@ -10,3 +10,8 @@ venv/
 .ruff_cache/
 tmp/
 output/
+build/
+dist/
+*.egg-info/
+secore/_native*.pyd
+secore/_native*.so
