@@ -1371,7 +1371,8 @@ class FluidStateEstimator:
             is_pos = f_val >= 0.0
             up_col = np.where(is_pos, plan["adv_state_i"], plan["adv_state_j"])
             is_up_end = plan["adv_is_from"] == is_pos
-            mass = np.maximum(np.abs(f_val), 1e-9)
+            # 热损质量流量下界 1e-3：避免零流量叶管处 exp(-L/|q|) 导数爆炸击穿信息矩阵条件数
+            mass = np.maximum(np.abs(f_val), 1e-3)
             factor = np.exp(-plan["adv_loss"] / mass)
             u_up = x[up_col]
             amb = plan["adv_amb"]
@@ -1440,7 +1441,7 @@ class FluidStateEstimator:
                         factor = float(
                             np.exp(
                                 -net.edge_heat_loss[pos]
-                                / max(abs(float(flow[pos])), 1e-9)
+                                / max(abs(float(flow[pos])), 1e-3)
                             )
                         )
                         ambient = float(net.medium.ambient_temperature)
@@ -1460,7 +1461,7 @@ class FluidStateEstimator:
                         )
                 if enthalpy is not None:
                     factor = float(
-                        np.exp(-net.edge_heat_loss[pos] / max(abs(float(flow[pos])), 1e-9))
+                        np.exp(-net.edge_heat_loss[pos] / max(abs(float(flow[pos])), 1e-3))
                     )
                     ambient = float(net.medium.ambient_enthalpy)
                     if flow[pos] >= 0.0:
@@ -1654,7 +1655,8 @@ class FluidStateEstimator:
             is_pos = f_val >= 0.0
             up_col = np.where(is_pos, plan["adv_state_i"], plan["adv_state_j"]).astype(np.int32, copy=False)
             is_up_end = plan["adv_is_from"] == is_pos
-            mass = np.maximum(np.abs(f_val), 1e-9)
+            abs_f = np.abs(f_val)
+            mass = np.maximum(abs_f, 1e-3)
             loss = plan["adv_loss"]
             factor = np.exp(-loss / mass)
             out_scale = plan["adv_out_scale"]
@@ -1662,8 +1664,8 @@ class FluidStateEstimator:
             col_parts.append(up_col)
             data_parts.append(out_scale * np.where(is_up_end, 1.0, factor))
 
-            # 下游端且存在热损时向量化写入对流量的偏导（彻底替代逐行 flow_derivative.getrow）
-            dn_mask = (~is_up_end) & (loss > 0.0)
+            # 下游端且存在热损时向量化写入对流量的偏导（|f|<=1e-3 平台段导数严格为 0，与前向公式一致）
+            dn_mask = (~is_up_end) & (loss > 0.0) & (abs_f > 1e-3)
             if np.any(dn_mask):
                 dn_idx = np.flatnonzero(dn_mask)
                 f_dn = f_val[dn_idx]
@@ -1810,13 +1812,14 @@ class FluidStateEstimator:
                             cols.append(upstream_col)
                             data.append(1.0)
                         else:
-                            mass = max(abs(flow_value), 1e-9)
+                            abs_flow = abs(flow_value)
+                            mass = max(abs_flow, 1e-3)
                             loss = float(net.edge_heat_loss[pos])
                             factor = float(np.exp(-loss / mass))
                             rows.append(row)
                             cols.append(upstream_col)
                             data.append(factor)
-                            if loss > 0.0:
+                            if loss > 0.0 and abs_flow > 1e-3:
                                 temperature_state = x[
                                     self.base_temperature : self.base_enthalpy
                                 ]
@@ -1860,13 +1863,14 @@ class FluidStateEstimator:
                         cols.append(self.base_enthalpy + upstream_node)
                         data.append(output_scale)
                     else:
-                        mass = max(abs(flow_value), 1e-9)
+                        abs_flow = abs(flow_value)
+                        mass = max(abs_flow, 1e-3)
                         loss = float(net.edge_heat_loss[pos])
                         factor = float(np.exp(-loss / mass))
                         rows.append(row)
                         cols.append(self.base_enthalpy + upstream_node)
                         data.append(factor * output_scale)
-                        if loss > 0.0:
+                        if loss > 0.0 and abs_flow > 1e-3:
                             enthalpy = x[self.base_enthalpy :]
                             da_dq = factor * loss * np.sign(flow_value or 1.0) / (mass * mass)
                             flow_scale = (
@@ -2853,12 +2857,22 @@ class FluidStateEstimator:
                 return res, removed_items
 
             unconverged_streak = 0 if res.converged else 1
+            # 缓存当前状态下的坏数据识别与列覆盖度，跳过临界行或回滚重试时免去重复矩阵求逆
+            need_identify = True
+            bad_list: List[BadDataItem] = []
+            norm_res = np.empty(0, dtype=np.float64)
+            col_degrees: Optional[np.ndarray] = None
+            row_to_item: Dict[int, BadDataItem] = {}
             while len(removed_items) < total_cap:
-                bad_list, norm_res = self.identify_bad_data(
-                    res,
-                    threshold=threshold_value,
-                    weight_override=cur_weight,
-                )
+                if need_identify:
+                    bad_list, norm_res = self.identify_bad_data(
+                        res,
+                        threshold=threshold_value,
+                        weight_override=cur_weight,
+                    )
+                    col_degrees = compute_active_column_degrees(res.H, active_mask, cur_weight)
+                    row_to_item = {int(it.row_pos): it for it in bad_list}
+                    need_identify = False
                 if not bad_list:
                     break
                 cand_rows = [
@@ -2886,7 +2900,6 @@ class FluidStateEstimator:
                 selected = [cand_rows[k] for k in selected_pos] if selected_pos else [cand_rows[0]]
 
                 # 严格保护状态列覆盖可观测性：不得把任意状态变量的全部支撑量测删空
-                col_degrees = compute_active_column_degrees(res.H, active_mask, cur_weight)
                 safe_local, _skipped = filter_batch_preserving_column_coverage(res.H, selected, col_degrees)
                 safe_rows = [selected[k] for k in safe_local]
                 if not safe_rows:
@@ -2912,6 +2925,8 @@ class FluidStateEstimator:
                         break
                     trial_rows = trial_rows[: max(1, len(trial_rows) // 2)]
                 if not trial_rows:
+                    if len(blocked_rows_set) >= 32:
+                        break
                     continue
 
                 # 带回滚与折半退避的重估：防止误删隐式临界测点导致压力坍塌、单点压力爆炸或发散
@@ -2926,7 +2941,6 @@ class FluidStateEstimator:
                     prev_min_p = 1.0
                     prev_max_p = 1.0
                     prev_med_p = 1.0
-                row_to_item = {int(it.row_pos): it for it in bad_list}
                 accepted_trial = False
                 while trial_rows:
                     t_weight = cur_weight.copy()
@@ -2984,6 +2998,7 @@ class FluidStateEstimator:
                             removed_items.append(item)
                         res = trial_res
                         unconverged_streak = 0 if res.converged else (unconverged_streak + 1)
+                        need_identify = True
                         accepted_trial = True
                         break
                     if len(trial_rows) == 1:
@@ -2999,7 +3014,8 @@ class FluidStateEstimator:
                     break
 
             self.bad_data = removed_items
-            self.identify_bad_data(res, threshold=threshold_value, weight_override=cur_weight)
+            if need_identify:
+                self.identify_bad_data(res, threshold=threshold_value, weight_override=cur_weight)
             self.bad_data = removed_items
             self.result = res
             self._write_back_state(res.x)

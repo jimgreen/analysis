@@ -4177,6 +4177,87 @@ def test_fluid_bad_data_pressure_explosion_rollback_and_fullstep_damping(tmp_pat
     assert any(it.measurement.device_name == "sp_4_8" and it.measurement.meas_type == "FLOW_FROM" for it in rem)
 
 
+def test_fluid_zero_flow_heat_loss_jacobian_well_conditioned_and_bad_data_no_redundant_id(tmp_path):
+    """验证零流量蒸汽管热损雅可比良态无数值爆炸，且删坏跳过临界行时不重复调用 identify_bad_data。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    lines = [
+        "<SteamMedium>",
+        "@ density compressibility molar_mass temperature heat_capacity ambient_enthalpy reference_temperature reference_enthalpy feedwater_enthalpy flow_factor",
+        "# 4.0 1.0 0.018 473.15 2.08 419.0 100.0 2676.0 419.0 1.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name pressure enthalpy temperature run_stat",
+        "# 1 sn_1 10.0 3000.0 255.76923 1",
+        "# 2 sn_2 9.95 3000.0 255.76923 1",
+        "# 3 sn_3 9.95 3000.0 255.76923 1",
+        "</SteamNode>",
+        "<SteamSource>\n@ idx name node control_type pressure_set flow_set alpha flow_min flow_max enthalpy_set run_stat\n# 1 ssrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 5.0 3000.0 1\n</SteamSource>",
+        "<SteamLoad>\n@ idx name node flow_set condensate_enthalpy run_stat\n# 1 sld_2 2 0.25 419.0 1\n</SteamLoad>",
+        "<SteamPipe>\n@ idx name i_node j_node conductance heat_loss run_stat\n# 1 sp_1_2 1 2 1.0 1e-6 1\n# 2 sp_2_3 2 3 1.0 1e-6 1\n</SteamPipe>",
+    ]
+    steam_e = tmp_path / "steam_zero_flow.e"
+    steam_e.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # 支路 sp_2_3 无负荷故稳态流量近似为 0，在两端放 PRESSURE / H_TO / FLOW_FROM 量测
+    meas = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value",
+        "# 1 m_1 SteamNode sn_1 PRESSURE 100.0 1 10.0",
+        "# 2 m_2 SteamNode sn_2 PRESSURE 100.0 1 9.95",
+        "# 3 m_3 SteamNode sn_3 PRESSURE 100.0 1 9.9499",
+        "# 4 m_4 SteamNode sn_1 ENTHALPY 1e-3 1 3000.0",
+        "# 5 m_5 SteamNode sn_2 ENTHALPY 1e-3 1 3000.0",
+        "# 6 m_6 SteamNode sn_3 ENTHALPY 1e-3 1 3000.0",
+        "# 7 m_7 SteamPipe sp_1_2 FLOW_FROM 100.0 1 0.9975",
+        "# 8 m_8 SteamPipe sp_2_3 FLOW_FROM 100.0 1 0.0005",
+        "# 9 m_9 SteamPipe sp_2_3 H_TO 1e-3 1 2997.42",
+        "</Measurement>",
+    ]
+    steam_m = tmp_path / "steam_zero_flow.meas"
+    steam_m.write_text("\n".join(meas) + "\n", encoding="utf-8")
+
+    net = load_steam_network_from_e_file(str(steam_e))
+    est = SteamStateEstimator(net, str(steam_m), parameters=SE_PARAMS.with_overrides(max_iter=100), flat_start=True)
+    est.prepare()
+    obs = est.analyze_observability(add_pseudo=True)
+    # 1. 在极微正流量平台段内（|f| = sqrt(1e-7) ≈ 3.16e-4 < 1e-3）校验解析雅可比与中心差分吻合且量级有界
+    x_probe = est.initial_state(flat_start=False)
+    x_probe[2] = x_probe[1] - 1e-7
+    H_ana = est.jacobian_sparse(x_probe).toarray()
+    assert float(np.max(np.abs(H_ana))) < 1e4
+    eps = 1e-9
+    H_num = np.zeros_like(H_ana)
+    for j in range(x_probe.size):
+        dx = np.zeros_like(x_probe)
+        dx[j] = eps
+        H_num[:, j] = (est.evaluate(x_probe + dx) - est.evaluate(x_probe - dx)) / (2.0 * eps)
+    assert np.allclose(H_ana, H_num, rtol=1e-4, atol=1e-4)
+
+    # 2. 求解后信息矩阵良态无负特征值，且删坏在遇临界行跳过时不会无限重复调用 identify_bad_data
+    res = est.estimate(observability=obs)
+    assert res.converged
+    G = res.gain.toarray()
+    eigs = np.linalg.eigvalsh(G)
+    assert float(eigs.min()) > 0.0
+    assert float(eigs.max() / max(eigs.min(), 1e-30)) < 1e14
+
+    call_cnt = {"n": 0}
+    orig_id = est.identify_bad_data
+
+    def counted_id(*args, **kwargs):
+        call_cnt["n"] += 1
+        return orig_id(*args, **kwargs)
+
+    est.identify_bad_data = counted_id
+    res2, rem2 = est.estimate_with_bad_data_removal(threshold=0.01, max_remove=5)
+    assert res2.converged
+    # 每次成功删坏最多触发 1 次重识 + 1 次收尾（绝不因跳过临界行暴增至数十次）
+    assert call_cnt["n"] <= len(rem2) + 2
+
+
+
 
 
 

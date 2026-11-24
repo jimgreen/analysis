@@ -12694,6 +12694,17 @@ class HybridStateEstimator:
                                 )
                             else:
                                 wb_rows, wb_prev_w, wb_prev_H, wb_defer, wb_used_anc = None, None, None, False, False
+                            # 剩余配额与待删显性强坏数据仍充足时，批删中间轮次安全复用粗收敛早停，避免无谓精磨
+                            batch_coarse_thr = (
+                                coarse_thr
+                                if (
+                                    coarse_thr is not None
+                                    and half_attempt == 0
+                                    and (remaining_quota - len(batch_rows)) >= 2
+                                    and (len(valid_cands) - len(batch_rows)) >= 10
+                                )
+                                else None
+                            )
                             trial_result = self.estimate(
                                 measurements=base_measurements,
                                 x0=trial_x0,
@@ -12705,7 +12716,7 @@ class HybridStateEstimator:
                                 _woodbury_removed_rows=wb_rows,
                                 _woodbury_prev_weights=wb_prev_w,
                                 _woodbury_prev_H=wb_prev_H,
-                                _coarse_bad_data_threshold=None,
+                                _coarse_bad_data_threshold=batch_coarse_thr,
                                 _defer_factor_refresh=wb_defer and len(batch_rows) < 8,
                                 _woodbury_u_cache=anchor_u_cache,
                                 _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
