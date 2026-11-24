@@ -593,18 +593,47 @@ def build_upper_csr_from_aat(
                 a_sup[pos] = G_csr.data[u_mask]
                 return cached_pattern["ia"], cached_pattern["ja"], a_sup, cached_pattern
 
-    ia, ja, a, upper_mask, sup_keys = _upper_csr_from_symmetric_csr(G_csr)
-    n_rows = int(G_csr.shape[0])
-    # 检查上三角每行首项是否包含全部对角元 (i, i)（用于 damping > 0 安全判定）
+    # 基于严格正值符号矩阵 A_bin 构造 A·A^T + I 的完整结构超集模式，彻底防止平启动时（如 theta=0）
+    # 因数值偶然相消为 0 而漏收稀疏非零位，导致后续迭代丢失非对角耦合破坏正定性（error=-4）。
+    n_rows = int(A_csc_use.shape[0])
+    A_bin = SP_CSC_MATRIX(
+        (np.ones(int(A_csc_use.nnz), dtype=np.float64), A_csc_use.indices, A_csc_use.indptr),
+        shape=A_csc_use.shape,
+        copy=False,
+    )
+    G_sym = (A_bin.tocsr() @ A_bin.T + SP_EYE(n_rows, format="csr", dtype=np.float64)).tocsr()
+    if not G_sym.has_sorted_indices:
+        G_sym.sort_indices()
+    ia, ja, _a_sym, upper_mask, sup_keys = _upper_csr_from_symmetric_csr(G_sym)
     has_full_diag = bool(
         n_rows == 0
         or (np.all(ia[1:] > ia[:-1]) and np.array_equal(ja[ia[:-1]], np.arange(n_rows, dtype=np.int32)))
     )
+    t_map = NATIVE_BUILD_CSC_TRANSPOSE_MAP(A_csc_use) if NATIVE_BUILD_CSC_TRANSPOSE_MAP is not None else None
+    a_val = None
+    if NATIVE_ASSEMBLE_AAT_UPPER_CSR is not None:
+        a_val = NATIVE_ASSEMBLE_AAT_UPPER_CSR(
+            A_csc_use,
+            ia,
+            ja,
+            damping=beta,
+            transpose_map=t_map,
+        )
+    if a_val is None:
+        # 纯 Python 回退：将 G_csr 上三角精确映射回严格符号超集 sup_keys
+        row_nnz = np.diff(G_csr.indptr)
+        row_idx = np.repeat(np.arange(n_rows, dtype=G_csr.indices.dtype), row_nnz)
+        u_mask = G_csr.indices >= row_idx
+        sub_keys = row_idx[u_mask].astype(np.int64) * np.int64(n_rows) + G_csr.indices[u_mask].astype(np.int64)
+        a_val = np.zeros(sup_keys.size, dtype=np.float64)
+        if sub_keys.size:
+            pos = np.searchsorted(sup_keys, sub_keys)
+            a_val[pos] = G_csr.data[u_mask]
     new_pattern = {
-        "shape": G_csr.shape,
-        "nnz": int(G_csr.nnz),
-        "g_indptr": G_csr.indptr.copy(),
-        "g_indices": G_csr.indices.copy(),
+        "shape": G_sym.shape,
+        "nnz": int(G_sym.nnz),
+        "g_indptr": G_sym.indptr.copy(),
+        "g_indices": G_sym.indices.copy(),
         "upper_mask": upper_mask,
         "sup_keys": sup_keys,
         "ia": ia,
@@ -615,14 +644,10 @@ def build_upper_csr_from_aat(
         "a_indices": A_csc_use.indices.copy(),
         "a_indptr_ref": A_csc_use.indptr,
         "a_indices_ref": A_csc_use.indices,
-        "a_transpose_map": (
-            NATIVE_BUILD_CSC_TRANSPOSE_MAP(A_csc_use)
-            if NATIVE_BUILD_CSC_TRANSPOSE_MAP is not None
-            else None
-        ),
+        "a_transpose_map": t_map,
         "has_full_diag": has_full_diag,
     }
-    return ia, ja, a, new_pattern
+    return ia, ja, a_val, new_pattern
 
 
 class MKLPardisoFactorizationError(RuntimeError):
@@ -653,6 +678,7 @@ class MKLPardisoFactor:
         self._ja = np.ascontiguousarray(ja, dtype=np.int32)
         self._upper_pattern = upper_pattern
         self._a: Optional[np.ndarray] = None
+        self._a_owned: bool = False
         self._pt = np.zeros(64, dtype=np.int64)
         self._iparm = np.zeros(64, dtype=np.int32)
         self._perm = np.zeros(self._n, dtype=np.int32)
@@ -664,13 +690,14 @@ class MKLPardisoFactor:
         self._dummy = np.zeros(1, dtype=np.float64)
         self._closed = False
         self._factorized = False
+        self._pt_dirty = False
         self._last_aat_operand = None
         self._last_damping: float = 0.0
         self._cholmod_materialized = None
         self._diag_idx: Optional[np.ndarray] = None
         self._refresh_diag_index()
 
-        # 执行符号分析 phase=11（中大型矩阵启用两级并行分解 iparm[23]=10，若不兼容自动回退 0）
+        # 执行符号分析 phase=11
         self._run_symbolic_analysis()
 
     def _refresh_diag_index(self) -> None:
@@ -706,7 +733,20 @@ class MKLPardisoFactor:
         err = self._call_pardiso(11, 1, self._dummy, self._dummy, a_arr=self._dummy)
         if err != 0:
             self._closed = True
+            self._pt_dirty = False
             raise RuntimeError(f"MKL PARDISO symbolic analysis failed with error={err}")
+        self._pt_dirty = False
+
+    def _release_dirty_pt(self) -> None:
+        """数值分解失败后释放已被 MKL 污染的内部句柄 pt，保留稀疏模式与数值缓冲供下次自动重建。"""
+        if not self._closed and not self._pt_dirty:
+            try:
+                self._call_pardiso(-1, 1, self._dummy, self._dummy, a_arr=self._dummy)
+            except Exception:
+                pass
+        self._pt.fill(0)
+        self._pt_dirty = True
+        self._factorized = False
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -751,14 +791,17 @@ class MKLPardisoFactor:
 
     def factorize_inplace(self, a: np.ndarray, *, aat_operand=None, damping: float = 0.0) -> None:
         """复用已缓存的符号分析与置换，原位执行多线程数值 Cholesky 分解（``phase=22``）。"""
+        if self._pt_dirty:
+            self._run_symbolic_analysis()
         a_c = np.ascontiguousarray(a, dtype=np.float64)
         self._a = a_c
+        self._a_owned = a_c is not a
         self._last_aat_operand = aat_operand
         self._last_damping = float(damping)
         self._cholmod_materialized = None
         err = self._call_pardiso(22, 1, self._dummy, self._dummy, a_arr=a_c)
         if err != 0:
-            self._factorized = False
+            self._release_dirty_pt()
             raise MKLPardisoFactorizationError(f"MKL PARDISO numerical factorization failed with error={err}")
         self._factorized = True
 
@@ -773,14 +816,19 @@ class MKLPardisoFactor:
         beta = float(new_damping)
         delta = beta - self._last_damping
         if delta != 0.0 and self._diag_idx.size > 0:
+            if not self._a_owned:
+                self._a = self._a.copy()
+                self._a_owned = True
             self._a[self._diag_idx] += delta
         self._last_damping = beta
         if aat_operand is not None:
             self._last_aat_operand = aat_operand
         self._cholmod_materialized = None
+        if self._pt_dirty:
+            self._run_symbolic_analysis()
         err = self._call_pardiso(22, 1, self._dummy, self._dummy, a_arr=self._a)
         if err != 0:
-            self._factorized = False
+            self._release_dirty_pt()
             raise MKLPardisoFactorizationError(f"MKL PARDISO numerical factorization failed with error={err}")
         self._factorized = True
 
@@ -814,7 +862,7 @@ class MKLPardisoFactor:
         )
         if not same_struct:
             # 稀疏结构变化时原位重建 PARDISO 符号分析上下文
-            if not self._closed:
+            if not self._closed and not self._pt_dirty:
                 try:
                     self._call_pardiso(-1, 1, self._dummy, self._dummy, a_arr=self._dummy)
                 except Exception:
@@ -931,11 +979,13 @@ class MKLPardisoFactor:
 
     def close(self) -> None:
         if not self._closed:
-            try:
-                self._call_pardiso(-1, 1, self._dummy, self._dummy, a_arr=self._dummy)
-            except Exception:
-                pass
+            if not self._pt_dirty:
+                try:
+                    self._call_pardiso(-1, 1, self._dummy, self._dummy, a_arr=self._dummy)
+                except Exception:
+                    pass
             self._closed = True
+            self._pt_dirty = False
             self._factorized = False
             self._cholmod_materialized = None
 

@@ -1192,9 +1192,10 @@ static PyObject* py_assemble_aat_upper_csr_cached(PyObject*, PyObject* args) {
     double* a_out = static_cast<double*>(g_aout.view.buf);
     const int32_t n = static_cast<int32_t>(n_int);
 
+    int pattern_miss = 0;
     Py_BEGIN_ALLOW_THREADS
     const int n_threads = (n >= 2048) ? resolve_openmp_threads() : 1;
-    #pragma omp parallel num_threads(n_threads)
+    #pragma omp parallel num_threads(n_threads) reduction(+:pattern_miss)
     {
         std::vector<int32_t> slot(static_cast<size_t>(n), -1);
         #pragma omp for schedule(dynamic, 128)
@@ -1223,6 +1224,8 @@ static PyObject* py_assemble_aat_upper_csr_cached(PyObject*, PyObject* args) {
                             const int32_t gp = slot[ai.ptr[p]];
                             if (gp >= 0) {
                                 a_out[gp] += vi * vj;
+                            } else {
+                                pattern_miss += 1;
                             }
                         }
                     }
@@ -1245,6 +1248,8 @@ static PyObject* py_assemble_aat_upper_csr_cached(PyObject*, PyObject* args) {
                                 const int32_t gp = slot[j];
                                 if (gp >= 0) {
                                     a_out[gp] += vi * vj;
+                                } else {
+                                    pattern_miss += 1;
                                 }
                             }
                         }
@@ -1258,6 +1263,9 @@ static PyObject* py_assemble_aat_upper_csr_cached(PyObject*, PyObject* args) {
     }
     Py_END_ALLOW_THREADS
 
+    if (pattern_miss > 0) {
+        Py_RETURN_FALSE;
+    }
     Py_RETURN_TRUE;
 }
 

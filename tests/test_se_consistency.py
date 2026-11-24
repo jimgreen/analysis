@@ -3542,6 +3542,14 @@ def test_native_kernels_equivalence_aat_ac_and_meas_parser(tmp_path):
         G_ref2 = (A_csc @ A_csc.T).toarray() + np.eye(n_s) * 1.5
         dx_ref = np.linalg.solve(G_ref2, rhs)
         assert np.allclose(dx_nat, dx_ref, rtol=1e-11, atol=1e-11)
+        # 验证 phase=22 遇非正定失败释放污染句柄 pt 后，后续加正阻尼仍可自动恢复精确分解
+        a_neg = a_init.copy()
+        a_neg[ia[:-1]] -= 1e6
+        with pytest.raises(RuntimeError):
+            fac.factorize_inplace(a_neg, aat_operand=A_csc, damping=0.25 - 1e6)
+        fac.update_damping_and_factorize(1.5, aat_operand=A_csc)
+        dx_rec = fac.solve(rhs)
+        assert np.allclose(dx_rec, dx_ref, rtol=1e-11, atol=1e-11)
         fac.close()
 
     # 2. AC 复电压、支路/变压器求值与雅可比（含三绕组与 direct scatter）等价性
