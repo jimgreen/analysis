@@ -3729,6 +3729,258 @@ def test_native_kernels_equivalence_aat_ac_and_meas_parser(tmp_path):
         assert ppc_nat["device_name_id_by_bytes"] == ppc_py["device_name_id_by_bytes"]
 
 
+def test_fluid_se_vectorized_observability_and_bad_data_removal(tmp_path):
+    """验证流体网络向量化求值/雅可比精度、50% 盲区 O(N) 补齐及双上限精确杠杆坏数据剔除。"""
+    from lfcore.heat_lf import HeatPowerFlowCalc
+    from lfcore.steam_lf import SteamPowerFlowCalc
+    from model.heat_model import load_heat_network_from_e_file
+    from model.meas_model import Measurement
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.heat_se import HeatStateEstimator
+    from secore.steam_se import SteamStateEstimator
+
+    lf_params = algorithm_parameters.PowerFlowParameters(
+        tol=1e-7, max_iter=100, min_voltage=0.1, divergence_threshold=1e6
+    )
+
+    # 1. 自包含 25 节点蒸汽网（含管段、阀门、减压器、源、负荷）
+    n_s = 25
+    steam_lines = [
+        "<SteamMedium>",
+        "@ density compressibility molar_mass temperature heat_capacity ambient_enthalpy reference_temperature reference_enthalpy feedwater_enthalpy flow_factor",
+        "# 4.0 1.0 0.018 473.15 2.08 419.0 100.0 2676.0 419.0 1.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name pressure enthalpy temperature run_stat",
+    ]
+    for i in range(1, n_s + 1):
+        p_init = 10.0 - 0.015 * (i // 2)
+        steam_lines.append(f"# {i} s_n{i} {p_init:.4f} 3000.0 255.76923 1")
+    steam_lines += [
+        "</SteamNode>",
+        "<SteamSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max enthalpy_set run_stat",
+        "# 1 s_src 1 PRESSURE 10.0 0.0 1.0 0.0 5.0 3000.0 1",
+        "</SteamSource>",
+        "<SteamLoad>",
+        "@ idx name node flow_set condensate_enthalpy run_stat",
+    ]
+    for k, nd in enumerate(range(13, n_s + 1), start=1):
+        steam_lines.append(f"# {k} s_ld_{k} {nd} 0.05 419.0 1")
+    steam_lines += [
+        "</SteamLoad>",
+        "<SteamPipe>",
+        "@ idx name i_node j_node conductance heat_loss run_stat",
+    ]
+    pid = 1
+    valve_rows = []
+    red_rows = []
+    for child in range(2, n_s + 1):
+        parent = child // 2
+        if child == 2:
+            red_rows.append(f"# 1 s_red_1_2 1 2 RATIO 1.0 0.0 2.0e-6 1")
+        elif child == 3:
+            valve_rows.append(f"# 1 s_val_1_3 1 3 OPEN 1.0 0.0 1.5e-6 1")
+        else:
+            steam_lines.append(f"# {pid} s_pipe_{parent}_{child} {parent} {child} 1.0 2.0e-6 1")
+            pid += 1
+    steam_lines += [
+        "</SteamPipe>",
+        "<SteamValve>",
+        "@ idx name i_node j_node control_type conductance flow_set heat_loss run_stat",
+        *valve_rows,
+        "</SteamValve>",
+        "<SteamPressureReducer>",
+        "@ idx name i_node j_node control_type ratio flow_set heat_loss run_stat",
+        *red_rows,
+        "</SteamPressureReducer>",
+    ]
+    steam_e = tmp_path / "steam_unit.e"
+    steam_e.write_text("\n".join(steam_lines) + "\n", encoding="utf-8")
+
+    s_net_true = load_steam_network_from_e_file(str(steam_e))
+    s_lf = SteamPowerFlowCalc(s_net_true, parameters=lf_params, result_mode="none")
+    assert s_lf.run() == 0
+    s_net_true.prepare()
+
+    # 构造覆盖节点压力/焓/温、管段流量/端压/下游焓/下游温、负荷热的量测文件
+    meas_specs = []
+    for i in range(n_s):
+        nm = f"s_n{i + 1}"
+        meas_specs.append(("SteamNode", nm, "PRESSURE", i))
+        meas_specs.append(("SteamNode", nm, "ENTHALPY", i))
+        if i % 3 == 0:
+            meas_specs.append(("SteamNode", nm, "TEMPERATURE", i))
+    for epos, edge in enumerate(s_net_true.edges):
+        dt = "SteamPressureReducer" if edge.name.startswith("s_red_") else (
+            "SteamValve" if edge.name.startswith("s_val_") else "SteamPipe"
+        )
+        ni = int(s_net_true.edge_i[epos])
+        meas_specs.append((dt, edge.name, "FLOW_FROM", ni))
+        meas_specs.append((dt, edge.name, "PRESSURE_FROM", ni))
+        meas_specs.append((dt, edge.name, "H_TO", ni))
+        if epos % 4 == 0:
+            meas_specs.append((dt, edge.name, "T_TO", ni))
+    meas_specs.append(("SteamLoad", "s_ld_1", "HEAT", 12))
+
+    dummy = [
+        Measurement(idx + 1, f"m_{idx + 1}", dt, dn, mt, 100.0, True, 0.0)
+        for idx, (dt, dn, mt, _nd) in enumerate(meas_specs)
+    ]
+    ref_s = SteamStateEstimator(s_net_true, measurements=dummy, parameters=SE_PARAMS, flat_start=False)
+    ref_s.prepare()
+    x_true = ref_s.initial_state(flat_start=False)
+    if ref_s.n_regulated > 0 and getattr(s_lf, "edge_flow", None) is not None:
+        x_true[ref_s.base_regulated_flow : ref_s.base_supply_temperature] = np.asarray(
+            s_lf.edge_flow, dtype=np.float64
+        )[s_net_true.regulated_edge_pos]
+    h_true = ref_s.evaluate(x_true)
+
+    # 1a. 中心有限差分核验向量化解析雅可比逐元素一致
+    H_an = ref_s.jacobian_sparse(x_true).toarray()
+    eps = 1e-6
+    for col in range(ref_s.state_count):
+        xp = x_true.copy()
+        xm = x_true.copy()
+        step = eps * max(1.0, abs(float(x_true[col])) * 1e-2)
+        xp[col] += step
+        xm[col] -= step
+        fd_col = (ref_s.evaluate(xp) - ref_s.evaluate(xm)) / (2.0 * step)
+        assert np.allclose(H_an[:, col], fd_col, rtol=1e-4, atol=1e-5), f"Steam jac mismatch at col={col}"
+
+    # 1b. 写入 .meas（注入 3 条大幅坏数据：2 条节点压力 + 1 条节点焓值）校验双上限精准剔除
+    bad_targets = {("SteamNode", "s_n4", "PRESSURE"), ("SteamNode", "s_n9", "PRESSURE"), ("SteamNode", "s_n1", "ENTHALPY")}
+    bad_idxs = set()
+    m_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for idx, (dt, dn, mt, _nd) in enumerate(meas_specs):
+        val0 = float(h_true[idx])
+        scale = max(abs(val0), 1.0 if "FLOW" not in mt else 0.1)
+        sigma = 0.005 * scale
+        w = 1.0 / (sigma * sigma)
+        if (dt, dn, mt) in bad_targets:
+            val = val0 * 1.35
+            bad_idxs.add(idx + 1)
+        else:
+            val = val0
+        m_lines.append(f"# {idx + 1} m_{idx + 1} {dt} {dn} {mt} {w:.6g} 1 {val:.8g}")
+    m_lines.append("</Measurement>")
+    steam_m = tmp_path / "steam_bad.meas"
+    steam_m.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    s_net_bad = load_steam_network_from_e_file(str(steam_e))
+    s_est = SteamStateEstimator(
+        s_net_bad,
+        str(steam_m),
+        parameters=SE_PARAMS.with_overrides(bad_threshold=4.0, max_remove=6, max_remove_per_round=2),
+        flat_start=True,
+    )
+    res_bad, removed = s_est.estimate_with_bad_data_removal(threshold=4.0, max_remove=6, max_remove_per_round=2)
+    assert res_bad.converged
+    removed_ids = {int(it.measurement.idx) for it in removed}
+    assert bad_idxs.issubset(removed_ids), f"expected {bad_idxs} in {removed_ids}"
+    assert len(removed_ids) <= 4
+    p_true = np.sqrt(np.maximum(x_true[: s_est.n_potential], 1e-12))
+    p_est = np.sqrt(np.maximum(res_bad.x[: s_est.n_potential], 1e-12))
+    assert float(np.max(np.abs(p_est - p_true) / np.maximum(p_true, 1e-6))) < 0.01
+
+    # 1c. 50% 盲区 O(N) 可观测性定向补齐并满秩收敛
+    blind_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for idx, (dt, dn, mt, nd) in enumerate(meas_specs):
+        val0 = float(h_true[idx])
+        scale = max(abs(val0), 1.0 if "FLOW" not in mt else 0.1)
+        w = 1.0 / ((0.01 * scale) ** 2)
+        vld = 0 if (nd % 2 == 1) else 1
+        blind_lines.append(f"# {idx + 1} m_{idx + 1} {dt} {dn} {mt} {w:.6g} {vld} {val0:.8g}")
+    blind_lines.append("</Measurement>")
+    steam_blind_m = tmp_path / "steam_blind.meas"
+    steam_blind_m.write_text("\n".join(blind_lines) + "\n", encoding="utf-8")
+
+    s_net_blind = load_steam_network_from_e_file(str(steam_e))
+    s_blind = SteamStateEstimator(
+        s_net_blind,
+        str(steam_blind_m),
+        parameters=SE_PARAMS.with_overrides(targeted_pseudo_measurement_max=500),
+        flat_start=True,
+    )
+    obs_blind = s_blind.analyze_observability(add_pseudo=True)
+    assert obs_blind.observable and obs_blind.rank == s_blind.state_count
+    res_blind = s_blind.estimate(observability=obs_blind)
+    assert res_blind.converged
+
+    # 2. 自包含 8 节点热网向量化温度求值与雅可比有限差分一致性校验
+    heat_lines = [
+        "<HeatMedium>",
+        "@ density heat_capacity ambient_temperature temperature flow_factor",
+        "# 998.0 4.186 20.0 353.15 1.0",
+        "</HeatMedium>",
+        "<HeatNode>",
+        "@ idx name pressure temperature supply_temperature return_temperature run_stat",
+        "# 1 h_n1 10.0 90.0 90.0 70.0 1",
+        "# 2 h_n2 9.95 89.5 89.5 69.5 1",
+        "# 3 h_n3 9.90 89.0 89.0 69.0 1",
+        "# 4 h_n4 9.85 88.5 88.5 68.5 1",
+        "</HeatNode>",
+        "<HeatSource>",
+        "@ idx name node control_type pressure_set flow_set supply_temperature run_stat",
+        "# 1 h_src 1 PRESSURE 10.0 0.0 90.0 1",
+        "</HeatSource>",
+        "<HeatLoad>",
+        "@ idx name node flow_set return_temperature run_stat",
+        "# 1 h_ld1 3 0.2 68.0 1",
+        "# 2 h_ld2 4 0.2 68.0 1",
+        "</HeatLoad>",
+        "<HeatPipe>",
+        "@ idx name i_node j_node conductance heat_loss run_stat",
+        "# 1 h_p12 1 2 1.0 1.0e-3 1",
+        "# 2 h_p23 2 3 1.0 1.0e-3 1",
+        "# 3 h_p24 2 4 1.0 1.0e-3 1",
+        "</HeatPipe>",
+    ]
+    heat_e = tmp_path / "heat_unit.e"
+    heat_e.write_text("\n".join(heat_lines) + "\n", encoding="utf-8")
+    h_net = load_heat_network_from_e_file(str(heat_e))
+    h_lf = HeatPowerFlowCalc(h_net, parameters=lf_params, result_mode="none")
+    assert h_lf.run() == 0
+    h_net.prepare()
+    h_meas = [
+        Measurement(1, "hm1", "HeatNode", "h_n1", "PRESSURE", 100.0, True, 0.0),
+        Measurement(2, "hm2", "HeatNode", "h_n2", "PRESSURE", 100.0, True, 0.0),
+        Measurement(3, "hm3", "HeatNode", "h_n3", "PRESSURE", 100.0, True, 0.0),
+        Measurement(4, "hm4", "HeatNode", "h_n4", "PRESSURE", 100.0, True, 0.0),
+        Measurement(5, "hm5", "HeatNode", "h_n1", "T_SUPPLY", 100.0, True, 0.0),
+        Measurement(6, "hm6", "HeatNode", "h_n2", "T_SUPPLY", 100.0, True, 0.0),
+        Measurement(7, "hm7", "HeatNode", "h_n3", "T_SUPPLY", 100.0, True, 0.0),
+        Measurement(8, "hm8", "HeatNode", "h_n4", "T_SUPPLY", 100.0, True, 0.0),
+        Measurement(9, "hm9", "HeatNode", "h_n1", "T_RETURN", 100.0, True, 0.0),
+        Measurement(10, "hm10", "HeatNode", "h_n2", "T_RETURN", 100.0, True, 0.0),
+        Measurement(11, "hm11", "HeatNode", "h_n3", "T_RETURN", 100.0, True, 0.0),
+        Measurement(12, "hm12", "HeatNode", "h_n4", "T_RETURN", 100.0, True, 0.0),
+        Measurement(13, "hm13", "HeatPipe", "h_p12", "FLOW_FROM", 100.0, True, 0.0),
+        Measurement(14, "hm14", "HeatPipe", "h_p23", "TS_FROM", 100.0, True, 0.0),
+        Measurement(15, "hm15", "HeatPipe", "h_p24", "TR_TO", 100.0, True, 0.0),
+    ]
+    h_est = HeatStateEstimator(h_net, measurements=h_meas, parameters=SE_PARAMS, flat_start=False)
+    h_est.prepare()
+    xh = h_est.initial_state(flat_start=False)
+    zh = h_est.evaluate(xh)
+    for m_obj, v_val in zip(h_meas, zh.tolist()):
+        m_obj.value = float(v_val)
+    h_est._rebuild_measurement_groups()
+    Hh_an = h_est.jacobian_sparse(xh).toarray()
+    for col in range(h_est.state_count):
+        xp = xh.copy()
+        xm = xh.copy()
+        xp[col] += 1e-6
+        xm[col] -= 1e-6
+        fd_col = (h_est.evaluate(xp) - h_est.evaluate(xm)) / 2e-6
+        assert np.allclose(Hh_an[:, col], fd_col, rtol=1e-4, atol=1e-5), f"Heat jac mismatch at col={col}"
+    obs_h = h_est.analyze_observability(add_pseudo=True)
+    assert obs_h.observable
+    res_h = h_est.estimate(observability=obs_h)
+    assert res_h.converged
+
+
+
 
 
 
