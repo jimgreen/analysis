@@ -3476,6 +3476,252 @@ def test_bad_data_limits_per_round_total_and_zero_injection_protection(tmp_path)
     assert all(str(item.measurement.device_type) != "ACPowerBalance" for item in rem_full)
 
 
+def test_native_kernels_equivalence_aat_ac_and_meas_parser(tmp_path):
+    """验证 C++17/OpenMP 原生核（固定模式 A·A^T、AC 复电压/支路/平衡雅可比、.meas 解析及 PARDISO 阻尼原位更新）与参考实现逐位等价。"""
+    from scipy.sparse import csc_matrix, csr_matrix, eye as sp_eye
+    from secore.native_kernels import (
+        assemble_aat_upper_csr_native,
+        build_csc_transpose_map_native,
+        complex_voltage_native,
+        eval_ac_branch_power_values_native,
+        fill_ac_balance_jacobian_native,
+        fill_ac_branch_power_jacobian_native,
+        is_native_kernels_available,
+    )
+    from secore.mkl_pardiso import (
+        MKLPardisoFactor,
+        build_upper_csr_from_aat,
+        is_mkl_pardiso_available,
+    )
+    from model import meas_array_model as mam
+
+    if not is_native_kernels_available():
+        pytest.skip("secore._native 扩展不可用")
+
+    rng = np.random.default_rng(20261124)
+
+    # 1. 固定模式转置映射 + Gustavson A·A^T 装配等价性（含 0 掩蔽行与非零阻尼）
+    n_s, m_s = 180, 420
+    rows, cols, vals = [], [], []
+    for c in range(m_s):
+        k = int(rng.integers(1, 6))
+        rs = np.sort(rng.choice(n_s, size=k, replace=False))
+        rows.extend(rs.tolist())
+        cols.extend([c] * k)
+        vals.extend(rng.normal(0.0, 2.0, size=k).tolist())
+    A_csc = csc_matrix((vals, (rows, cols)), shape=(n_s, m_s), dtype=np.float64)
+    A_csc.sort_indices()
+    ia, ja, a_init, pat = build_upper_csr_from_aat(A_csc, damping=0.25)
+    tmap = build_csc_transpose_map_native(A_csc)
+    assert tmap is not None
+    # 模拟部分列置零（坏数据权重归零掩蔽）
+    A_masked = A_csc.copy()
+    A_masked.data[A_masked.indptr[10] : A_masked.indptr[25]] = 0.0
+    a_nat = assemble_aat_upper_csr_native(A_masked, ia, ja, damping=0.35, transpose_map=tmap)
+    assert a_nat is not None
+    G_ref = (A_masked @ A_masked.T + sp_eye(n_s, format="csr") * 0.35).toarray()
+    G_nat = np.zeros((n_s, n_s), dtype=np.float64)
+    for i in range(n_s):
+        for gp in range(int(ia[i]), int(ia[i + 1])):
+            j = int(ja[gp])
+            G_nat[i, j] = a_nat[gp]
+            G_nat[j, i] = a_nat[gp]
+    assert np.allclose(G_nat, G_ref, rtol=1e-12, atol=1e-12)
+
+    # 若 MKL PARDISO 可用，同步校验原位阻尼更新与 O(n) 无阻尼对角元读取
+    if is_mkl_pardiso_available():
+        fac = MKLPardisoFactor(n_s, ia, ja, upper_pattern=pat)
+        fac.factorize_inplace(a_init, aat_operand=A_csc, damping=0.25)
+        diag_nat = fac.unregularized_diagonal()
+        diag_ref = np.asarray(A_csc.power(2).sum(axis=1), dtype=np.float64).ravel()
+        assert diag_nat is not None
+        assert np.allclose(diag_nat, diag_ref, rtol=1e-12, atol=1e-12)
+        rhs = rng.normal(0.0, 1.0, size=n_s)
+        fac.update_damping_and_factorize(1.5, aat_operand=A_csc)
+        dx_nat = fac.solve(rhs)
+        G_ref2 = (A_csc @ A_csc.T).toarray() + np.eye(n_s) * 1.5
+        dx_ref = np.linalg.solve(G_ref2, rhs)
+        assert np.allclose(dx_nat, dx_ref, rtol=1e-11, atol=1e-11)
+        fac.close()
+
+    # 2. AC 复电压、支路/变压器求值与雅可比（含三绕组与 direct scatter）等价性
+    n_bus = 1500
+    theta = rng.uniform(-0.8, 0.8, size=n_bus)
+    voltage = rng.uniform(0.85, 1.15, size=n_bus)
+    vc_ref = voltage * np.exp(1j * theta)
+    vc_nat = complex_voltage_native(theta, voltage)
+    assert vc_nat is not None
+    assert np.allclose(vc_nat, vc_ref, rtol=1e-13, atol=1e-13)
+
+    m_pow = 600
+    own = rng.integers(0, n_bus, size=m_pow, dtype=np.int64)
+    other = rng.integers(0, n_bus, size=m_pow, dtype=np.int64)
+    third = rng.integers(0, n_bus, size=m_pow, dtype=np.int64)
+    is_p = rng.integers(0, 2, size=m_pow, dtype=np.int8).astype(bool)
+    ys = rng.normal(0.0, 5.0, size=m_pow) + 1j * rng.normal(0.0, 5.0, size=m_pow)
+    ym = rng.normal(0.0, 5.0, size=m_pow) + 1j * rng.normal(0.0, 5.0, size=m_pow)
+    yt = rng.normal(0.0, 2.0, size=m_pow) + 1j * rng.normal(0.0, 2.0, size=m_pow)
+    rows_pow = np.arange(m_pow, dtype=np.int64)
+
+    for has_third in (False, True):
+        vals_nat = np.zeros(m_pow, dtype=np.float64)
+        ok_ev = eval_ac_branch_power_values_native(
+            vals_nat, rows_pow, own, other, third if has_third else None,
+            is_p, ys, ym, yt if has_third else None, vc_ref, has_third,
+        )
+        assert ok_ev
+        cur_ref = ys * vc_ref[own] + ym * vc_ref[other] + (yt * vc_ref[third] if has_third else 0.0)
+        pow_ref = vc_ref[own] * np.conj(cur_ref)
+        vals_ref = np.where(is_p, pow_ref.real, pow_ref.imag)
+        assert np.allclose(vals_nat, vals_ref, rtol=1e-12, atol=1e-12)
+
+        # 雅可比输出模式与 direct scatter 模式对比
+        outs = [np.empty(m_pow, dtype=np.float64) for _ in range(6)]
+        ch_arr = tuple((outs[i], None) if (has_third or i not in (2, 5)) else (None, None) for i in range(6))
+        assert fill_ac_branch_power_jacobian_native(
+            own, other, third if has_third else None, is_p,
+            np.conj(ys), np.conj(ym), np.conj(yt) if has_third else None,
+            voltage, vc_ref, has_third, ch_arr,
+        )
+        # 构造随机 scatter 槽位测试直写路径
+        n_ch = 6 if has_third else 4
+        target = np.full(m_pow * n_ch, -999.0, dtype=np.float64)
+        perm = rng.permutation(m_pow * n_ch).astype(np.int64)
+        slot_chunks = [perm[i * m_pow : (i + 1) * m_pow] for i in range(n_ch)]
+        if has_third:
+            ch_sc = tuple((target, slot_chunks[i]) for i in range(6))
+        else:
+            ch_sc = (
+                (target, slot_chunks[0]),
+                (target, slot_chunks[1]),
+                (None, None),
+                (target, slot_chunks[2]),
+                (target, slot_chunks[3]),
+                (None, None),
+            )
+        assert fill_ac_branch_power_jacobian_native(
+            own, other, third if has_third else None, is_p,
+            np.conj(ys), np.conj(ym), np.conj(yt) if has_third else None,
+            voltage, vc_ref, has_third, ch_sc,
+        )
+        # 与纯 NumPy 参考对比
+        v_conj = np.conj(vc_ref)
+        inv_v = 1.0 / np.maximum(voltage, 1e-12)
+        oo = np.conj(ym) * vc_ref[own] * v_conj[other]
+        o3 = np.conj(yt) * vc_ref[own] * v_conj[third] if has_third else 0.0
+        off = oo + o3
+        dvo = 2.0 * np.conj(ys) * voltage[own] + off * inv_v[own]
+        dvt = oo * inv_v[other]
+        refs = [
+            np.where(is_p, -off.imag, off.real),
+            np.where(is_p, oo.imag, -oo.real),
+            np.where(is_p, o3.imag, -o3.real) if has_third else None,
+            np.where(is_p, dvo.real, dvo.imag),
+            np.where(is_p, dvt.real, dvt.imag),
+            np.where(is_p, (o3 * inv_v[third]).real, (o3 * inv_v[third]).imag) if has_third else None,
+        ]
+        sc_idx = 0
+        for i in range(6):
+            if refs[i] is not None:
+                assert np.allclose(outs[i], refs[i], rtol=1e-12, atol=1e-12)
+                assert np.allclose(target[slot_chunks[sc_idx]], refs[i], rtol=1e-12, atol=1e-12)
+                sc_idx += 1
+
+    # 3. AC 节点功率平衡雅可比原生核等价性
+    n_bal = 300
+    bal_pos = np.sort(rng.choice(n_bus, size=n_bal, replace=False)).astype(np.int64)
+    y_diag_conj = rng.normal(0.0, 4.0, size=n_bus) + 1j * rng.normal(0.0, 4.0, size=n_bus)
+    yb_list, yn_list, yp_list, yc_list = [], [], [], []
+    for b in range(n_bal):
+        bp = int(bal_pos[b])
+        nbrs = np.unique(np.concatenate(([bp], rng.integers(0, n_bus, size=4))))
+        for nd in nbrs:
+            yb_list.append(b)
+            yn_list.append(int(nd))
+            yp_list.append(bp)
+            yc_list.append(complex(rng.normal(0.0, 3.0), rng.normal(0.0, 3.0)))
+    y_bal = np.asarray(yb_list, dtype=np.int32)
+    y_nodes = np.asarray(yn_list, dtype=np.int64)
+    y_pos = np.asarray(yp_list, dtype=np.int64)
+    y_conj = np.asarray(yc_list, dtype=np.complex128)
+    off_mask = y_nodes != y_pos
+    n_off = int(np.count_nonzero(off_mask))
+    counts_yb = np.bincount(y_bal, minlength=n_bal)
+    y_bal_ptr = np.empty(n_bal + 1, dtype=np.int64)
+    y_bal_ptr[0] = 0
+    np.cumsum(counts_yb, dtype=np.int64, out=y_bal_ptr[1:])
+    y_off_idx = np.full(y_bal.size, -1, dtype=np.int32)
+    y_off_idx[off_mask] = np.arange(n_off, dtype=np.int32)
+
+    b_outs = [np.empty(n_off, dtype=np.float64) for _ in range(4)] + [np.empty(n_bal, dtype=np.float64) for _ in range(4)]
+    assert fill_ac_balance_jacobian_native(
+        bal_pos, y_bal_ptr, y_nodes, y_pos, y_conj, y_off_idx, y_diag_conj,
+        voltage, vc_ref, n_off, tuple((arr, None) for arr in b_outs),
+    )
+    inv_v = 1.0 / np.maximum(voltage, 1e-12)
+    y_vt = y_conj * (vc_ref * inv_v)[y_pos] * np.conj(vc_ref)[y_nodes]
+    term = y_vt * voltage[y_pos]
+    off_term = term[off_mask]
+    off_sum = (
+        np.bincount(y_bal[off_mask], weights=off_term.real, minlength=n_bal)
+        + 1j * np.bincount(y_bal[off_mask], weights=off_term.imag, minlength=n_bal)
+    )
+    sum_all = (
+        np.bincount(y_bal, weights=y_vt.real, minlength=n_bal)
+        + 1j * np.bincount(y_bal, weights=y_vt.imag, minlength=n_bal)
+    )
+    th_off = -1j * off_term
+    v_off = off_term * inv_v[y_nodes[off_mask]]
+    th_own = 1j * off_sum
+    v_own = y_diag_conj[bal_pos] * voltage[bal_pos] + sum_all
+    b_refs = [th_off.real, th_off.imag, v_off.real, v_off.imag, th_own.real, th_own.imag, v_own.real, v_own.imag]
+    for arr_n, arr_r in zip(b_outs, b_refs):
+        assert np.allclose(arr_n, arr_r, rtol=1e-12, atol=1e-12)
+
+    # 4. .meas C++ 单遍解析核与 Python 分块解析器 100% 逐列等价性（含 status 列与不含 status 列）
+    for with_status in (False, True):
+        f_meas = tmp_path / f"sample_{int(with_status)}.meas"
+        hdr = "@ idx name dev_type dev_name meas_type weight valid value" + (" status" if with_status else "")
+        rows_txt = ["<Measurement>", hdr]
+        statuses = ("NORMAL", "invalid", "PSEUDO", "3", "0")
+        for i in range(1, 201):
+            dev = f"BUS_{(i % 40) + 1}"
+            dt = "ACNode" if i % 3 else "ACBranch"
+            mt = "V" if i % 3 == 1 else ("angle" if i % 15 == 0 else "P_FROM")
+            w_val = 100.0 + (i % 7) * 0.125
+            vld = 0 if i % 11 == 0 else 1
+            val = ((-1) ** i) * (1.2345e-2 * i)
+            st_sfx = f" {statuses[i % len(statuses)]}" if with_status else ""
+            rows_txt.append(f"# {i} m_{i} {dt} {dev} {mt} {w_val:.6f} {vld} {val:.8e}{st_sfx}")
+        rows_txt.append("</Measurement>")
+        f_meas.write_text("\n".join(rows_txt) + "\n", encoding="utf-8")
+
+        ppc_nat = mam._try_parse_meas_ppc_bulk_bytes(f_meas, include_strings=False, include_matrix=True)
+        orig_fn = mam._NATIVE_PARSE_MEAS_BULK_BYTES
+        try:
+            mam._NATIVE_PARSE_MEAS_BULK_BYTES = None
+            ppc_py = mam._try_parse_meas_ppc_bulk_bytes(f_meas, include_strings=False, include_matrix=True)
+        finally:
+            mam._NATIVE_PARSE_MEAS_BULK_BYTES = orig_fn
+
+        assert ppc_nat is not None and ppc_py is not None
+        for key in (
+            "idx_array",
+            "device_type_code_array",
+            "meas_type_code_array",
+            "valid_array",
+            "status_array",
+            "device_name_id_array",
+            "angle_mask_array",
+        ):
+            assert np.array_equal(ppc_nat[key], ppc_py[key]), f"mismatch on {key}"
+        assert np.allclose(ppc_nat["weight_array"], ppc_py["weight_array"], rtol=1e-14, atol=1e-14)
+        assert np.allclose(ppc_nat["value_array"], ppc_py["value_array"], rtol=1e-14, atol=1e-14)
+        assert list(ppc_nat["device_names"]) == list(ppc_py["device_names"])
+        assert ppc_nat["device_name_id_by_bytes"] == ppc_py["device_name_id_by_bytes"]
+
+
+
 
 
 

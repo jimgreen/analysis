@@ -310,45 +310,78 @@ def _side_alive_node_lookup(side) -> Dict[int, bool]:
 
 def _build_se_dcac_converters(ppc: Dict) -> List[SimpleNamespace]:
     rows = np.asarray(ppc.get("dcac", np.zeros((0, len(DCAC_COLS)), dtype=np.float64)))
+    n_rows = int(rows.shape[0]) if rows.ndim == 2 else 0
+    if n_rows == 0:
+        return []
     names = ppc.get("dcac_name")
-    converters = []
-    for pos, row in enumerate(rows):
-        idx = int(row[DCAC_COLS["idx"]])
-        converters.append(
-            _array_device(
-                idx,
-                _name_at(names, pos, "dcac", idx),
-                ac_node=int(row[DCAC_COLS["ac_node"]]),
-                dc_node=int(row[DCAC_COLS["dc_node"]]),
-                r1=float(row[DCAC_COLS["r1"]]),
-                r2=float(row[DCAC_COLS["r2"]]),
-                ac_control_type=DCAC_AC_CONTROL_LABEL.get(int(row[DCAC_COLS["ac_control_type"]]), "NONE"),
-                dc_control_type=DCAC_DC_CONTROL_LABEL.get(int(row[DCAC_COLS["dc_control_type"]]), "NONE"),
-                p_ac_set=float(row[DCAC_COLS["p_ac_set"]]),
-                p_dc_set=float(row[DCAC_COLS["p_dc_set"]]),
-                q_ac_set=float(row[DCAC_COLS["q_ac_set"]]),
-                v_ac_set=float(row[DCAC_COLS["v_ac_set"]]),
-                v_dc_set=float(row[DCAC_COLS["v_dc_set"]]),
-                run_stat=int(row[DCAC_COLS["run_stat"]]),
-                dc_p=float(row[DCAC_COLS["dc_p"]]),
-                ac_p=float(row[DCAC_COLS["ac_p"]]),
-                ac_q=float(row[DCAC_COLS["ac_q"]]),
-                dc_i=float(row[DCAC_COLS["dc_i"]]),
-                ac_i=float(row[DCAC_COLS["ac_i"]]),
-                dev_type=DCAC_DEVICE_TYPE_LABEL.get(
-                    int(row[DCAC_COLS["dev_type"]]),
-                    "DCACConverter",
-                ),
-                ac_node_obj=None,
-                dc_node_obj=None,
-                ac_isl_obj=None,
-                dc_isl_obj=None,
-                hybrid_isl=0,
-                hybrid_isl_obj=None,
-                is_alive=False,
-            )
+    has_names = names is not None and len(names) == n_rows
+    c_idx = rows[:, DCAC_COLS["idx"]].astype(np.int64, copy=False).tolist()
+    c_ac_node = rows[:, DCAC_COLS["ac_node"]].astype(np.int64, copy=False).tolist()
+    c_dc_node = rows[:, DCAC_COLS["dc_node"]].astype(np.int64, copy=False).tolist()
+    c_r1 = rows[:, DCAC_COLS["r1"]].astype(np.float64, copy=False).tolist()
+    c_r2 = rows[:, DCAC_COLS["r2"]].astype(np.float64, copy=False).tolist()
+    c_ac_ctrl = rows[:, DCAC_COLS["ac_control_type"]].astype(np.int64, copy=False).tolist()
+    c_dc_ctrl = rows[:, DCAC_COLS["dc_control_type"]].astype(np.int64, copy=False).tolist()
+    c_p_ac_set = rows[:, DCAC_COLS["p_ac_set"]].astype(np.float64, copy=False).tolist()
+    c_p_dc_set = rows[:, DCAC_COLS["p_dc_set"]].astype(np.float64, copy=False).tolist()
+    c_q_ac_set = rows[:, DCAC_COLS["q_ac_set"]].astype(np.float64, copy=False).tolist()
+    c_v_ac_set = rows[:, DCAC_COLS["v_ac_set"]].astype(np.float64, copy=False).tolist()
+    c_v_dc_set = rows[:, DCAC_COLS["v_dc_set"]].astype(np.float64, copy=False).tolist()
+    c_run_stat = rows[:, DCAC_COLS["run_stat"]].astype(np.int64, copy=False).tolist()
+    c_dc_p = rows[:, DCAC_COLS["dc_p"]].astype(np.float64, copy=False).tolist()
+    c_ac_p = rows[:, DCAC_COLS["ac_p"]].astype(np.float64, copy=False).tolist()
+    c_ac_q = rows[:, DCAC_COLS["ac_q"]].astype(np.float64, copy=False).tolist()
+    c_dc_i = rows[:, DCAC_COLS["dc_i"]].astype(np.float64, copy=False).tolist()
+    c_ac_i = rows[:, DCAC_COLS["ac_i"]].astype(np.float64, copy=False).tolist()
+    c_dev_type = rows[:, DCAC_COLS["dev_type"]].astype(np.int64, copy=False).tolist()
+    name_list = (
+        [str(v) if v is not None and str(v) else f"dcac_{idx}" for v, idx in zip(names, c_idx)]
+        if has_names
+        else [f"dcac_{idx}" for idx in c_idx]
+    )
+    ac_ctrl_get = DCAC_AC_CONTROL_LABEL.get
+    dc_ctrl_get = DCAC_DC_CONTROL_LABEL.get
+    dev_type_get = DCAC_DEVICE_TYPE_LABEL.get
+    return [
+        SimpleNamespace(
+            idx=idx,
+            name=name,
+            ac_node=ac_node,
+            dc_node=dc_node,
+            r1=r1,
+            r2=r2,
+            ac_control_type=ac_ctrl_get(ac_ctrl, "NONE"),
+            dc_control_type=dc_ctrl_get(dc_ctrl, "NONE"),
+            p_ac_set=p_ac_set,
+            p_dc_set=p_dc_set,
+            q_ac_set=q_ac_set,
+            v_ac_set=v_ac_set,
+            v_dc_set=v_dc_set,
+            run_stat=run_stat,
+            dc_p=dc_p,
+            ac_p=ac_p,
+            ac_q=ac_q,
+            dc_i=dc_i,
+            ac_i=ac_i,
+            dev_type=dev_type_get(dev_type, "DCACConverter"),
+            ac_node_obj=None,
+            dc_node_obj=None,
+            ac_isl_obj=None,
+            dc_isl_obj=None,
+            hybrid_isl=0,
+            hybrid_isl_obj=None,
+            is_alive=False,
         )
-    return converters
+        for (
+            idx, name, ac_node, dc_node, r1, r2, ac_ctrl, dc_ctrl,
+            p_ac_set, p_dc_set, q_ac_set, v_ac_set, v_dc_set,
+            run_stat, dc_p, ac_p, ac_q, dc_i, ac_i, dev_type,
+        ) in zip(
+            c_idx, name_list, c_ac_node, c_dc_node, c_r1, c_r2, c_ac_ctrl, c_dc_ctrl,
+            c_p_ac_set, c_p_dc_set, c_q_ac_set, c_v_ac_set, c_v_dc_set,
+            c_run_stat, c_dc_p, c_ac_p, c_ac_q, c_dc_i, c_ac_i, c_dev_type,
+        )
+    ]
 
 
 def _assign_se_converter_topology(network: _SELightweightHybridNetwork) -> None:
@@ -4249,29 +4282,51 @@ class HybridStateEstimator:
             if table.ndim != 2 or table.shape[0] == 0:
                 return {}
             bus_ids = table[:, cols["idx"]].astype(np.int64, copy=False)
-            wanted = set(wanted_ids)
-            matches = np.flatnonzero(np.isin(bus_ids, list(wanted)))
+            wanted_arr = np.unique(np.asarray(wanted_ids, dtype=np.int64))
+            matches = np.flatnonzero(np.isin(bus_ids, wanted_arr))
             if matches.size == 0:
                 return {}
+            sel_ids = bus_ids[matches].tolist()
+            sel_vbase = table[matches, cols["vbase"]].tolist()
+            sel_v = table[matches, cols["voltage"]].tolist()
+            sel_stat = table[matches, cols["run_stat"]].astype(np.int64, copy=False).tolist()
             raw_names = ppc.get("bus_name", ())
-            has_names = len(raw_names) == int(table.shape[0])
-            result: Dict[int, SimpleNamespace] = {}
-            for pos in matches.tolist():
-                idx_val = int(bus_ids[pos])
-                name_val = str(raw_names[pos]) if has_names and raw_names[pos] is not None else f"bus_{idx_val}"
-                status_val = int(table[pos, cols["run_stat"]])
-                ns_kwargs = {
-                    "idx": idx_val,
-                    "name": name_val,
-                    "vbase": float(table[pos, cols["vbase"]]),
-                    "voltage": float(table[pos, cols["voltage"]]),
-                    "run_stat": status_val,
-                    "is_alive": status_val == 1,
+            if len(raw_names) == int(table.shape[0]):
+                sel_names = [
+                    str(raw_names[pos]) if raw_names[pos] is not None else f"bus_{idx_val}"
+                    for pos, idx_val in zip(matches.tolist(), sel_ids)
+                ]
+            else:
+                sel_names = [f"bus_{idx_val}" for idx_val in sel_ids]
+            if ac_side:
+                sel_ang = table[matches, cols["angle"]].tolist()
+                return {
+                    idx_val: SimpleNamespace(
+                        idx=idx_val,
+                        name=name_val,
+                        vbase=vb_val,
+                        voltage=v_val,
+                        run_stat=st_val,
+                        is_alive=(st_val == 1),
+                        angle=ang_val,
+                    )
+                    for idx_val, name_val, vb_val, v_val, st_val, ang_val in zip(
+                        sel_ids, sel_names, sel_vbase, sel_v, sel_stat, sel_ang
+                    )
                 }
-                if ac_side:
-                    ns_kwargs["angle"] = float(table[pos, cols["angle"]])
-                result[idx_val] = SimpleNamespace(**ns_kwargs)
-            return result
+            return {
+                idx_val: SimpleNamespace(
+                    idx=idx_val,
+                    name=name_val,
+                    vbase=vb_val,
+                    voltage=v_val,
+                    run_stat=st_val,
+                    is_alive=(st_val == 1),
+                )
+                for idx_val, name_val, vb_val, v_val, st_val in zip(
+                    sel_ids, sel_names, sel_vbase, sel_v, sel_stat
+                )
+            }
 
         ac_wanted = [int(conv.ac_node) for conv in self.dcac_converters]
         dc_wanted = [int(conv.dc_node) for conv in self.dcac_converters]
@@ -6276,42 +6331,129 @@ class HybridStateEstimator:
         self._warn_missing_device_pos("disable_coupled_ac_power_balance_no_table", DEVICE_TYPE_ACPowerBalance)
 
     def _add_hybrid_pseudo_measurements(self) -> None:
-        next_idx = self._max_measurement_idx_fast(self.measurements) + 1
+        n_conv = len(self.dcac_converters)
+        if n_conv == 0:
+            return
         measured_devices = self._active_hybrid_converter_measurement_devices()
         converter_keys = self._hybrid_converter_device_key_array()
-        if converter_keys.size and all(int(key) in measured_devices for key in converter_keys):
-            return
-        specs_to_add = []
-        for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
-            if int(spec.device_type_code) != DEVICE_TYPE_DCACConverter:
-                continue
-            device_key = self._hybrid_converter_spec_device_key(spec)
-            if device_key < 0 or device_key in measured_devices:
-                continue
-            if self._voltage_pseudo_is_covered_by_code(spec.device_type_code, spec.device_pos, spec.meas_type_code):
-                continue
-            specs_to_add.append(spec)
-        if not specs_to_add:
-            return
-        batch = []
-        for spec in specs_to_add:
-            meas = Measurement(
-                idx=next_idx,
-                name=f"pseudo_{spec.meas_type.lower()}_{spec.device_name}",
-                device_type=spec.device_type,
-                device_name=spec.device_name,
-                meas_type=spec.meas_type,
-                weight=self.pseudo_measurement_weight_pq,
-                valid=True,
-                value=float(spec.value),
-                device_type_code=int(spec.device_type_code),
-                device_pos=int(spec.device_pos),
-                meas_type_code=int(spec.meas_type_code),
+        if converter_keys.size == n_conv and measured_devices:
+            if len(measured_devices) >= n_conv and all(int(key) in measured_devices for key in converter_keys):
+                return
+            measured_sorted = np.fromiter(measured_devices, dtype=np.int64, count=len(measured_devices))
+            if measured_sorted.size > 1:
+                measured_sorted.sort()
+            pos_hit = np.searchsorted(measured_sorted, converter_keys)
+            in_measured = (pos_hit < measured_sorted.size) & (
+                measured_sorted[np.minimum(pos_hit, measured_sorted.size - 1)] == converter_keys
             )
-            mark_measurement_pseudo(meas)
-            batch.append(meas)
-            next_idx += 1
-        self._append_pseudo_measurement_objects(batch)
+            missing_pos = np.flatnonzero(~in_measured)
+        else:
+            missing_pos = np.arange(n_conv, dtype=np.int64)
+        if missing_pos.size == 0:
+            return
+
+        # 预取真实电压观测节点，对 V_DC / V_AC 做 O(1) 覆盖判定，避免逐条构建 spec 与重复扫描
+        ac_obs_nodes = self._real_voltage_observation_nodes("ac")
+        dc_obs_nodes = self._real_voltage_observation_nodes("dc")
+        ac_has_zero_ties = bool(getattr(self._ac_sub_estimator, "_has_zero_impedance_ties", False)) if self._ac_sub_estimator is not None else False
+        dc_has_zero_ties = bool(getattr(self._dc_sub_estimator, "_has_zero_impedance_ties", False)) if self._dc_sub_estimator is not None else False
+        dcac_dc_nodes = np.asarray(getattr(self, "_dcac_dc_node", ()), dtype=np.int64)
+        dcac_ac_nodes = np.asarray(getattr(self, "_dcac_ac_node", ()), dtype=np.int64)
+        voltage_covered = self._voltage_pseudo_is_covered_by_code
+
+        converters = self.dcac_converters
+        dp_list: List[int] = []
+        mt_list: List[int] = []
+        val_list: List[float] = []
+        for pos in missing_pos.tolist():
+            conv = converters[pos]
+            p_dc = float(getattr(conv, "dc_p", 0.0) or 0.0)
+            p_ac = float(getattr(conv, "ac_p", 0.0) or 0.0)
+            q_ac = float(getattr(conv, "ac_q", 0.0) or 0.0)
+            dp_list.extend((pos, pos, pos))
+            mt_list.extend((MEAS_TYPE_P_DC, MEAS_TYPE_P_AC, MEAS_TYPE_Q_AC))
+            val_list.extend((p_dc, p_ac, q_ac))
+            if not dc_has_zero_ties and pos < dcac_dc_nodes.size:
+                v_dc_cov = int(dcac_dc_nodes[pos]) in dc_obs_nodes
+            else:
+                v_dc_cov = voltage_covered(DEVICE_TYPE_DCACConverter, pos, MEAS_TYPE_V_DC)
+            if not v_dc_cov:
+                dc_node_obj = getattr(conv, "dc_node_obj", None)
+                v_dc = float(getattr(dc_node_obj, "voltage", 1.0) or 1.0)
+                dp_list.append(pos)
+                mt_list.append(MEAS_TYPE_V_DC)
+                val_list.append(v_dc)
+            if not ac_has_zero_ties and pos < dcac_ac_nodes.size:
+                v_ac_cov = int(dcac_ac_nodes[pos]) in ac_obs_nodes
+            else:
+                v_ac_cov = voltage_covered(DEVICE_TYPE_DCACConverter, pos, MEAS_TYPE_V_AC)
+            if not v_ac_cov:
+                ac_node_obj = getattr(conv, "ac_node_obj", None)
+                v_ac = float(getattr(ac_node_obj, "voltage", 1.0) or 1.0)
+                dp_list.append(pos)
+                mt_list.append(MEAS_TYPE_V_AC)
+                val_list.append(v_ac)
+
+        count = len(dp_list)
+        if count == 0:
+            return
+        next_idx = self._max_measurement_idx_fast(self.measurements) + 1
+        mt_arr = np.asarray(mt_list, dtype=np.int16)
+        dp_arr = np.asarray(dp_list, dtype=np.int64)
+        dt_arr = np.full(count, DEVICE_TYPE_DCACConverter, dtype=np.int16)
+        values_arr, weights_arr = normalize_pseudo_measurement_arrays(
+            mt_arr,
+            np.asarray(val_list, dtype=np.float64),
+            np.full(count, self.pseudo_measurement_weight_pq, dtype=np.float64),
+            weight_v=self.pseudo_measurement_weight_v,
+            weight_pq=self.pseudo_measurement_weight_pq,
+            preserve_explicit_pq_weight=False,
+        )
+        master_table = getattr(self.measurements, "table", None)
+        if master_table is None or int(master_table.idx.size) != len(self.measurements):
+            master_table = _measurement_table_from_measurements(self.measurements)
+        need_strings = int(np.asarray(master_table.name, dtype=object).size) == int(master_table.idx.size) and int(master_table.idx.size) > 0
+        if need_strings:
+            mt_label_map = {
+                MEAS_TYPE_P_DC: "P_DC",
+                MEAS_TYPE_P_AC: "P_AC",
+                MEAS_TYPE_Q_AC: "Q_AC",
+                MEAS_TYPE_V_DC: "V_DC",
+                MEAS_TYPE_V_AC: "V_AC",
+            }
+            conv_names = [converters[p].name for p in dp_list]
+            mt_labels = [mt_label_map[m] for m in mt_list]
+            name_arr = np.asarray([f"pseudo_{ml.lower()}_{cn}" for ml, cn in zip(mt_labels, conv_names)], dtype=object)
+            dt_str_arr = np.full(count, "DCACConverter", dtype=object)
+            dn_str_arr = np.asarray(conv_names, dtype=object)
+            mt_str_arr = np.asarray(mt_labels, dtype=object)
+        else:
+            empty_obj = np.asarray([], dtype=object)
+            name_arr = dt_str_arr = dn_str_arr = mt_str_arr = empty_obj
+        tail_table = MeasurementTable(
+            idx=np.arange(next_idx, next_idx + count, dtype=np.int64),
+            name=name_arr,
+            device_type=dt_str_arr,
+            device_name=dn_str_arr,
+            meas_type=mt_str_arr,
+            weight=weights_arr,
+            valid=np.ones(count, dtype=bool),
+            value=values_arr,
+            device_type_code=dt_arr,
+            angle_mask=np.zeros(count, dtype=bool),
+            status_code=np.full(count, MEAS_STATUS_PSEUDO, dtype=np.int16),
+            rows_by_device_type_code={int(DEVICE_TYPE_DCACConverter): np.arange(count, dtype=np.int64)},
+            device_name_id=np.full(count, -1, dtype=np.int64),
+            meas_type_code=mt_arr,
+            device_pos=dp_arr,
+        )
+        new_table = concat_measurement_tables(master_table, tail_table)
+        self.measurement_table = new_table
+        self.measurements = TableBackedMeasurementList(
+            new_table,
+            normalized=getattr(self.measurements, "normalized", False),
+        )
+        self._invalidate_measurement_activity_summary(preserve_real_voltage_cache=True)
 
     def _hybrid_converter_device_key_array(self) -> np.ndarray:
         cached = getattr(self, "_hybrid_converter_device_key_array_cache", None)
@@ -7667,8 +7809,22 @@ class HybridStateEstimator:
                                             cur = best.get(nid)
                                             if cur is None or w_val > cur[0]:
                                                 best[nid] = (w_val, v_val)
-                        # 跳过肯定属于 DC 侧的基础节点行，避免多余回调
-                        handled |= row_dev == DEVICE_TYPE_DCNode
+                        # 向量化处理 DCACConverter 的 V_AC 电压量测，跳过肯定属于 DC 侧的 DCNode/V_DC
+                        conv_ac_mask = (row_dev == DEVICE_TYPE_DCACConverter) & (row_meas == MEAS_TYPE_V_AC)
+                        if np.any(conv_ac_mask):
+                            handled |= conv_ac_mask
+                            conv_ac_nodes = np.asarray(getattr(self, "_dcac_ac_node", ()), dtype=np.int64)
+                            c_pos = row_pos[conv_ac_mask]
+                            in_conv = c_pos < conv_ac_nodes.size
+                            if np.any(in_conv):
+                                n_ids = conv_ac_nodes[c_pos[in_conv].astype(np.intp, copy=False)]
+                                c_w = row_weights[conv_ac_mask][in_conv]
+                                c_v = row_values[conv_ac_mask][in_conv]
+                                for nid, w_val, v_val in zip(n_ids.tolist(), c_w.tolist(), c_v.tolist()):
+                                    cur = best.get(nid)
+                                    if cur is None or w_val > cur[0]:
+                                        best[nid] = (w_val, v_val)
+                        handled |= (row_dev == DEVICE_TYPE_DCNode) | ((row_dev == DEVICE_TYPE_DCACConverter) & (row_meas == MEAS_TYPE_V_DC))
                     elif side == "dc" and self._dc_sub_estimator is not None:
                         fast_mask = (row_dev == DEVICE_TYPE_DCNode) & (row_meas == MEAS_TYPE_V)
                         if np.any(fast_mask):
@@ -7685,7 +7841,22 @@ class HybridStateEstimator:
                                     cur = best.get(nid)
                                     if cur is None or w_val > cur[0]:
                                         best[nid] = (w_val, v_val)
-                        handled |= row_dev == DEVICE_TYPE_ACNode
+                        # 向量化处理 DCACConverter 的 V_DC 电压量测，跳过肯定属于 AC 侧的 ACNode/V_AC
+                        conv_dc_mask = (row_dev == DEVICE_TYPE_DCACConverter) & (row_meas == MEAS_TYPE_V_DC)
+                        if np.any(conv_dc_mask):
+                            handled |= conv_dc_mask
+                            conv_dc_nodes = np.asarray(getattr(self, "_dcac_dc_node", ()), dtype=np.int64)
+                            c_pos = row_pos[conv_dc_mask]
+                            in_conv = c_pos < conv_dc_nodes.size
+                            if np.any(in_conv):
+                                n_ids = conv_dc_nodes[c_pos[in_conv].astype(np.intp, copy=False)]
+                                c_w = row_weights[conv_dc_mask][in_conv]
+                                c_v = row_values[conv_dc_mask][in_conv]
+                                for nid, w_val, v_val in zip(n_ids.tolist(), c_w.tolist(), c_v.tolist()):
+                                    cur = best.get(nid)
+                                    if cur is None or w_val > cur[0]:
+                                        best[nid] = (w_val, v_val)
+                        handled |= (row_dev == DEVICE_TYPE_ACNode) | ((row_dev == DEVICE_TYPE_DCACConverter) & (row_meas == MEAS_TYPE_V_AC))
 
                     rem_idx = np.flatnonzero(~handled)
                     for idx in rem_idx.tolist():
@@ -8270,33 +8441,38 @@ class HybridStateEstimator:
         append_from_side_estimator("ac", self._ac_sub_estimator)
         append_from_side_estimator("dc", self._dc_sub_estimator)
 
-        conv_dt: List[int] = []
-        conv_dp: List[int] = []
-        conv_mt: List[int] = []
-        conv_val: List[float] = []
-        for spec in self._hybrid_converter_measurement_specs(source="pseudo"):
-            device_type_code = int(spec.device_type_code)
-            meas_type_code = int(spec.meas_type_code)
-            if meas_type_code not in allowed_codes_by_device.get(device_type_code, ()):
-                continue
-            device_pos = int(spec.device_pos)
-            if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
-                continue
-            key = pack_key(device_type_code, device_pos, meas_type_code)
-            if key < 0 or key in active_keys_raw or key in conv_added_keys:
-                continue
-            if meas_type_code == MEAS_TYPE_V and voltage_covered(device_type_code, device_pos, meas_type_code):
-                continue
-            conv_dt.append(device_type_code)
-            conv_dp.append(device_pos)
-            conv_mt.append(meas_type_code)
-            conv_val.append(float(spec.value))
-            conv_added_keys.add(key)
-        if conv_dt:
-            dt_chunks.append(np.asarray(conv_dt, dtype=np.int16))
-            dp_chunks.append(np.asarray(conv_dp, dtype=np.int64))
-            mt_chunks.append(np.asarray(conv_mt, dtype=np.int16))
-            val_chunks.append(np.asarray(conv_val, dtype=np.float64))
+        n_conv = len(self.dcac_converters)
+        if n_conv > 0:
+            # 向量化构造换流器 (P_DC, P_AC, Q_AC) 缺失伪量测，免除 5.5 万个 spec 对象构建与逐条查重
+            c_dp = np.repeat(np.arange(n_conv, dtype=np.int64), 3)
+            c_dt = np.full(n_conv * 3, DEVICE_TYPE_DCACConverter, dtype=np.int16)
+            c_mt = np.tile(np.asarray([MEAS_TYPE_P_DC, MEAS_TYPE_P_AC, MEAS_TYPE_Q_AC], dtype=np.int16), n_conv)
+            c_keys = pack_key_array(c_dt, c_dp, c_mt)
+            c_keep = c_keys >= 0
+            if existing_sorted.size > 0 and np.any(c_keep):
+                c_pos = np.searchsorted(existing_sorted, c_keys)
+                c_in = (c_pos < existing_sorted.size) & (
+                    existing_sorted[np.minimum(c_pos, existing_sorted.size - 1)] == c_keys
+                )
+                c_keep &= ~c_in
+            missing_conv_idx = np.flatnonzero(c_keep)
+            if missing_conv_idx.size > 0:
+                sel_dp = c_dp[missing_conv_idx]
+                sel_mt = c_mt[missing_conv_idx]
+                converters = self.dcac_converters
+                sel_val = np.empty(missing_conv_idx.size, dtype=np.float64)
+                for k, (p_i, m_i) in enumerate(zip(sel_dp.tolist(), sel_mt.tolist())):
+                    conv = converters[p_i]
+                    if m_i == MEAS_TYPE_P_DC:
+                        sel_val[k] = float(getattr(conv, "dc_p", 0.0) or 0.0)
+                    elif m_i == MEAS_TYPE_P_AC:
+                        sel_val[k] = float(getattr(conv, "ac_p", 0.0) or 0.0)
+                    else:
+                        sel_val[k] = float(getattr(conv, "ac_q", 0.0) or 0.0)
+                dt_chunks.append(c_dt[missing_conv_idx])
+                dp_chunks.append(sel_dp)
+                mt_chunks.append(sel_mt)
+                val_chunks.append(sel_val)
         if not dt_chunks:
             return 0
         device_type_arr = dt_chunks[0] if len(dt_chunks) == 1 else np.concatenate(dt_chunks)
@@ -9649,6 +9825,7 @@ class HybridStateEstimator:
         _coarse_bad_data_threshold: Optional[float] = None,
         _defer_factor_refresh: bool = False,
         _woodbury_u_cache: Optional[Dict] = None,
+        _hint_lm_damping: float = 0.0,
     ) -> EstimateResult:
         if not self._prepared:
             self.prepare()
@@ -10174,7 +10351,9 @@ class HybridStateEstimator:
             ):
                 diag_g = None
                 if solved_via_aat and normal_operand is not None:
-                    diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    diag_g = aat_solver.unregularized_diagonal() if aat_solver is not None else None
+                    if diag_g is None:
+                        diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
                 elif gain is not None:
                     diag_g = np.asarray(gain.diagonal() if is_sparse_matrix(gain) else np.diag(gain), dtype=np.float64).ravel()
                 if diag_g is not None and diag_g.size == rhs.size:
@@ -10344,7 +10523,8 @@ class HybridStateEstimator:
                     backtrack_streak += 4
                     if backtrack_streak >= 12 and solved_via_aat and aat_solver is not None:
                         if force_lm_damping < 10.0:
-                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, 1e-1))
+                            hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
+                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, hint_base))
                             curvature_damping_active = True
                             curvature_probe_steps = 0
                             curvature_probe_interval = 2
@@ -10366,7 +10546,8 @@ class HybridStateEstimator:
                             fullstep_osc_streak += 1
                             if fullstep_osc_streak >= 4 and solved_via_aat and aat_solver is not None:
                                 # 满步锯齿振荡自愈：连续满步不收缩且目标几乎不降，提前切入曲率阻尼
-                                force_lm_damping = min(10.0, max(force_lm_damping * 10.0, 1e-1))
+                                hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
+                                force_lm_damping = min(10.0, max(force_lm_damping * 10.0, hint_base))
                                 curvature_damping_active = True
                                 curvature_probe_steps = 0
                                 curvature_probe_interval = 2
@@ -10388,7 +10569,7 @@ class HybridStateEstimator:
                 and not is_curvature_probe
                 and step_damping > 0.0
                 and cur_rhs_inf <= damped_kkt_tol
-                and max_correction < 5e-4
+                and max_correction < 1e-3
                 and objective_change <= damped_obj_tol
             )
             if (
@@ -10405,7 +10586,7 @@ class HybridStateEstimator:
                     if (
                         curv_stagnation_streak >= 12
                         and cur_rhs_inf <= max(1e-3, 1000.0 * self.tol)
-                        and max_correction < 5e-4
+                        and max_correction < 1e-3
                         and objective_change <= damped_obj_tol
                     ):
                         damped_kkt_stagnation_ok = True
@@ -10624,6 +10805,8 @@ class HybridStateEstimator:
             estimate_result._undamped_spd_failed = True
         if factor_deferred:
             estimate_result._factor_deferred = True
+        if curvature_damping_active and force_lm_damping > 0.0:
+            estimate_result._final_lm_damping = float(force_lm_damping)
         estimate_result._inplace_factor_modified = inplace_factor_modified
         return estimate_result
 
@@ -11413,6 +11596,17 @@ class HybridStateEstimator:
             v_cols_arr = np.asarray(getattr(self, "voltage_cols", np.asarray([], dtype=np.int32)), dtype=np.intp)
             raw_ac_th = np.asarray(getattr(self, "ac_theta_state_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
             a_cols_arr = raw_ac_th[raw_ac_th >= 0].astype(np.intp, copy=False) if raw_ac_th.size else np.empty(0, dtype=np.intp)
+            init_rt = getattr(self, "_last_estimate_aat_runtime", None)
+            hub_solver = (
+                init_rt[0]
+                if (isinstance(init_rt, tuple) and len(init_rt) == 2 and init_rt[0] is not None)
+                else init_aat_solver
+            )
+            hub_plan = (
+                init_rt[1]
+                if (isinstance(init_rt, tuple) and len(init_rt) == 2)
+                else None
+            )
             warmup = run_huber_irls_warmup(
                 lambda xv, out_z: self.evaluate(xv, base_measurements, out=out_z),
                 lambda ze, out_r: self._measurement_residual(base_z, ze, base_measurements, out=out_r),
@@ -11428,6 +11622,8 @@ class HybridStateEstimator:
                 a_max_rad=float(self.angle_max_rad),
                 max_iter=min(15, int(self.max_iter)),
                 huber_k=3.0,
+                shared_aat_solver=hub_solver,
+                shared_aat_plan=hub_plan,
             )
             if warmup is not None:
                 x_hub, r_hub, z_hub = warmup
@@ -12447,6 +12643,7 @@ class HybridStateEstimator:
                                 _coarse_bad_data_threshold=None,
                                 _defer_factor_refresh=wb_defer and len(batch_rows) < 8,
                                 _woodbury_u_cache=anchor_u_cache,
+                                _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
                             )
                             trial_obs = getattr(trial_result, "observability", None)
                             trial_coarse_stopped = bool(getattr(trial_result, "_coarse_stopped", False))
@@ -12557,6 +12754,7 @@ class HybridStateEstimator:
                     _woodbury_prev_H=wb_prev_H,
                     _defer_factor_refresh=wb_defer,
                     _woodbury_u_cache=anchor_u_cache,
+                    _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
                 )
                 trial_obs = getattr(trial_result, "observability", None)
                 trial_coarse_stopped = bool(getattr(trial_result, "_coarse_stopped", False))

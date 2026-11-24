@@ -18,6 +18,11 @@ from model.meas_model import (
     measurement_status_is_active,
 )
 
+try:
+    from secore.native_kernels import parse_meas_bulk_bytes_native as _NATIVE_PARSE_MEAS_BULK_BYTES
+except Exception:
+    _NATIVE_PARSE_MEAS_BULK_BYTES = None
+
 
 MEAS_COLS = {
     "idx": 0,
@@ -686,184 +691,231 @@ def _try_parse_meas_ppc_bulk_bytes(
     unique_name_bytes = []
     has_angle_meas = False
 
-    if include_strings:
-        name_chunks = []
-        dt_local_id_arr = np.empty(n_rows, dtype=np.int32)
-        mt_local_id_arr = np.empty(n_rows, dtype=np.int32)
-        dt_tok_to_local: Dict[bytes, int] = {}
-        dt_local_tokens = []
-        mt_tok_to_local: Dict[bytes, int] = {}
-        mt_local_tokens = []
-
-    data_len = len(data_bytes)
-    pos = 0
-    row_off = 0
-    chunk_size = _BULK_CHUNK_BYTES
-    while pos < data_len:
-        end = pos + chunk_size
-        if end < data_len:
-            nl = data_bytes.find(b"\n", end)
-            end = data_len if nl < 0 else nl
-        else:
-            end = data_len
-        chunk = data_bytes[pos:end]
-        pos = end + 1
-        if not chunk:
-            continue
-        c_rows = chunk.count(b"\n") + 1
-        tokens = chunk.split()
-        if len(tokens) != c_rows * ncols or tokens[0::ncols].count(b"#") != c_rows:
-            return None
-        row_end = row_off + c_rows
-        if row_end > n_rows:
-            return None
-
-        try:
-            idx_array[row_off:row_end] = np.fromiter(
-                map(int, tokens[idx_pos::ncols]), dtype=np.int64, count=c_rows
-            )
-            weight_toks = tokens[weight_pos::ncols]
-            first_weight = weight_toks[0]
-            if weight_toks.count(first_weight) == c_rows:
-                weight_values[row_off:row_end] = float(first_weight)
-            else:
-                weight_values[row_off:row_end] = np.fromiter(
-                    map(float, weight_toks), dtype=np.float64, count=c_rows
-                )
-            value_values[row_off:row_end] = np.fromiter(
-                map(float, tokens[value_pos::ncols]), dtype=np.float64, count=c_rows
-            )
-        except ValueError:
-            return None
-
-        valid_toks = tokens[valid_pos::ncols]
-        all_valid_chunk = valid_toks.count(b"1") == c_rows
-        if all_valid_chunk:
-            valid_values[row_off:row_end] = True
-        else:
-            valid_values[row_off:row_end] = np.fromiter(
-                map(b"1".__eq__, valid_toks), dtype=bool, count=c_rows
-            )
-
-        if status_pos >= 0:
-            st_toks = tokens[status_pos::ncols]
-            st0 = st_toks[0]
-            sc0 = _STATUS_BYTES_FAST_MAP.get(st0)
-            if sc0 is not None and st_toks.count(st0) == c_rows:
-                status_values[row_off:row_end] = sc0
-                if sc0 in (MEAS_STATUS_INVALID, MEAS_STATUS_REMOVED):
-                    valid_values[row_off:row_end] = False
-            else:
-                st_local_map = {}
-                for tok in dict.fromkeys(st_toks):
-                    code = _STATUS_BYTES_FAST_MAP.get(tok)
-                    if code is None:
-                        code = _STATUS_BYTES_FAST_MAP.get(tok.upper())
-                    if code is None:
-                        return None
-                    st_local_map[tok] = code
-                sc_arr = np.fromiter(map(st_local_map.__getitem__, st_toks), dtype=np.int16, count=c_rows)
-                status_values[row_off:row_end] = sc_arr
-                inactive = (sc_arr == MEAS_STATUS_INVALID) | (sc_arr == MEAS_STATUS_REMOVED)
-                if np.any(inactive):
-                    valid_values[row_off:row_end] &= ~inactive
-        else:
-            if all_valid_chunk:
-                status_values[row_off:row_end] = MEAS_STATUS_NORMAL
-            else:
-                status_values[row_off:row_end] = np.where(
-                    valid_values[row_off:row_end], MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID
-                )
-
-        dev_toks = tokens[dev_type_pos::ncols]
-        dt0 = dev_toks[0]
-        if dev_toks.count(dt0) == c_rows:
-            dt_c0 = dt_code_map.get(dt0, 0)
-            device_type_code_array[row_off:row_end] = dt_c0
-            if include_strings:
-                lid = dt_tok_to_local.get(dt0)
-                if lid is None:
-                    lid = len(dt_local_tokens)
-                    dt_tok_to_local[dt0] = lid
-                    dt_local_tokens.append(dt0)
-                dt_local_id_arr[row_off:row_end] = lid
-        else:
-            dt_uniq_chunk = list(dict.fromkeys(dev_toks))
-            for tok in dt_uniq_chunk:
-                if tok not in dt_code_map:
-                    dt_code_map[tok] = 0
-            device_type_code_array[row_off:row_end] = np.fromiter(
-                map(dt_code_map.__getitem__, dev_toks), dtype=np.int16, count=c_rows
-            )
-            if include_strings:
-                for tok in dt_uniq_chunk:
-                    if tok not in dt_tok_to_local:
-                        dt_tok_to_local[tok] = len(dt_local_tokens)
-                        dt_local_tokens.append(tok)
-                dt_local_id_arr[row_off:row_end] = np.fromiter(
-                    map(dt_tok_to_local.__getitem__, dev_toks), dtype=np.int32, count=c_rows
-                )
-
-        meas_toks = tokens[meas_type_pos::ncols]
-        mt_uniq_chunk = list(dict.fromkeys(meas_toks))
-        for tok in mt_uniq_chunk:
-            code = mt_code_map.get(tok)
-            if code is None:
-                code = _MEAS_TYPE_CODES_BYTES.get(tok.upper(), 0)
-                mt_code_map[tok] = code
-            if not has_angle_meas and code in _ANGLE_CODE_SET:
-                has_angle_meas = True
-        meas_type_code_array[row_off:row_end] = np.fromiter(
-            map(mt_code_map.__getitem__, meas_toks), dtype=np.int16, count=c_rows
-        )
-        if include_strings:
-            for tok in mt_uniq_chunk:
-                if tok not in mt_tok_to_local:
-                    mt_tok_to_local[tok] = len(mt_local_tokens)
-                    mt_local_tokens.append(tok)
-            mt_local_id_arr[row_off:row_end] = np.fromiter(
-                map(mt_tok_to_local.__getitem__, meas_toks), dtype=np.int32, count=c_rows
-            )
-
-        name_toks = tokens[dev_name_pos::ncols]
-        new_names = [tok for tok in dict.fromkeys(name_toks) if tok not in name_to_id]
-        if new_names:
-            base_id = len(unique_name_bytes)
-            unique_name_bytes.extend(new_names)
-            name_to_id.update(zip(new_names, range(base_id, base_id + len(new_names))))
-        device_name_id[row_off:row_end] = np.fromiter(
-            map(name_to_id.__getitem__, name_toks), dtype=np.int32, count=c_rows
+    # 非字符串数组模式优先调用 C++17 单遍 std::from_chars 高速解析核，失败自动回退下方分块路径
+    native_unique_names = None
+    if not include_strings and _NATIVE_PARSE_MEAS_BULK_BYTES is not None:
+        native_unique_names = _NATIVE_PARSE_MEAS_BULK_BYTES(
+            data_bytes,
+            ncols,
+            idx_pos,
+            dev_type_pos,
+            dev_name_pos,
+            meas_type_pos,
+            weight_pos,
+            valid_pos,
+            value_pos,
+            status_pos,
+            int(MEAS_STATUS_NORMAL),
+            int(MEAS_STATUS_INVALID),
+            int(MEAS_STATUS_REMOVED),
+            dt_code_map,
+            mt_code_map,
+            _STATUS_BYTES_FAST_MAP,
+            idx_array,
+            weight_values,
+            value_values,
+            valid_values,
+            status_values,
+            device_type_code_array,
+            meas_type_code_array,
+            device_name_id,
         )
 
-        if include_strings:
-            name_chunks.append(b"\n".join(tokens[name_col_pos::ncols]))
-
-        row_off = row_end
-
-    if row_off != n_rows:
-        return None
-
-    # 仅解码唯一设备名（经 bytes.split 切分必定不含换行符，可整块一次性 UTF-8 解码）
-    device_names_list = b"\n".join(unique_name_bytes).decode("utf8").split("\n")
-    device_names_arr = np.asarray(device_names_list, dtype=object)
-
-    if include_strings:
-        name_arr = np.asarray(b"\n".join(name_chunks).decode("utf8").split("\n"), dtype=object)
-        dt_labels = np.asarray([tok.decode("utf8") for tok in dt_local_tokens], dtype=object)
-        device_type_arr = dt_labels[dt_local_id_arr]
-        device_name_arr = device_names_arr[device_name_id]
-        mt_labels = np.asarray(
-            [
-                tok.decode("utf8") if _MEAS_TYPE_CODES_BYTES.get(tok, 0) != 0 else tok.decode("utf8").upper()
-                for tok in mt_local_tokens
-            ],
-            dtype=object,
+    if native_unique_names is not None:
+        uniq_bytes_list = native_unique_names.split(b"\n") if native_unique_names else []
+        name_to_id = dict(zip(uniq_bytes_list, range(len(uniq_bytes_list))))
+        device_names_list = native_unique_names.decode("utf8").split("\n") if native_unique_names else []
+        device_names_arr = np.asarray(device_names_list, dtype=object)
+        c0, c1, c2, c3 = (int(c) for c in ANGLE_MEASUREMENT_TYPE_CODES.tolist())
+        has_angle_meas = bool(
+            np.any(
+                (meas_type_code_array == c0)
+                | (meas_type_code_array == c1)
+                | (meas_type_code_array == c2)
+                | (meas_type_code_array == c3)
+            )
         )
-        meas_type_arr = mt_labels[mt_local_id_arr]
-        device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
-    else:
         name_arr = device_type_arr = device_name_arr = meas_type_arr = None
         device_name_id_by_name = None
+    else:
+        if include_strings:
+            name_chunks = []
+            dt_local_id_arr = np.empty(n_rows, dtype=np.int32)
+            mt_local_id_arr = np.empty(n_rows, dtype=np.int32)
+            dt_tok_to_local: Dict[bytes, int] = {}
+            dt_local_tokens = []
+            mt_tok_to_local: Dict[bytes, int] = {}
+            mt_local_tokens = []
+
+        data_len = len(data_bytes)
+        pos = 0
+        row_off = 0
+        chunk_size = _BULK_CHUNK_BYTES
+        while pos < data_len:
+            end = pos + chunk_size
+            if end < data_len:
+                nl = data_bytes.find(b"\n", end)
+                end = data_len if nl < 0 else nl
+            else:
+                end = data_len
+            chunk = data_bytes[pos:end]
+            pos = end + 1
+            if not chunk:
+                continue
+            c_rows = chunk.count(b"\n") + 1
+            tokens = chunk.split()
+            if len(tokens) != c_rows * ncols or tokens[0::ncols].count(b"#") != c_rows:
+                return None
+            row_end = row_off + c_rows
+            if row_end > n_rows:
+                return None
+
+            try:
+                idx_array[row_off:row_end] = np.fromiter(
+                    map(int, tokens[idx_pos::ncols]), dtype=np.int64, count=c_rows
+                )
+                weight_toks = tokens[weight_pos::ncols]
+                first_weight = weight_toks[0]
+                if weight_toks.count(first_weight) == c_rows:
+                    weight_values[row_off:row_end] = float(first_weight)
+                else:
+                    weight_values[row_off:row_end] = np.fromiter(
+                        map(float, weight_toks), dtype=np.float64, count=c_rows
+                    )
+                value_values[row_off:row_end] = np.fromiter(
+                    map(float, tokens[value_pos::ncols]), dtype=np.float64, count=c_rows
+                )
+            except ValueError:
+                return None
+
+            valid_toks = tokens[valid_pos::ncols]
+            all_valid_chunk = valid_toks.count(b"1") == c_rows
+            if all_valid_chunk:
+                valid_values[row_off:row_end] = True
+            else:
+                valid_values[row_off:row_end] = np.fromiter(
+                    map(b"1".__eq__, valid_toks), dtype=bool, count=c_rows
+                )
+
+            if status_pos >= 0:
+                st_toks = tokens[status_pos::ncols]
+                st0 = st_toks[0]
+                sc0 = _STATUS_BYTES_FAST_MAP.get(st0)
+                if sc0 is not None and st_toks.count(st0) == c_rows:
+                    status_values[row_off:row_end] = sc0
+                    if sc0 in (MEAS_STATUS_INVALID, MEAS_STATUS_REMOVED):
+                        valid_values[row_off:row_end] = False
+                else:
+                    st_local_map = {}
+                    for tok in dict.fromkeys(st_toks):
+                        code = _STATUS_BYTES_FAST_MAP.get(tok)
+                        if code is None:
+                            code = _STATUS_BYTES_FAST_MAP.get(tok.upper())
+                        if code is None:
+                            return None
+                        st_local_map[tok] = code
+                    sc_arr = np.fromiter(map(st_local_map.__getitem__, st_toks), dtype=np.int16, count=c_rows)
+                    status_values[row_off:row_end] = sc_arr
+                    inactive = (sc_arr == MEAS_STATUS_INVALID) | (sc_arr == MEAS_STATUS_REMOVED)
+                    if np.any(inactive):
+                        valid_values[row_off:row_end] &= ~inactive
+            else:
+                if all_valid_chunk:
+                    status_values[row_off:row_end] = MEAS_STATUS_NORMAL
+                else:
+                    status_values[row_off:row_end] = np.where(
+                        valid_values[row_off:row_end], MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID
+                    )
+
+            dev_toks = tokens[dev_type_pos::ncols]
+            dt0 = dev_toks[0]
+            if dev_toks.count(dt0) == c_rows:
+                dt_c0 = dt_code_map.get(dt0, 0)
+                device_type_code_array[row_off:row_end] = dt_c0
+                if include_strings:
+                    lid = dt_tok_to_local.get(dt0)
+                    if lid is None:
+                        lid = len(dt_local_tokens)
+                        dt_tok_to_local[dt0] = lid
+                        dt_local_tokens.append(dt0)
+                    dt_local_id_arr[row_off:row_end] = lid
+            else:
+                dt_uniq_chunk = list(dict.fromkeys(dev_toks))
+                for tok in dt_uniq_chunk:
+                    if tok not in dt_code_map:
+                        dt_code_map[tok] = 0
+                device_type_code_array[row_off:row_end] = np.fromiter(
+                    map(dt_code_map.__getitem__, dev_toks), dtype=np.int16, count=c_rows
+                )
+                if include_strings:
+                    for tok in dt_uniq_chunk:
+                        if tok not in dt_tok_to_local:
+                            dt_tok_to_local[tok] = len(dt_local_tokens)
+                            dt_local_tokens.append(tok)
+                    dt_local_id_arr[row_off:row_end] = np.fromiter(
+                        map(dt_tok_to_local.__getitem__, dev_toks), dtype=np.int32, count=c_rows
+                    )
+
+            meas_toks = tokens[meas_type_pos::ncols]
+            mt_uniq_chunk = list(dict.fromkeys(meas_toks))
+            for tok in mt_uniq_chunk:
+                code = mt_code_map.get(tok)
+                if code is None:
+                    code = _MEAS_TYPE_CODES_BYTES.get(tok.upper(), 0)
+                    mt_code_map[tok] = code
+                if not has_angle_meas and code in _ANGLE_CODE_SET:
+                    has_angle_meas = True
+            meas_type_code_array[row_off:row_end] = np.fromiter(
+                map(mt_code_map.__getitem__, meas_toks), dtype=np.int16, count=c_rows
+            )
+            if include_strings:
+                for tok in mt_uniq_chunk:
+                    if tok not in mt_tok_to_local:
+                        mt_tok_to_local[tok] = len(mt_local_tokens)
+                        mt_local_tokens.append(tok)
+                mt_local_id_arr[row_off:row_end] = np.fromiter(
+                    map(mt_tok_to_local.__getitem__, meas_toks), dtype=np.int32, count=c_rows
+                )
+
+            name_toks = tokens[dev_name_pos::ncols]
+            new_names = [tok for tok in dict.fromkeys(name_toks) if tok not in name_to_id]
+            if new_names:
+                base_id = len(unique_name_bytes)
+                unique_name_bytes.extend(new_names)
+                name_to_id.update(zip(new_names, range(base_id, base_id + len(new_names))))
+            device_name_id[row_off:row_end] = np.fromiter(
+                map(name_to_id.__getitem__, name_toks), dtype=np.int32, count=c_rows
+            )
+
+            if include_strings:
+                name_chunks.append(b"\n".join(tokens[name_col_pos::ncols]))
+
+            row_off = row_end
+
+        if row_off != n_rows:
+            return None
+
+        # 仅解码唯一设备名（经 bytes.split 切分必定不含换行符，可整块一次性 UTF-8 解码）
+        device_names_list = b"\n".join(unique_name_bytes).decode("utf8").split("\n")
+        device_names_arr = np.asarray(device_names_list, dtype=object)
+
+        if include_strings:
+            name_arr = np.asarray(b"\n".join(name_chunks).decode("utf8").split("\n"), dtype=object)
+            dt_labels = np.asarray([tok.decode("utf8") for tok in dt_local_tokens], dtype=object)
+            device_type_arr = dt_labels[dt_local_id_arr]
+            device_name_arr = device_names_arr[device_name_id]
+            mt_labels = np.asarray(
+                [
+                    tok.decode("utf8") if _MEAS_TYPE_CODES_BYTES.get(tok, 0) != 0 else tok.decode("utf8").upper()
+                    for tok in mt_local_tokens
+                ],
+                dtype=object,
+            )
+            meas_type_arr = mt_labels[mt_local_id_arr]
+            device_name_id_by_name = dict(zip(device_names_list, range(len(device_names_list))))
+        else:
+            name_arr = device_type_arr = device_name_arr = meas_type_arr = None
+            device_name_id_by_name = None
 
     # 若按设备类型已分块连续，直接 arange 切片免去 argsort
     change = np.flatnonzero(device_type_code_array[1:] != device_type_code_array[:-1]) + 1

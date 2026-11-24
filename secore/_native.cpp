@@ -8,9 +8,14 @@
 #include <Python.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #ifdef _OPENMP
@@ -1071,6 +1076,1016 @@ static PyObject* py_assemble_aat_upper_csr(PyObject*, PyObject* args) {
     Py_RETURN_TRUE;
 }
 
+// ============================================================================
+// 5. 静态 CSC->CSR 转置索引映射构建（仅首次固定模式时执行一次）
+//    返回 (is_col_sorted) 并原地填充 r_ptr / r_col / r_src_pos
+// ============================================================================
+static PyObject* py_build_csc_transpose_map(PyObject*, PyObject* args) {
+    int n_int = 0;
+    PyObject *obj_ap = nullptr, *obj_ai = nullptr;
+    PyObject *obj_rptr = nullptr, *obj_rcol = nullptr, *obj_rsrc = nullptr;
+    if (!PyArg_ParseTuple(
+            args, "iOOOOO",
+            &n_int, &obj_ap, &obj_ai, &obj_rptr, &obj_rcol, &obj_rsrc)) {
+        return nullptr;
+    }
+    PyBufGuard g_ap, g_ai, g_rptr, g_rcol, g_rsrc;
+    if (!g_ap.acquire(obj_ap, PyBUF_C_CONTIGUOUS) ||
+        !g_ai.acquire(obj_ai, PyBUF_C_CONTIGUOUS) ||
+        !g_rptr.acquire(obj_rptr, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_rcol.acquire(obj_rcol, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_rsrc.acquire(obj_rsrc, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    Int64View ap;
+    Int32View ai;
+    if (!ap.bind(g_ap.view, "A_indptr") || !ai.bind(g_ai.view, "A_indices")) {
+        return nullptr;
+    }
+    if (g_rptr.view.itemsize != 8 || g_rcol.view.itemsize != 4 || g_rsrc.view.itemsize != 8) {
+        PyErr_SetString(PyExc_TypeError, "r_ptr/r_src must be int64 and r_col must be int32");
+        return nullptr;
+    }
+    const int32_t n = static_cast<int32_t>(n_int);
+    const int32_t m_cols = static_cast<int32_t>(ap.size - 1);
+    int64_t* r_ptr = static_cast<int64_t*>(g_rptr.view.buf);
+    int32_t* r_col = static_cast<int32_t*>(g_rcol.view.buf);
+    int64_t* r_src = static_cast<int64_t*>(g_rsrc.view.buf);
+
+    int is_sorted = 1;
+    Py_BEGIN_ALLOW_THREADS
+    std::fill(r_ptr, r_ptr + static_cast<size_t>(n) + 1, int64_t(0));
+    for (int32_t col = 0; col < m_cols; ++col) {
+        const int64_t s = ap.ptr[col];
+        const int64_t e = ap.ptr[col + 1];
+        int32_t prev_row = -1;
+        for (int64_t p = s; p < e; ++p) {
+            const int32_t row = ai.ptr[p];
+            if (row < prev_row) {
+                is_sorted = 0;
+            }
+            prev_row = row;
+            r_ptr[static_cast<size_t>(row) + 1] += 1;
+        }
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        r_ptr[static_cast<size_t>(i) + 1] += r_ptr[i];
+    }
+    std::vector<int64_t> cur_pos(r_ptr, r_ptr + static_cast<size_t>(n) + 1);
+    for (int32_t col = 0; col < m_cols; ++col) {
+        const int64_t s = ap.ptr[col];
+        const int64_t e = ap.ptr[col + 1];
+        for (int64_t p = s; p < e; ++p) {
+            const int32_t row = ai.ptr[p];
+            const int64_t dst = cur_pos[static_cast<size_t>(row)]++;
+            r_col[dst] = col;
+            r_src[dst] = p;
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    return PyBool_FromLong(is_sorted);
+}
+
+// ============================================================================
+// 6. 固定模式 Gustavson OpenMP 并行装配 G = A A^T (+ beta I)
+//    复用预计算转置映射 (r_ptr, r_col, r_src)，零转置、零重分配、零双指针归并
+// ============================================================================
+static PyObject* py_assemble_aat_upper_csr_cached(PyObject*, PyObject* args) {
+    int n_int = 0;
+    int col_sorted = 0;
+    double damping = 0.0;
+    PyObject *obj_ap = nullptr, *obj_ai = nullptr, *obj_ad = nullptr;
+    PyObject *obj_rptr = nullptr, *obj_rcol = nullptr, *obj_rsrc = nullptr;
+    PyObject *obj_ia = nullptr, *obj_ja = nullptr, *obj_aout = nullptr;
+    if (!PyArg_ParseTuple(
+            args, "iOOOOOOOOOdi",
+            &n_int, &obj_ap, &obj_ai, &obj_ad,
+            &obj_rptr, &obj_rcol, &obj_rsrc,
+            &obj_ia, &obj_ja, &obj_aout, &damping, &col_sorted)) {
+        return nullptr;
+    }
+    PyBufGuard g_ap, g_ai, g_ad, g_rptr, g_rcol, g_rsrc, g_ia, g_ja, g_aout;
+    if (!g_ap.acquire(obj_ap, PyBUF_C_CONTIGUOUS) ||
+        !g_ai.acquire(obj_ai, PyBUF_C_CONTIGUOUS) ||
+        !g_ad.acquire(obj_ad, PyBUF_C_CONTIGUOUS) ||
+        !g_rptr.acquire(obj_rptr, PyBUF_C_CONTIGUOUS) ||
+        !g_rcol.acquire(obj_rcol, PyBUF_C_CONTIGUOUS) ||
+        !g_rsrc.acquire(obj_rsrc, PyBUF_C_CONTIGUOUS) ||
+        !g_ia.acquire(obj_ia, PyBUF_C_CONTIGUOUS) ||
+        !g_ja.acquire(obj_ja, PyBUF_C_CONTIGUOUS) ||
+        !g_aout.acquire(obj_aout, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    Int64View ap, rptr, rsrc;
+    Int32View ai, rcol, ia, ja;
+    if (!ap.bind(g_ap.view, "A_indptr") ||
+        !ai.bind(g_ai.view, "A_indices") ||
+        !rptr.bind(g_rptr.view, "r_ptr") ||
+        !rcol.bind(g_rcol.view, "r_col") ||
+        !rsrc.bind(g_rsrc.view, "r_src") ||
+        !ia.bind(g_ia.view, "ia") ||
+        !ja.bind(g_ja.view, "ja")) {
+        return nullptr;
+    }
+    const double* ad = static_cast<const double*>(g_ad.view.buf);
+    double* a_out = static_cast<double*>(g_aout.view.buf);
+    const int32_t n = static_cast<int32_t>(n_int);
+
+    Py_BEGIN_ALLOW_THREADS
+    const int n_threads = (n >= 2048) ? resolve_openmp_threads() : 1;
+    #pragma omp parallel num_threads(n_threads)
+    {
+        std::vector<int32_t> slot(static_cast<size_t>(n), -1);
+        #pragma omp for schedule(dynamic, 128)
+        for (int32_t i = 0; i < n; ++i) {
+            const int32_t gs = ia.ptr[i];
+            const int32_t ge = ia.ptr[i + 1];
+            for (int32_t gp = gs; gp < ge; ++gp) {
+                const int32_t j = ja.ptr[gp];
+                a_out[gp] = (j == i) ? damping : 0.0;
+                slot[j] = gp;
+            }
+            const int64_t rs = rptr.ptr[i];
+            const int64_t re = rptr.ptr[i + 1];
+            if (col_sorted) {
+                for (int64_t rk = rs; rk < re; ++rk) {
+                    const int64_t p0 = rsrc.ptr[rk];
+                    const double vi = ad[p0];
+                    if (vi == 0.0) {
+                        continue;
+                    }
+                    const int32_t col = rcol.ptr[rk];
+                    const int64_t ce = ap.ptr[col + 1];
+                    for (int64_t p = p0; p < ce; ++p) {
+                        const double vj = ad[p];
+                        if (vj != 0.0) {
+                            const int32_t gp = slot[ai.ptr[p]];
+                            if (gp >= 0) {
+                                a_out[gp] += vi * vj;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int64_t rk = rs; rk < re; ++rk) {
+                    const int64_t p0 = rsrc.ptr[rk];
+                    const double vi = ad[p0];
+                    if (vi == 0.0) {
+                        continue;
+                    }
+                    const int32_t col = rcol.ptr[rk];
+                    const int64_t cs = ap.ptr[col];
+                    const int64_t ce = ap.ptr[col + 1];
+                    for (int64_t p = cs; p < ce; ++p) {
+                        const int32_t j = ai.ptr[p];
+                        if (j >= i) {
+                            const double vj = ad[p];
+                            if (vj != 0.0) {
+                                const int32_t gp = slot[j];
+                                if (gp >= 0) {
+                                    a_out[gp] += vi * vj;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (int32_t gp = gs; gp < ge; ++gp) {
+                slot[ja.ptr[gp]] = -1;
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_TRUE;
+}
+
+// ============================================================================
+// 7. OpenMP 并行复电压计算 voltage * exp(1j * theta)
+// ============================================================================
+static PyObject* py_complex_voltage(PyObject*, PyObject* args) {
+    PyObject *obj_theta = nullptr, *obj_voltage = nullptr, *obj_out = nullptr;
+    if (!PyArg_ParseTuple(args, "OOO", &obj_theta, &obj_voltage, &obj_out)) {
+        return nullptr;
+    }
+    PyBufGuard g_theta, g_voltage, g_out;
+    if (!g_theta.acquire(obj_theta, PyBUF_C_CONTIGUOUS) ||
+        !g_voltage.acquire(obj_voltage, PyBUF_C_CONTIGUOUS) ||
+        !g_out.acquire(obj_out, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    if (g_theta.view.itemsize != 8 || g_voltage.view.itemsize != 8 || g_out.view.itemsize != 16) {
+        PyErr_SetString(PyExc_ValueError, "theta/voltage must be float64 and out must be complex128");
+        return nullptr;
+    }
+    const int64_t n = static_cast<int64_t>(g_theta.view.len / 8);
+    if (static_cast<int64_t>(g_voltage.view.len / 8) != n || static_cast<int64_t>(g_out.view.len / 16) != n) {
+        PyErr_SetString(PyExc_ValueError, "array length mismatch in complex_voltage");
+        return nullptr;
+    }
+    const double* theta = static_cast<const double*>(g_theta.view.buf);
+    const double* voltage = static_cast<const double*>(g_voltage.view.buf);
+    double* out = static_cast<double*>(g_out.view.buf);
+
+    Py_BEGIN_ALLOW_THREADS
+    // 轻量内存带宽受限核保持单线程执行，避免唤醒 MSVC vcomp140 线程池与 MKL libiomp5md 自旋争抢 CPU
+    for (int64_t i = 0; i < n; ++i) {
+        const double v = voltage[i];
+        const double th = theta[i];
+        out[2 * i] = v * std::cos(th);
+        out[2 * i + 1] = v * std::sin(th);
+    }
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_TRUE;
+}
+
+// 通用输出通道：支持按槽位直接散射写入目标稀疏 CSR 缓冲或连续写入独立数组
+struct ScatterChannel {
+    double* dst = nullptr;
+    const int64_t* slots = nullptr;
+    int64_t dst_len = 0;
+
+    inline void write(int64_t k, double val) const noexcept {
+        if (dst == nullptr) {
+            return;
+        }
+        if (slots != nullptr) {
+            const int64_t s = slots[k];
+            if (s >= 0) {
+                dst[s] = val;
+            }
+        } else {
+            dst[k] = val;
+        }
+    }
+};
+
+static bool bind_scatter_channel(
+    PyObject* obj_dst,
+    PyObject* obj_slots,
+    int64_t expected_k,
+    PyBufGuard& g_dst,
+    PyBufGuard& g_slots,
+    ScatterChannel& ch) {
+    ch.dst = nullptr;
+    ch.slots = nullptr;
+    ch.dst_len = 0;
+    if (obj_dst == nullptr || obj_dst == Py_None) {
+        return true;
+    }
+    if (!g_dst.acquire(obj_dst, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS)) {
+        return false;
+    }
+    if (g_dst.view.itemsize != 8) {
+        PyErr_SetString(PyExc_ValueError, "scatter destination must be float64");
+        return false;
+    }
+    ch.dst = static_cast<double*>(g_dst.view.buf);
+    ch.dst_len = static_cast<int64_t>(g_dst.view.len / 8);
+    if (obj_slots != nullptr && obj_slots != Py_None) {
+        if (!g_slots.acquire(obj_slots, PyBUF_C_CONTIGUOUS)) {
+            return false;
+        }
+        if (g_slots.view.itemsize != 8) {
+            PyErr_SetString(PyExc_ValueError, "scatter slots must be int64");
+            return false;
+        }
+        const int64_t slen = static_cast<int64_t>(g_slots.view.len / 8);
+        if (slen == 0) {
+            ch.dst = nullptr;
+            return true;
+        }
+        if (slen != expected_k) {
+            PyErr_SetString(PyExc_ValueError, "scatter slots length mismatch");
+            return false;
+        }
+        ch.slots = static_cast<const int64_t*>(g_slots.view.buf);
+    } else if (ch.dst_len < expected_k) {
+        PyErr_SetString(PyExc_ValueError, "output buffer too short");
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// 8. OpenMP 并行 AC 支路/变压器功率量测求值
+// ============================================================================
+static PyObject* py_eval_ac_branch_power_values(PyObject*, PyObject* args) {
+    PyObject *obj_values = nullptr, *obj_rows = nullptr;
+    PyObject *obj_own = nullptr, *obj_other = nullptr, *obj_third = nullptr;
+    PyObject *obj_is_p = nullptr;
+    PyObject *obj_ys = nullptr, *obj_ym = nullptr, *obj_yt = nullptr;
+    PyObject *obj_vc = nullptr;
+    int has_third = 0;
+    if (!PyArg_ParseTuple(
+            args, "OOOOOOOOOOi",
+            &obj_values, &obj_rows, &obj_own, &obj_other, &obj_third,
+            &obj_is_p, &obj_ys, &obj_ym, &obj_yt, &obj_vc, &has_third)) {
+        return nullptr;
+    }
+    PyBufGuard g_val, g_rows, g_own, g_other, g_third, g_isp, g_ys, g_ym, g_yt, g_vc;
+    if (!g_val.acquire(obj_values, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_rows.acquire(obj_rows, PyBUF_C_CONTIGUOUS) ||
+        !g_own.acquire(obj_own, PyBUF_C_CONTIGUOUS) ||
+        !g_other.acquire(obj_other, PyBUF_C_CONTIGUOUS) ||
+        !g_isp.acquire(obj_is_p, PyBUF_C_CONTIGUOUS) ||
+        !g_ys.acquire(obj_ys, PyBUF_C_CONTIGUOUS) ||
+        !g_ym.acquire(obj_ym, PyBUF_C_CONTIGUOUS) ||
+        !g_vc.acquire(obj_vc, PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    if (has_third) {
+        if (!g_third.acquire(obj_third, PyBUF_C_CONTIGUOUS) ||
+            !g_yt.acquire(obj_yt, PyBUF_C_CONTIGUOUS)) {
+            return nullptr;
+        }
+    }
+    Int64View rows, own, other, third;
+    if (!rows.bind(g_rows.view, "rows") ||
+        !own.bind(g_own.view, "own") ||
+        !other.bind(g_other.view, "other")) {
+        return nullptr;
+    }
+    if (has_third && !third.bind(g_third.view, "third")) {
+        return nullptr;
+    }
+    if (g_val.view.itemsize != 8 || g_isp.view.itemsize != 1 ||
+        g_ys.view.itemsize != 16 || g_ym.view.itemsize != 16 || g_vc.view.itemsize != 16 ||
+        (has_third && g_yt.view.itemsize != 16)) {
+        PyErr_SetString(PyExc_ValueError, "invalid dtype in eval_ac_branch_power_values");
+        return nullptr;
+    }
+    const int64_t m = rows.size;
+    double* values = static_cast<double*>(g_val.view.buf);
+    const uint8_t* is_p = static_cast<const uint8_t*>(g_isp.view.buf);
+    const double* ys = static_cast<const double*>(g_ys.view.buf);
+    const double* ym = static_cast<const double*>(g_ym.view.buf);
+    const double* yt = has_third ? static_cast<const double*>(g_yt.view.buf) : nullptr;
+    const double* vc = static_cast<const double*>(g_vc.view.buf);
+
+    Py_BEGIN_ALLOW_THREADS
+    // 轻量内存带宽核单线程执行，零线程唤醒且不干扰 MKL PARDISO 线程池
+    for (int64_t k = 0; k < m; ++k) {
+        const int64_t io = own.ptr[k];
+        const int64_t it = other.ptr[k];
+        const double vo_r = vc[2 * io];
+        const double vo_i = vc[2 * io + 1];
+        const double vt_r = vc[2 * it];
+        const double vt_i = vc[2 * it + 1];
+
+        const double ys_r = ys[2 * k];
+        const double ys_i = ys[2 * k + 1];
+        const double ym_r = ym[2 * k];
+        const double ym_i = ym[2 * k + 1];
+
+        double cur_r = (ys_r * vo_r - ys_i * vo_i) + (ym_r * vt_r - ym_i * vt_i);
+        double cur_i = (ys_r * vo_i + ys_i * vo_r) + (ym_r * vt_i + ym_i * vt_r);
+        if (has_third) {
+            const int64_t i3 = third.ptr[k];
+            const double v3_r = vc[2 * i3];
+            const double v3_i = vc[2 * i3 + 1];
+            const double yt_r = yt[2 * k];
+            const double yt_i = yt[2 * k + 1];
+            cur_r += yt_r * v3_r - yt_i * v3_i;
+            cur_i += yt_r * v3_i + yt_i * v3_r;
+        }
+        // S = v_own * conj(I)
+        if (is_p[k]) {
+            values[rows.ptr[k]] = vo_r * cur_r + vo_i * cur_i;
+        } else {
+            values[rows.ptr[k]] = vo_i * cur_r - vo_r * cur_i;
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_TRUE;
+}
+
+// ============================================================================
+// 9. OpenMP 并行 AC 支路/变压器功率雅可比计算（支持固定模式直写目标 CSR 缓冲）
+// ============================================================================
+static PyObject* py_fill_ac_branch_power_jacobian(PyObject*, PyObject* args) {
+    PyObject *obj_own = nullptr, *obj_other = nullptr, *obj_third = nullptr;
+    PyObject *obj_is_p = nullptr;
+    PyObject *obj_ysc = nullptr, *obj_ymc = nullptr, *obj_ytc = nullptr;
+    PyObject *obj_v = nullptr, *obj_vc = nullptr;
+    int has_third = 0;
+    PyObject *d0 = nullptr, *s0 = nullptr, *d1 = nullptr, *s1 = nullptr;
+    PyObject *d2 = nullptr, *s2 = nullptr, *d3 = nullptr, *s3 = nullptr;
+    PyObject *d4 = nullptr, *s4 = nullptr, *d5 = nullptr, *s5 = nullptr;
+    if (!PyArg_ParseTuple(
+            args, "OOOOOOOOOiOOOOOOOOOOOO",
+            &obj_own, &obj_other, &obj_third, &obj_is_p,
+            &obj_ysc, &obj_ymc, &obj_ytc, &obj_v, &obj_vc, &has_third,
+            &d0, &s0, &d1, &s1, &d2, &s2, &d3, &s3, &d4, &s4, &d5, &s5)) {
+        return nullptr;
+    }
+    PyBufGuard g_own, g_other, g_third, g_isp, g_ysc, g_ymc, g_ytc, g_v, g_vc;
+    if (!g_own.acquire(obj_own, PyBUF_C_CONTIGUOUS) ||
+        !g_other.acquire(obj_other, PyBUF_C_CONTIGUOUS) ||
+        !g_isp.acquire(obj_is_p, PyBUF_C_CONTIGUOUS) ||
+        !g_ysc.acquire(obj_ysc, PyBUF_C_CONTIGUOUS) ||
+        !g_ymc.acquire(obj_ymc, PyBUF_C_CONTIGUOUS) ||
+        !g_v.acquire(obj_v, PyBUF_C_CONTIGUOUS) ||
+        !g_vc.acquire(obj_vc, PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    if (has_third) {
+        if (!g_third.acquire(obj_third, PyBUF_C_CONTIGUOUS) ||
+            !g_ytc.acquire(obj_ytc, PyBUF_C_CONTIGUOUS)) {
+            return nullptr;
+        }
+    }
+    Int64View own, other, third;
+    if (!own.bind(g_own.view, "own") || !other.bind(g_other.view, "other")) {
+        return nullptr;
+    }
+    if (has_third && !third.bind(g_third.view, "third")) {
+        return nullptr;
+    }
+    if (g_isp.view.itemsize != 1 || g_ysc.view.itemsize != 16 || g_ymc.view.itemsize != 16 ||
+        g_v.view.itemsize != 8 || g_vc.view.itemsize != 16 ||
+        (has_third && g_ytc.view.itemsize != 16)) {
+        PyErr_SetString(PyExc_ValueError, "invalid dtype in fill_ac_branch_power_jacobian");
+        return nullptr;
+    }
+    const int64_t m = own.size;
+    PyBufGuard gd0, gs0, gd1, gs1, gd2, gs2, gd3, gs3, gd4, gs4, gd5, gs5;
+    ScatterChannel c0, c1, c2, c3, c4, c5;
+    if (!bind_scatter_channel(d0, s0, m, gd0, gs0, c0) ||
+        !bind_scatter_channel(d1, s1, m, gd1, gs1, c1) ||
+        !bind_scatter_channel(d2, s2, m, gd2, gs2, c2) ||
+        !bind_scatter_channel(d3, s3, m, gd3, gs3, c3) ||
+        !bind_scatter_channel(d4, s4, m, gd4, gs4, c4) ||
+        !bind_scatter_channel(d5, s5, m, gd5, gs5, c5)) {
+        return nullptr;
+    }
+
+    const uint8_t* is_p = static_cast<const uint8_t*>(g_isp.view.buf);
+    const double* ysc = static_cast<const double*>(g_ysc.view.buf);
+    const double* ymc = static_cast<const double*>(g_ymc.view.buf);
+    const double* ytc = has_third ? static_cast<const double*>(g_ytc.view.buf) : nullptr;
+    const double* voltage = static_cast<const double*>(g_v.view.buf);
+    const double* vc = static_cast<const double*>(g_vc.view.buf);
+
+    Py_BEGIN_ALLOW_THREADS
+    // 轻量内存带宽核单线程执行，零线程唤醒且不干扰 MKL PARDISO 线程池
+    for (int64_t k = 0; k < m; ++k) {
+        const int64_t io = own.ptr[k];
+        const int64_t it = other.ptr[k];
+        const double vo_r = vc[2 * io];
+        const double vo_i = vc[2 * io + 1];
+        const double vt_r = vc[2 * it];
+        const double vt_i = vc[2 * it + 1];
+
+        // u_other = v_own * conj(v_other)
+        const double uo_r = vo_r * vt_r + vo_i * vt_i;
+        const double uo_i = vo_i * vt_r - vo_r * vt_i;
+        const double ymc_r = ymc[2 * k];
+        const double ymc_i = ymc[2 * k + 1];
+        const double oo_r = ymc_r * uo_r - ymc_i * uo_i;
+        const double oo_i = ymc_r * uo_i + ymc_i * uo_r;
+
+        double off_r = oo_r;
+        double off_i = oo_i;
+        double o3_r = 0.0;
+        double o3_i = 0.0;
+        if (has_third) {
+            const int64_t i3 = third.ptr[k];
+            const double v3_r = vc[2 * i3];
+            const double v3_i = vc[2 * i3 + 1];
+            const double u3_r = vo_r * v3_r + vo_i * v3_i;
+            const double u3_i = vo_i * v3_r - vo_r * v3_i;
+            const double ytc_r = ytc[2 * k];
+            const double ytc_i = ytc[2 * k + 1];
+            o3_r = ytc_r * u3_r - ytc_i * u3_i;
+            o3_i = ytc_r * u3_i + ytc_i * u3_r;
+            off_r += o3_r;
+            off_i += o3_i;
+        }
+
+        const double v_own_mag = voltage[io];
+        const double v_other_mag = voltage[it];
+        const double inv_vo = 1.0 / (v_own_mag > 1e-12 ? v_own_mag : 1e-12);
+        const double inv_vt = 1.0 / (v_other_mag > 1e-12 ? v_other_mag : 1e-12);
+
+        const double dvo_r = 2.0 * ysc[2 * k] * v_own_mag + off_r * inv_vo;
+        const double dvo_i = 2.0 * ysc[2 * k + 1] * v_own_mag + off_i * inv_vo;
+        const double dvt_r = oo_r * inv_vt;
+        const double dvt_i = oo_i * inv_vt;
+
+        if (is_p[k]) {
+            c0.write(k, -off_i);
+            c1.write(k, oo_i);
+            c3.write(k, dvo_r);
+            c4.write(k, dvt_r);
+            if (has_third) {
+                const double v3_mag = voltage[third.ptr[k]];
+                const double inv_v3 = 1.0 / (v3_mag > 1e-12 ? v3_mag : 1e-12);
+                c2.write(k, o3_i);
+                c5.write(k, o3_r * inv_v3);
+            }
+        } else {
+            c0.write(k, off_r);
+            c1.write(k, -oo_r);
+            c3.write(k, dvo_i);
+            c4.write(k, dvt_i);
+            if (has_third) {
+                const double v3_mag = voltage[third.ptr[k]];
+                const double inv_v3 = 1.0 / (v3_mag > 1e-12 ? v3_mag : 1e-12);
+                c2.write(k, -o3_r);
+                c5.write(k, o3_i * inv_v3);
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_TRUE;
+}
+
+// ============================================================================
+// 10. OpenMP 并行 AC 节点功率平衡雅可比计算（单遍融合归约 + 固定模式原位直写）
+// ============================================================================
+static PyObject* py_fill_ac_balance_jacobian(PyObject*, PyObject* args) {
+    PyObject *obj_bal_pos = nullptr, *obj_y_bal_ptr = nullptr;
+    PyObject *obj_y_nodes = nullptr, *obj_y_pos = nullptr;
+    PyObject *obj_y_conj = nullptr, *obj_y_off_idx = nullptr;
+    PyObject *obj_y_diag_conj = nullptr;
+    PyObject *obj_v = nullptr, *obj_vc = nullptr;
+    int64_t n_off = 0;
+    PyObject *do0 = nullptr, *so0 = nullptr, *do1 = nullptr, *so1 = nullptr;
+    PyObject *do2 = nullptr, *so2 = nullptr, *do3 = nullptr, *so3 = nullptr;
+    PyObject *dw0 = nullptr, *sw0 = nullptr, *dw1 = nullptr, *sw1 = nullptr;
+    PyObject *dw2 = nullptr, *sw2 = nullptr, *dw3 = nullptr, *sw3 = nullptr;
+    if (!PyArg_ParseTuple(
+            args, "OOOOOOOOOLOOOOOOOOOOOOOOOO",
+            &obj_bal_pos, &obj_y_bal_ptr, &obj_y_nodes, &obj_y_pos,
+            &obj_y_conj, &obj_y_off_idx, &obj_y_diag_conj, &obj_v, &obj_vc, &n_off,
+            &do0, &so0, &do1, &so1, &do2, &so2, &do3, &so3,
+            &dw0, &sw0, &dw1, &sw1, &dw2, &sw2, &dw3, &sw3)) {
+        return nullptr;
+    }
+    PyBufGuard g_bp, g_ptr, g_yn, g_yp, g_yc, g_oidx, g_ydc, g_v, g_vc;
+    if (!g_bp.acquire(obj_bal_pos, PyBUF_C_CONTIGUOUS) ||
+        !g_ptr.acquire(obj_y_bal_ptr, PyBUF_C_CONTIGUOUS) ||
+        !g_yn.acquire(obj_y_nodes, PyBUF_C_CONTIGUOUS) ||
+        !g_yp.acquire(obj_y_pos, PyBUF_C_CONTIGUOUS) ||
+        !g_yc.acquire(obj_y_conj, PyBUF_C_CONTIGUOUS) ||
+        !g_oidx.acquire(obj_y_off_idx, PyBUF_C_CONTIGUOUS) ||
+        !g_ydc.acquire(obj_y_diag_conj, PyBUF_C_CONTIGUOUS) ||
+        !g_v.acquire(obj_v, PyBUF_C_CONTIGUOUS) ||
+        !g_vc.acquire(obj_vc, PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    Int64View bal_pos, y_bal_ptr, y_nodes, y_pos;
+    Int32View y_off_idx;
+    if (!bal_pos.bind(g_bp.view, "balance_pos") ||
+        !y_bal_ptr.bind(g_ptr.view, "y_bal_ptr") ||
+        !y_nodes.bind(g_yn.view, "y_nodes") ||
+        !y_pos.bind(g_yp.view, "y_pos") ||
+        !y_off_idx.bind(g_oidx.view, "y_off_idx")) {
+        return nullptr;
+    }
+    if (g_yc.view.itemsize != 16 || g_ydc.view.itemsize != 16 ||
+        g_v.view.itemsize != 8 || g_vc.view.itemsize != 16) {
+        PyErr_SetString(PyExc_ValueError, "invalid dtype in fill_ac_balance_jacobian");
+        return nullptr;
+    }
+    const int64_t n_bal = bal_pos.size;
+    PyBufGuard gdo0, gso0, gdo1, gso1, gdo2, gso2, gdo3, gso3;
+    PyBufGuard gdw0, gsw0, gdw1, gsw1, gdw2, gsw2, gdw3, gsw3;
+    ScatterChannel co0, co1, co2, co3, cw0, cw1, cw2, cw3;
+    if (!bind_scatter_channel(do0, so0, n_off, gdo0, gso0, co0) ||
+        !bind_scatter_channel(do1, so1, n_off, gdo1, gso1, co1) ||
+        !bind_scatter_channel(do2, so2, n_off, gdo2, gso2, co2) ||
+        !bind_scatter_channel(do3, so3, n_off, gdo3, gso3, co3) ||
+        !bind_scatter_channel(dw0, sw0, n_bal, gdw0, gsw0, cw0) ||
+        !bind_scatter_channel(dw1, sw1, n_bal, gdw1, gsw1, cw1) ||
+        !bind_scatter_channel(dw2, sw2, n_bal, gdw2, gsw2, cw2) ||
+        !bind_scatter_channel(dw3, sw3, n_bal, gdw3, gsw3, cw3)) {
+        return nullptr;
+    }
+
+    const double* y_conj = static_cast<const double*>(g_yc.view.buf);
+    const double* y_diag_conj = static_cast<const double*>(g_ydc.view.buf);
+    const double* voltage = static_cast<const double*>(g_v.view.buf);
+    const double* vc = static_cast<const double*>(g_vc.view.buf);
+
+    Py_BEGIN_ALLOW_THREADS
+    // 单遍紧凑循环零临时数组，避免 vcomp140 线程池与 MKL libiomp5md 自旋争抢核
+    for (int64_t b = 0; b < n_bal; ++b) {
+        const int64_t s = y_bal_ptr.ptr[b];
+        const int64_t e = y_bal_ptr.ptr[b + 1];
+        double off_sum_r = 0.0;
+        double off_sum_i = 0.0;
+        double sum_all_r = 0.0;
+        double sum_all_i = 0.0;
+
+        for (int64_t k = s; k < e; ++k) {
+            const int64_t p = y_pos.ptr[k];
+            const int64_t nd = y_nodes.ptr[k];
+            const double vp_mag = voltage[p];
+            const double inv_vp = 1.0 / (vp_mag > 1e-12 ? vp_mag : 1e-12);
+            const double vu_r = vc[2 * p] * inv_vp;
+            const double vu_i = vc[2 * p + 1] * inv_vp;
+            const double vn_r = vc[2 * nd];
+            const double vn_i = vc[2 * nd + 1];
+
+            // u = v_unit[p] * conj(V[nd])
+            const double u_r = vu_r * vn_r + vu_i * vn_i;
+            const double u_i = vu_i * vn_r - vu_r * vn_i;
+            const double yc_r = y_conj[2 * k];
+            const double yc_i = y_conj[2 * k + 1];
+            const double yv_r = yc_r * u_r - yc_i * u_i;
+            const double yv_i = yc_r * u_i + yc_i * u_r;
+
+            sum_all_r += yv_r;
+            sum_all_i += yv_i;
+
+            const int32_t o = y_off_idx.ptr[k];
+            if (o >= 0) {
+                const double term_r = yv_r * vp_mag;
+                const double term_i = yv_i * vp_mag;
+                off_sum_r += term_r;
+                off_sum_i += term_i;
+
+                const double vn_mag = voltage[nd];
+                const double inv_vn = 1.0 / (vn_mag > 1e-12 ? vn_mag : 1e-12);
+                // theta_values = -1j * term = (term_i, -term_r)
+                co0.write(o, term_i);
+                co1.write(o, -term_r);
+                co2.write(o, term_r * inv_vn);
+                co3.write(o, term_i * inv_vn);
+            }
+        }
+
+        const int64_t bp = bal_pos.ptr[b];
+        const double vbp = voltage[bp];
+        // own_theta = 1j * off_sum = (-off_sum_i, off_sum_r)
+        cw0.write(b, -off_sum_i);
+        cw1.write(b, off_sum_r);
+        cw2.write(b, y_diag_conj[2 * bp] * vbp + sum_all_r);
+        cw3.write(b, y_diag_conj[2 * bp + 1] * vbp + sum_all_i);
+    }
+    Py_END_ALLOW_THREADS
+
+    Py_RETURN_TRUE;
+}
+
+// ============================================================================
+// 11. C++17 单遍高速解析 <Measurement> 标准无引号字节块
+// ============================================================================
+static inline bool parse_int64_sv(std::string_view sv, int64_t& out) noexcept {
+    if (sv.empty()) return false;
+    const char* p = sv.data();
+    const char* e = p + sv.size();
+    if (*p == '+') {
+        ++p;
+        if (p == e) return false;
+    }
+    auto res = std::from_chars(p, e, out);
+    return res.ec == std::errc{} && res.ptr == e;
+}
+
+static inline bool parse_double_sv(std::string_view sv, double& out) noexcept {
+    if (sv.empty()) return false;
+    const char* p = sv.data();
+    const char* e = p + sv.size();
+    if (*p == '+') {
+        ++p;
+        if (p == e) return false;
+    }
+#if defined(_MSC_VER) || (defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L)
+    auto res = std::from_chars(p, e, out);
+    return res.ec == std::errc{} && res.ptr == e;
+#else
+    char buf[128];
+    const size_t n = static_cast<size_t>(e - p);
+    if (n >= sizeof(buf)) return false;
+    std::memcpy(buf, p, n);
+    buf[n] = '\0';
+    char* endp = nullptr;
+    out = std::strtod(buf, &endp);
+    return endp == buf + n;
+#endif
+}
+
+static bool extract_bytes_code_map(PyObject* dict_obj, std::unordered_map<std::string, int16_t>& out_map) {
+    if (!PyDict_Check(dict_obj)) {
+        PyErr_SetString(PyExc_TypeError, "code map must be a dict");
+        return false;
+    }
+    PyObject *key = nullptr, *val = nullptr;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(dict_obj, &pos, &key, &val)) {
+        if (!PyBytes_Check(key)) {
+            PyErr_SetString(PyExc_TypeError, "code map keys must be bytes");
+            return false;
+        }
+        char* kbuf = nullptr;
+        Py_ssize_t klen = 0;
+        if (PyBytes_AsStringAndSize(key, &kbuf, &klen) != 0) {
+            return false;
+        }
+        long v = PyLong_AsLong(val);
+        if (v == -1 && PyErr_Occurred()) {
+            return false;
+        }
+        out_map.emplace(std::string(kbuf, static_cast<size_t>(klen)), static_cast<int16_t>(v));
+    }
+    return true;
+}
+
+static PyObject* py_parse_meas_bulk_bytes(PyObject*, PyObject* args) {
+    PyObject *obj_data = nullptr;
+    int ncols = 0, idx_pos = 0, dt_pos = 0, dn_pos = 0, mt_pos = 0;
+    int w_pos = 0, valid_pos = 0, val_pos = 0, st_pos = -1;
+    int status_normal = 0, status_invalid = 1, status_removed = 2;
+    PyObject *obj_dt_map = nullptr, *obj_mt_map = nullptr, *obj_st_map = nullptr;
+    PyObject *obj_idx = nullptr, *obj_w = nullptr, *obj_val = nullptr;
+    PyObject *obj_valid = nullptr, *obj_st = nullptr;
+    PyObject *obj_dt = nullptr, *obj_mt = nullptr, *obj_dn_id = nullptr;
+    if (!PyArg_ParseTuple(
+            args, "OiiiiiiiiiiiiOOOOOOOOOOO",
+            &obj_data,
+            &ncols, &idx_pos, &dt_pos, &dn_pos, &mt_pos,
+            &w_pos, &valid_pos, &val_pos, &st_pos,
+            &status_normal, &status_invalid, &status_removed,
+            &obj_dt_map, &obj_mt_map, &obj_st_map,
+            &obj_idx, &obj_w, &obj_val, &obj_valid, &obj_st,
+            &obj_dt, &obj_mt, &obj_dn_id)) {
+        return nullptr;
+    }
+
+    std::unordered_map<std::string, int16_t> dt_map, mt_map, st_map;
+    if (!extract_bytes_code_map(obj_dt_map, dt_map) ||
+        !extract_bytes_code_map(obj_mt_map, mt_map) ||
+        !extract_bytes_code_map(obj_st_map, st_map)) {
+        return nullptr;
+    }
+
+    PyBufGuard g_data, g_idx, g_w, g_val, g_valid, g_st, g_dt, g_mt, g_dnid;
+    if (!g_data.acquire(obj_data, PyBUF_C_CONTIGUOUS) ||
+        !g_idx.acquire(obj_idx, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_w.acquire(obj_w, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_val.acquire(obj_val, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_valid.acquire(obj_valid, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_st.acquire(obj_st, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_dt.acquire(obj_dt, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_mt.acquire(obj_mt, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS) ||
+        !g_dnid.acquire(obj_dn_id, PyBUF_WRITABLE | PyBUF_C_CONTIGUOUS)) {
+        return nullptr;
+    }
+    if (g_idx.view.itemsize != 8 || g_w.view.itemsize != 8 || g_val.view.itemsize != 8 ||
+        g_valid.view.itemsize != 1 || g_st.view.itemsize != 2 ||
+        g_dt.view.itemsize != 2 || g_mt.view.itemsize != 2 || g_dnid.view.itemsize != 4) {
+        PyErr_SetString(PyExc_ValueError, "invalid output dtypes in parse_meas_bulk_bytes");
+        return nullptr;
+    }
+
+    const int64_t n_rows = static_cast<int64_t>(g_idx.view.len / 8);
+    const char* raw = static_cast<const char*>(g_data.view.buf);
+    const size_t raw_len = static_cast<size_t>(g_data.view.len);
+    int64_t* idx_out = static_cast<int64_t*>(g_idx.view.buf);
+    double* w_out = static_cast<double*>(g_w.view.buf);
+    double* val_out = static_cast<double*>(g_val.view.buf);
+    uint8_t* valid_out = static_cast<uint8_t*>(g_valid.view.buf);
+    int16_t* st_out = static_cast<int16_t*>(g_st.view.buf);
+    int16_t* dt_out = static_cast<int16_t*>(g_dt.view.buf);
+    int16_t* mt_out = static_cast<int16_t*>(g_mt.view.buf);
+    int32_t* dnid_out = static_cast<int32_t*>(g_dnid.view.buf);
+
+    std::string unique_names_joined;
+    int64_t parsed_rows = 0;
+    bool ok = true;
+
+    Py_BEGIN_ALLOW_THREADS
+    // 用 string_view 映射加速（底层 key 存储在 dt_map / mt_map / st_map 与 raw 中生命周期全程有效）
+    std::unordered_map<std::string_view, int16_t> dt_sv, mt_sv, st_sv;
+    dt_sv.reserve(dt_map.size() * 2 + 8);
+    mt_sv.reserve(mt_map.size() * 2 + 8);
+    st_sv.reserve(st_map.size() * 2 + 8);
+    for (const auto& kv : dt_map) dt_sv.emplace(kv.first, kv.second);
+    for (const auto& kv : mt_map) mt_sv.emplace(kv.first, kv.second);
+    for (const auto& kv : st_map) st_sv.emplace(kv.first, kv.second);
+
+    // 扁平开放寻址字符串去重表（FNV-1a 64-bit + 线性探测），消除 std::unordered_map 10 万次链表节点堆分配
+    struct FlatSvSlot {
+        uint64_t hash = 0;
+        const char* ptr = nullptr;
+        uint32_t len = 0;
+        int32_t id = -1;
+    };
+    size_t ht_cap = 1024;
+    const size_t min_cap = static_cast<size_t>(n_rows) + 256;
+    while (ht_cap < min_cap) {
+        ht_cap <<= 1;
+    }
+    std::vector<FlatSvSlot> ht(ht_cap);
+    size_t ht_mask = ht_cap - 1;
+    int32_t unique_count = 0;
+    auto fnv1a_sv = [](std::string_view sv) noexcept -> uint64_t {
+        uint64_t h = 14695981039346656037ULL;
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(sv.data());
+        for (size_t i = 0; i < sv.size(); ++i) {
+            h ^= static_cast<uint64_t>(p[i]);
+            h *= 1099511628211ULL;
+        }
+        return h ? h : 1ULL;
+    };
+    auto ht_rehash = [&]() {
+        const size_t new_cap = ht_cap << 1;
+        const size_t new_mask = new_cap - 1;
+        std::vector<FlatSvSlot> nh(new_cap);
+        for (const auto& s : ht) {
+            if (s.id >= 0) {
+                size_t idx = static_cast<size_t>(s.hash) & new_mask;
+                while (nh[idx].id >= 0) {
+                    idx = (idx + 1) & new_mask;
+                }
+                nh[idx] = s;
+            }
+        }
+        ht.swap(nh);
+        ht_cap = new_cap;
+        ht_mask = new_mask;
+    };
+    unique_names_joined.reserve(raw_len / 4 + 64);
+
+    std::vector<std::string_view> row_toks;
+    row_toks.reserve(static_cast<size_t>(ncols + 2));
+
+    std::string_view last_dt_tok, last_mt_tok, last_st_tok, last_dn_tok;
+    int16_t last_dt_code = 0, last_mt_code = 0, last_st_code = 0;
+    int32_t last_dn_id = -1;
+    bool has_last_dt = false, has_last_mt = false, has_last_st = false, has_last_dn = false;
+    std::string upper_tmp;
+    upper_tmp.reserve(32);
+
+    size_t pos = 0;
+    while (pos < raw_len) {
+        size_t line_end = pos;
+        while (line_end < raw_len && raw[line_end] != '\n') {
+            ++line_end;
+        }
+        size_t cur = pos;
+        pos = (line_end < raw_len) ? (line_end + 1) : raw_len;
+
+        // 切分当前行 token（按 ASCII 空白）
+        row_toks.clear();
+        while (cur < line_end) {
+            while (cur < line_end && static_cast<unsigned char>(raw[cur]) <= ' ') {
+                ++cur;
+            }
+            if (cur >= line_end) break;
+            const size_t t0 = cur;
+            while (cur < line_end && static_cast<unsigned char>(raw[cur]) > ' ') {
+                ++cur;
+            }
+            row_toks.emplace_back(raw + t0, cur - t0);
+        }
+        if (static_cast<int>(row_toks.size()) != ncols ||
+            row_toks[0].size() != 1 || row_toks[0][0] != '#' ||
+            parsed_rows >= n_rows) {
+            ok = false;
+            break;
+        }
+
+        int64_t idx_v = 0;
+        double w_v = 0.0, val_v = 0.0;
+        if (!parse_int64_sv(row_toks[static_cast<size_t>(idx_pos)], idx_v) ||
+            !parse_double_sv(row_toks[static_cast<size_t>(w_pos)], w_v) ||
+            !parse_double_sv(row_toks[static_cast<size_t>(val_pos)], val_v)) {
+            ok = false;
+            break;
+        }
+        idx_out[parsed_rows] = idx_v;
+        w_out[parsed_rows] = w_v;
+        val_out[parsed_rows] = val_v;
+
+        const std::string_view valid_tok = row_toks[static_cast<size_t>(valid_pos)];
+        uint8_t is_valid = (valid_tok.size() == 1 && valid_tok[0] == '1') ? 1 : 0;
+
+        if (st_pos >= 0) {
+            const std::string_view st_tok = row_toks[static_cast<size_t>(st_pos)];
+            int16_t sc = 0;
+            if (has_last_st && st_tok == last_st_tok) {
+                sc = last_st_code;
+            } else {
+                auto it = st_sv.find(st_tok);
+                if (it == st_sv.end()) {
+                    upper_tmp.resize(st_tok.size());
+                    for (size_t i = 0; i < st_tok.size(); ++i) {
+                        unsigned char ch = static_cast<unsigned char>(st_tok[i]);
+                        upper_tmp[i] = static_cast<char>((ch >= 'a' && ch <= 'z') ? (ch - 32) : ch);
+                    }
+                    it = st_sv.find(upper_tmp);
+                    if (it == st_sv.end()) {
+                        ok = false;
+                        break;
+                    }
+                }
+                sc = it->second;
+                last_st_tok = st_tok;
+                last_st_code = sc;
+                has_last_st = true;
+            }
+            st_out[parsed_rows] = sc;
+            if (sc == status_invalid || sc == status_removed) {
+                is_valid = 0;
+            }
+        } else {
+            st_out[parsed_rows] = is_valid ? static_cast<int16_t>(status_normal) : static_cast<int16_t>(status_invalid);
+        }
+        valid_out[parsed_rows] = is_valid;
+
+        const std::string_view dt_tok = row_toks[static_cast<size_t>(dt_pos)];
+        if (has_last_dt && dt_tok == last_dt_tok) {
+            dt_out[parsed_rows] = last_dt_code;
+        } else {
+            auto it = dt_sv.find(dt_tok);
+            const int16_t code = (it != dt_sv.end()) ? it->second : 0;
+            dt_out[parsed_rows] = code;
+            last_dt_tok = dt_tok;
+            last_dt_code = code;
+            has_last_dt = true;
+        }
+
+        const std::string_view mt_tok = row_toks[static_cast<size_t>(mt_pos)];
+        if (has_last_mt && mt_tok == last_mt_tok) {
+            mt_out[parsed_rows] = last_mt_code;
+        } else {
+            auto it = mt_sv.find(mt_tok);
+            int16_t code = 0;
+            if (it != mt_sv.end()) {
+                code = it->second;
+            } else {
+                upper_tmp.resize(mt_tok.size());
+                for (size_t i = 0; i < mt_tok.size(); ++i) {
+                    unsigned char ch = static_cast<unsigned char>(mt_tok[i]);
+                    upper_tmp[i] = static_cast<char>((ch >= 'a' && ch <= 'z') ? (ch - 32) : ch);
+                }
+                auto it2 = mt_sv.find(upper_tmp);
+                code = (it2 != mt_sv.end()) ? it2->second : 0;
+            }
+            mt_out[parsed_rows] = code;
+            last_mt_tok = mt_tok;
+            last_mt_code = code;
+            has_last_mt = true;
+        }
+
+        const std::string_view dn_tok = row_toks[static_cast<size_t>(dn_pos)];
+        if (has_last_dn && dn_tok == last_dn_tok) {
+            dnid_out[parsed_rows] = last_dn_id;
+        } else {
+            if (static_cast<size_t>(unique_count) * 10 >= ht_cap * 7) {
+                ht_rehash();
+            }
+            const uint64_t h = fnv1a_sv(dn_tok);
+            size_t slot_idx = static_cast<size_t>(h) & ht_mask;
+            int32_t found_id = -1;
+            const uint32_t dlen = static_cast<uint32_t>(dn_tok.size());
+            while (true) {
+                auto& sl = ht[slot_idx];
+                if (sl.id < 0) {
+                    found_id = unique_count++;
+                    sl.hash = h;
+                    sl.ptr = dn_tok.data();
+                    sl.len = dlen;
+                    sl.id = found_id;
+                    if (!unique_names_joined.empty()) {
+                        unique_names_joined.push_back('\n');
+                    }
+                    unique_names_joined.append(dn_tok.data(), dn_tok.size());
+                    break;
+                }
+                if (sl.hash == h && sl.len == dlen && std::memcmp(sl.ptr, dn_tok.data(), dlen) == 0) {
+                    found_id = sl.id;
+                    break;
+                }
+                slot_idx = (slot_idx + 1) & ht_mask;
+            }
+            dnid_out[parsed_rows] = found_id;
+            last_dn_tok = dn_tok;
+            last_dn_id = found_id;
+            has_last_dn = true;
+        }
+
+        ++parsed_rows;
+    }
+    if (ok && parsed_rows != n_rows) {
+        ok = false;
+    }
+    Py_END_ALLOW_THREADS
+
+    if (!ok) {
+        Py_RETURN_NONE;
+    }
+    return PyBytes_FromStringAndSize(unique_names_joined.data(), static_cast<Py_ssize_t>(unique_names_joined.size()));
+}
+
 static PyMethodDef NativeMethods[] = {
     {"register_blas_capsules", py_register_blas_capsules, METH_VARARGS,
      "Register SciPy cython_blas/cython_lapack PyCapsule function pointers."},
@@ -1080,6 +2095,20 @@ static PyMethodDef NativeMethods[] = {
      "OpenMP parallel diag(H G^-1 H^T) from selected inverse Z_low."},
     {"assemble_aat_upper_csr", py_assemble_aat_upper_csr, METH_VARARGS,
      "OpenMP parallel fixed-pattern upper-triangular CSR assembly for G = A A^T (+ beta I)."},
+    {"build_csc_transpose_map", py_build_csc_transpose_map, METH_VARARGS,
+     "Build static CSC->CSR row transpose map (r_ptr, r_col, r_src) once per fixed pattern."},
+    {"assemble_aat_upper_csr_cached", py_assemble_aat_upper_csr_cached, METH_VARARGS,
+     "OpenMP Gustavson fixed-pattern upper-triangular CSR assembly reusing static transpose map."},
+    {"complex_voltage", py_complex_voltage, METH_VARARGS,
+     "OpenMP parallel complex voltage calculation V * exp(1j * theta)."},
+    {"eval_ac_branch_power_values", py_eval_ac_branch_power_values, METH_VARARGS,
+     "OpenMP parallel AC branch/transformer P/Q measurement evaluation."},
+    {"fill_ac_branch_power_jacobian", py_fill_ac_branch_power_jacobian, METH_VARARGS,
+     "OpenMP parallel AC branch/transformer P/Q Jacobian with optional direct CSR scatter."},
+    {"fill_ac_balance_jacobian", py_fill_ac_balance_jacobian, METH_VARARGS,
+     "OpenMP parallel AC nodal power-balance Jacobian with fused reduction and direct CSR scatter."},
+    {"parse_meas_bulk_bytes", py_parse_meas_bulk_bytes, METH_VARARGS,
+     "Single-pass C++17 std::from_chars bulk parser for standard unquoted <Measurement> blocks."},
     {nullptr, nullptr, 0, nullptr},
 };
 

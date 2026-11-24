@@ -44,12 +44,14 @@ except Exception:
 try:
     from .mkl_pardiso import (
         MKLPardisoFactor,
+        MKLPardisoFactorizationError,
         build_upper_csr_from_aat,
         get_linear_solver_preference,
         is_mkl_pardiso_available,
     )
 except Exception:
     MKLPardisoFactor = None
+    MKLPardisoFactorizationError = None
     build_upper_csr_from_aat = None
     get_linear_solver_preference = lambda: "auto"  # noqa: E731
     is_mkl_pardiso_available = lambda: False  # noqa: E731
@@ -327,6 +329,7 @@ class SparseJacobianBuilder:
         self._cached_chunk_slices: Optional[List[Tuple[int, int]]] = None
         self._cached_chunk_slot_plans: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
         self._cached_direct_chunk_slots: Optional[List[Optional[np.ndarray]]] = None
+        self._cached_expanded_direct_slots: Dict[int, np.ndarray] = {}
         self._cached_duplicate_dest_slots: Optional[np.ndarray] = None
         self._cached_slots_cover_pattern = False
         self._cached_has_unique_slots = False
@@ -352,6 +355,7 @@ class SparseJacobianBuilder:
         self._cached_add_many_specs = list(self._recorded_add_many_specs) if self._recorded_add_many_specs else None
         self._cached_chunk_slot_plans = []
         self._cached_direct_chunk_slots = []
+        self._cached_expanded_direct_slots = {}
         if slot.size == 0:
             self._cached_unique_slot_mask = np.array([], dtype=bool)
             self._cached_duplicate_slot_mask = np.array([], dtype=bool)
@@ -780,6 +784,67 @@ class SparseJacobianBuilder:
             self._data_chunks.append(masked_values)
         elif not self._data_only_refresh_active:
             self._recorded_add_many_specs.append((raw_cols, raw_mask, 0, None))
+
+    def try_claim_direct_scatter(
+        self,
+        block_checks: Sequence[Tuple[object, object, int]],
+    ) -> Optional[Tuple[np.ndarray, List[np.ndarray]]]:
+        """固定稀疏模式直写协商：若接下来连续 K 块均无重复槽位且模式与录制期一致，
+        直接返回 ``(target_csr_data, [slots_0, ..., slots_{K-1}])`` 供原生核原位写入并推进游标。
+        若任一条件不满足则保持游标不变并返回 ``None``，调用方无缝回退常规路径。
+        """
+        if not self._add_many_fast_path_ok or not self._data_only_direct_active:
+            return None
+        specs = self._cached_add_many_specs
+        direct_list = self._cached_direct_chunk_slots
+        chunk_slices = self._cached_chunk_slices
+        if specs is None or direct_list is None or chunk_slices is None:
+            return None
+        n_blocks = len(block_checks)
+        spec_cur = self._add_many_call_cursor
+        if spec_cur + n_blocks > len(specs):
+            return None
+        chunk_cur = self._data_only_chunk_cursor
+        slots_out: List[np.ndarray] = []
+        empty_slots = np.empty(0, dtype=np.int64)
+        for i in range(n_blocks):
+            cols_ref, mask_ref, arr_len = block_checks[i]
+            rec_cols, rec_mask, kind, rec_idx = specs[spec_cur + i]
+            if cols_ref is not rec_cols or mask_ref is not rec_mask:
+                return None
+            if kind == 0:
+                slots_out.append(empty_slots)
+                continue
+            if chunk_cur >= len(direct_list) or chunk_cur >= len(chunk_slices):
+                return None
+            d_slots = direct_list[chunk_cur]
+            if d_slots is None:
+                return None
+            start, end = chunk_slices[chunk_cur]
+            expected = int(end) - int(start)
+            if kind == 1:
+                if int(arr_len) != expected or int(d_slots.size) != int(arr_len):
+                    return None
+                slots_out.append(d_slots)
+            elif kind == 2:
+                if rec_idx is None or int(rec_idx.size) != expected or int(d_slots.size) != expected:
+                    return None
+                expanded = self._cached_expanded_direct_slots.get(chunk_cur)
+                if expanded is None or int(expanded.size) != int(arr_len):
+                    expanded = np.full(int(arr_len), -1, dtype=np.int64)
+                    expanded[rec_idx] = d_slots
+                    self._cached_expanded_direct_slots[chunk_cur] = expanded
+                slots_out.append(expanded)
+            else:
+                return None
+            chunk_cur += 1
+
+        target = self._initialize_data_only_direct_buffer()
+        if target is None:
+            return None
+        self._add_many_call_cursor = spec_cur + n_blocks
+        self._data_only_chunk_cursor = chunk_cur
+        return target, slots_out
 
     def to_csr(self):
         if self._assume_fixed_pattern and self._cached_slot_positions is not None and self._cached_pattern_indptr is not None and self._cached_pattern_indices is not None:
@@ -1557,11 +1622,16 @@ class CholmodAAtNormalEquationPlan:
         self._sqrt_weighted_residual = np.empty(self.shape[0], dtype=np.float64)
         self._fixed_sqrt_weight = None
         self._fixed_sqrt_row_weight = None
+        self._dyn_weight_snapshot = None
+        self._dyn_sqrt_row_weight = None
+        self._dyn_sqrt_weight = None
+        self._assembly_version = 0
         self.A = SP_CSC_MATRIX(
             (self.a_data, self.a_indices, self.a_indptr),
             shape=self.a_shape,
             copy=False,
         )
+        self.A._aat_assembly_version = 0
 
     @classmethod
     def from_jacobian(cls, H) -> "CholmodAAtNormalEquationPlan":
@@ -1595,6 +1665,9 @@ class CholmodAAtNormalEquationPlan:
     def clear_fixed_weights(self) -> None:
         self._fixed_sqrt_weight = None
         self._fixed_sqrt_row_weight = None
+        self._dyn_weight_snapshot = None
+        self._dyn_sqrt_row_weight = None
+        self._dyn_sqrt_weight = None
 
     def matches(self, H) -> bool:
         if not is_sparse_matrix(H) or tuple(H.shape) != self.shape:
@@ -1664,13 +1737,24 @@ class CholmodAAtNormalEquationPlan:
                 )
 
         if data.size:
+            dyn_sqrt_row_w = None
             if row_weight is not None:
                 if assume_fixed_weights:
                     if self._fixed_sqrt_weight is None or self._fixed_sqrt_weight.shape[0] != self.h_rows.size:
                         self.prepare_fixed_weights(row_weight)
                     np.multiply(data, self._fixed_sqrt_weight, out=self.a_data)
                 else:
-                    np.multiply(data, np.sqrt(row_weight[self.h_rows]), out=self.a_data)
+                    # 同一次 estimate() 多轮迭代期间动态权重向量不变，缓存 sqrt(w)[h_rows] 免去每步百万次开方与花式索引
+                    if (
+                        self._dyn_weight_snapshot is None
+                        or self._dyn_weight_snapshot.shape != row_weight.shape
+                        or not np.array_equal(self._dyn_weight_snapshot, row_weight)
+                    ):
+                        self._dyn_weight_snapshot = row_weight.copy()
+                        self._dyn_sqrt_row_weight = np.sqrt(np.maximum(row_weight, 0.0))
+                        self._dyn_sqrt_weight = self._dyn_sqrt_row_weight[self.h_rows]
+                    dyn_sqrt_row_w = self._dyn_sqrt_row_weight
+                    np.multiply(data, self._dyn_sqrt_weight, out=self.a_data)
             elif sqrt_scale != 1.0:
                 np.multiply(data, sqrt_scale, out=self.a_data)
             else:
@@ -1685,6 +1769,11 @@ class CholmodAAtNormalEquationPlan:
                     self._sqrt_weighted_residual = np.empty(residual.shape[0], dtype=np.float64)
                 np.multiply(residual, sqrt_row_weight, out=self._sqrt_weighted_residual)
                 self.rhs[:] = self.A @ self._sqrt_weighted_residual
+            elif dyn_sqrt_row_w is not None and weighted_residual is None:
+                if self._sqrt_weighted_residual.shape[0] != residual.shape[0]:
+                    self._sqrt_weighted_residual = np.empty(residual.shape[0], dtype=np.float64)
+                np.multiply(residual, dyn_sqrt_row_w, out=self._sqrt_weighted_residual)
+                self.rhs[:] = self.A @ self._sqrt_weighted_residual
             else:
                 np.multiply(data, weighted_residual_values[self.h_rows], out=self._rhs_values)
                 self.rhs[:] = np.bincount(
@@ -1696,6 +1785,8 @@ class CholmodAAtNormalEquationPlan:
             self.a_data.fill(0.0)
             self.rhs.fill(0.0)
 
+        self._assembly_version += 1
+        self.A._aat_assembly_version = self._assembly_version
         rhs = self.rhs.copy() if copy_rhs else self.rhs
         return self.A, rhs
 
@@ -1749,6 +1840,7 @@ class CholmodAAtNormalEquationSolver:
         self._cholmod_disabled = False
         self._pardiso_factor = None
         self._pardiso_upper_pattern = None
+        self._pardiso_last_a_key = None
         self._pardiso_disabled = False
         self._active_backend = None
         self._last_normal_operand = None
@@ -1762,6 +1854,7 @@ class CholmodAAtNormalEquationSolver:
         # 仍在复用的有效句柄；当引用计数归零时由 MKLPardisoFactor.__del__ 自动调用 phase=-1 释放内存。
         self._pardiso_factor = None
         self._pardiso_upper_pattern = None
+        self._pardiso_last_a_key = None
 
     def __del__(self) -> None:
         self._reset_pardiso()
@@ -1786,6 +1879,20 @@ class CholmodAAtNormalEquationSolver:
     def _solve_sparse_pardiso(self, A_csc, rhs: np.ndarray, damping: float = 0.0):
         beta = float(damping)
         n_state = int(A_csc.shape[0])
+        a_version = getattr(A_csc, "_aat_assembly_version", None)
+        a_key = (id(A_csc), a_version) if a_version is not None else None
+        # 同一步迭代中若 A_csc 未重新装配、仅调整 LM 阻尼，直接原位更新对角元，免去整矩阵 A·A^T 重算
+        if (
+            a_key is not None
+            and a_key == self._pardiso_last_a_key
+            and self._pardiso_factor is not None
+            and self._pardiso_factor.can_update_damping_inplace()
+        ):
+            self._pardiso_factor.update_damping_and_factorize(beta, aat_operand=A_csc)
+            self._last_normal_operand = A_csc
+            self._active_backend = "pardiso"
+            return self._pardiso_factor.solve(rhs), None
+
         prev_pattern = self._pardiso_upper_pattern
         ia, ja, a, new_pattern = build_upper_csr_from_aat(
             A_csc,
@@ -1797,6 +1904,7 @@ class CholmodAAtNormalEquationSolver:
             self._reset_pardiso()
             self._pardiso_factor = MKLPardisoFactor(n_state, ia, ja, upper_pattern=new_pattern)
             self._pardiso_upper_pattern = new_pattern
+        self._pardiso_last_a_key = a_key
         self._pardiso_factor.factorize_inplace(a, aat_operand=A_csc, damping=beta)
         self._last_normal_operand = A_csc
         self._active_backend = "pardiso"
@@ -1882,10 +1990,14 @@ class CholmodAAtNormalEquationSolver:
             except (TypeError, AttributeError):
                 self._reset_pardiso()
                 self._pardiso_disabled = True
-            except Exception:
-                # 数值奇异/病态仅本次回退，避免后续健康矩阵永久丧失 PARDISO 加速
-                self._reset_pardiso()
-                self._active_backend = None
+            except Exception as exc:
+                # 若仅是 phase=22 数值分解非正定失败，严禁销毁已缓存的 phase=11 符号分析与上三角数值缓冲，
+                # 供紧随其后的加阻尼步零开销原位更新对角元并复用符号分析。
+                if MKLPardisoFactorizationError is not None and isinstance(exc, MKLPardisoFactorizationError):
+                    self._active_backend = None
+                else:
+                    self._reset_pardiso()
+                    self._active_backend = None
         if (
             pref != "scipy"
             and not self._cholmod_disabled
@@ -1927,6 +2039,12 @@ class CholmodAAtNormalEquationSolver:
     def last_normal_operand(self):
         """返回最近一次成功分解的稀疏加权转置操作数 A_csc（供极稀疏选元求逆按需切换 supernodal）。"""
         return self._last_normal_operand
+
+    def unregularized_diagonal(self) -> Optional[np.ndarray]:
+        """O(n) 返回最近一次 PARDISO 分解对应的无阻尼对角元 diag(A·A^T)，失败返回 None。"""
+        if self._active_backend == "pardiso" and self._pardiso_factor is not None:
+            return self._pardiso_factor.unregularized_diagonal()
+        return None
 
     def solve_with_cached_factor(self, rhs: np.ndarray) -> Optional[np.ndarray]:
         """直接复用当前 PARDISO 或 CHOLMOD 数值因子执行稀疏前代/回代，不重新分解。"""
@@ -5099,27 +5217,52 @@ def select_island_fixed_voltage_reference_buses(
     chosen_comps = sorted_comps[first_in_island]
 
     # 4. 为每岛选定的定电压母线计算稳健均值（>=3 条时先剔除偏离中位数 > outlier_tol 的离群坏数据）
-    chosen_set = set(int(c) for c in chosen_comps.tolist())
-    chosen_mask = np.isin(comp_v, chosen_comps)
+    #    使用一次 O(K log K) 排序切片替代 O(K^2) 逐岛全表扫描，彻底消除万岛场景初始化瓶颈
+    chosen_lut = np.zeros(n_comp, dtype=bool)
+    chosen_lut[chosen_comps] = True
+    chosen_mask = chosen_lut[comp_v]
     sel_comps = comp_v[chosen_mask]
     sel_vals = val_v[chosen_mask]
+    if sel_comps.size == 0:
+        return {}
+
+    order_v = np.argsort(sel_comps, kind="mergesort")
+    sc = sel_comps[order_v]
+    sv = sel_vals[order_v]
+    change = np.empty(sc.size, dtype=bool)
+    change[0] = True
+    change[1:] = sc[1:] != sc[:-1]
+    starts = np.flatnonzero(change)
+    ends = np.empty_like(starts)
+    ends[:-1] = starts[1:]
+    ends[-1] = sc.size
+    group_comps = sc[starts]
+    group_counts = ends - starts
+
     out: Dict[int, float] = {}
     tol = float(outlier_tol)
-    for comp_id in chosen_comps.tolist():
-        c_int = int(comp_id)
-        if c_int not in chosen_set:
-            continue
-        vals = sel_vals[sel_comps == c_int]
-        if vals.size == 0:
-            continue
-        if vals.size >= 3 and tol > 0.0:
+    # 快速向量化路径：样本数 < 3（或 tol <= 0）直接通过前缀和一步算均值，零 Python np.mean 循环
+    small_mask = (group_counts < 3) if tol > 0.0 else np.ones(group_counts.size, dtype=bool)
+    if np.any(small_mask):
+        csum = np.empty(sv.size + 1, dtype=np.float64)
+        csum[0] = 0.0
+        np.cumsum(sv, out=csum[1:])
+        s_idx = np.flatnonzero(small_mask)
+        s_starts = starts[s_idx]
+        s_ends = ends[s_idx]
+        s_means = (csum[s_ends] - csum[s_starts]) / group_counts[s_idx]
+        np.clip(s_means, v_lo, v_hi, out=s_means)
+        for c_id, ref_v in zip(group_comps[s_idx].tolist(), s_means.tolist()):
+            out[int(c_id)] = float(ref_v)
+
+    if tol > 0.0 and not np.all(small_mask):
+        large_idx = np.flatnonzero(~small_mask)
+        for gi in large_idx.tolist():
+            vals = sv[int(starts[gi]) : int(ends[gi])]
             med = float(np.median(vals))
             inliers = vals[np.abs(vals - med) <= tol]
             ref_v = float(np.mean(inliers)) if inliers.size > 0 else med
-        else:
-            ref_v = float(np.mean(vals))
-        ref_v = min(max(ref_v, v_lo), v_hi)
-        out[c_int] = ref_v
+            out[int(group_comps[gi])] = min(max(ref_v, v_lo), v_hi)
     return out
 
 
@@ -5140,6 +5283,8 @@ def run_huber_irls_warmup(
     max_iter: int = 15,
     huber_k: float = 3.0,
     tol: float = 1e-4,
+    shared_aat_solver: Optional[CholmodAAtNormalEquationSolver] = None,
+    shared_aat_plan: Optional[CholmodAAtNormalEquationPlan] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """当初始纯 WLS 未收敛时，执行轻量 Huber IRLS 稳健热身，抑制大坏数据拉偏并产出稳健状态与残差。
 
@@ -5190,8 +5335,12 @@ def run_huber_irls_warmup(
         return w_eff
 
     use_aat = True
-    aat_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True, ordering_method="auto", multi_solve=True)
-    aat_plan = None
+    aat_solver = (
+        shared_aat_solver
+        if shared_aat_solver is not None
+        else CholmodAAtNormalEquationSolver(assume_fixed_pattern=True, ordering_method="auto", multi_solve=True)
+    )
+    aat_plan = shared_aat_plan
     normal_solver = NormalEquationSolver()
     lam = 0.0
 
@@ -5230,7 +5379,14 @@ def run_huber_irls_warmup(
         try_lam = lam
         for _ls in range(10):
             if norm_op is not None:
-                dx, _ = aat_solver.solve(norm_op, rhs, return_factor_diag=False, damping=try_lam)
+                allow_slow = (x.size < 500) or (try_lam >= 10.0)
+                dx, _ = aat_solver.solve(
+                    norm_op,
+                    rhs,
+                    return_factor_diag=False,
+                    damping=try_lam,
+                    allow_slow_fallback=allow_slow,
+                )
             else:
                 if try_lam > 0.0:
                     if is_sparse_matrix(gain):
@@ -5248,6 +5404,9 @@ def run_huber_irls_warmup(
                 continue
             max_dx = float(np.max(np.abs(dx)))
             if max_dx < tol and try_lam == 0.0:
+                return x, res, z_est
+            if _it >= 4 and max_dx < 1e-2 and try_lam == 0.0 and not _oob(x):
+                # Huber 仅负责将发散初值拉回稳健吸引域，达到 1e-2 即提前交回精确 WLS 完成二次收敛
                 return x, res, z_est
             s = 1.0
             if vc.size:

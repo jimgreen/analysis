@@ -163,6 +163,20 @@ from secore.se_math import (
     targeted_redundancy_count,
     unanchored_angle_state_indices,
 )
+try:
+    from secore.native_kernels import (
+        complex_voltage_native as NATIVE_COMPLEX_VOLTAGE,
+        eval_ac_branch_power_values_native as NATIVE_EVAL_AC_BRANCH_POWER_VALUES,
+        fill_ac_balance_jacobian_native as NATIVE_FILL_AC_BALANCE_JACOBIAN,
+        fill_ac_branch_power_jacobian_native as NATIVE_FILL_AC_BRANCH_POWER_JACOBIAN,
+        is_native_kernels_available as NATIVE_IS_AVAILABLE,
+    )
+except Exception:
+    NATIVE_COMPLEX_VOLTAGE = None
+    NATIVE_EVAL_AC_BRANCH_POWER_VALUES = None
+    NATIVE_FILL_AC_BALANCE_JACOBIAN = None
+    NATIVE_FILL_AC_BRANCH_POWER_JACOBIAN = None
+    NATIVE_IS_AVAILABLE = None
 from secore.state_metadata import StateMeta, state_labels_from_metadata
 from secore.se_array_plan import (
     MeasurementPlanTable,
@@ -4446,8 +4460,10 @@ class ACStateEstimator:
             store_strings=store_strings,
         )
 
+        active_key_set = self._active_measurement_key_set_ref()
+
         def key_is_active(key: int) -> bool:
-            return int(key) in self._active_measurement_key_set_ref()
+            return int(key) in active_key_set
 
         def queue_topology_pseudo(
             device_type_code: int,
@@ -4459,7 +4475,7 @@ class ACStateEstimator:
             value: float,
         ) -> None:
             key = self._active_measurement_key(device_type_code, int(device_pos), meas_type_code)
-            if key in added_keys or key_is_active(key):
+            if key in added_keys or int(key) in active_key_set:
                 return
             pseudo_name = f"pseudo_{meas_type.lower()}_{device_name}" if store_strings else ""
             pseudo_rows.add(
@@ -6869,6 +6885,10 @@ class ACStateEstimator:
 
     @staticmethod
     def _complex_voltage(theta: np.ndarray, voltage: np.ndarray) -> np.ndarray:
+        if NATIVE_COMPLEX_VOLTAGE is not None and theta.size >= 1024:
+            res = NATIVE_COMPLEX_VOLTAGE(theta, voltage)
+            if res is not None:
+                return res
         return voltage * np.exp(1j * theta)
 
     def _load_power_totals_from_state(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -8039,15 +8059,35 @@ class ACStateEstimator:
         if rows.size:
             own = plan["power_own"]
             other = plan["power_other"]
-            v_own = voltage_complex[own]
-            current = (
-                plan["power_y_self"] * v_own
-                + plan["power_y_mutual"] * voltage_complex[other]
-            )
-            if plan.get("power_has_third", True):
-                current = current + plan["power_y_third"] * voltage_complex[plan["power_third"]]
-            power = v_own * np.conj(current)
-            values[rows] = np.where(plan["power_is_p"], power.real, power.imag)
+            has_third = bool(plan.get("power_has_third", True))
+            if (
+                NATIVE_EVAL_AC_BRANCH_POWER_VALUES is not None
+                and rows.size >= 256
+                and NATIVE_EVAL_AC_BRANCH_POWER_VALUES(
+                    values,
+                    rows,
+                    own,
+                    other,
+                    plan["power_third"] if has_third else None,
+                    plan["power_is_p"],
+                    plan["power_y_self"],
+                    plan["power_y_mutual"],
+                    plan["power_y_third"] if has_third else None,
+                    voltage_complex,
+                    has_third,
+                )
+            ):
+                pass
+            else:
+                v_own = voltage_complex[own]
+                current = (
+                    plan["power_y_self"] * v_own
+                    + plan["power_y_mutual"] * voltage_complex[other]
+                )
+                if has_third:
+                    current = current + plan["power_y_third"] * voltage_complex[plan["power_third"]]
+                power = v_own * np.conj(current)
+                values[rows] = np.where(plan["power_is_p"], power.real, power.imag)
 
         rows = plan["current_rows"]
         if rows.size:
@@ -8537,59 +8577,162 @@ class ACStateEstimator:
             other = plan["power_other"]
             y_self_conj = plan["power_y_self_conj"]
             y_mutual_conj = plan["power_y_mutual_conj"]
-            v_own = voltage_complex[own]
-            off_other = y_mutual_conj * v_own * np.conj(voltage_complex[other])
-            has_third = plan.get("power_has_third", True)
-            if has_third:
-                third = plan["power_third"]
-                off_third = plan["power_y_third_conj"] * v_own * np.conj(voltage_complex[third])
-                off = off_other + off_third
-            else:
-                off = off_other
-            v_own_mag = voltage[own]
-            dvoltage_own = 2.0 * y_self_conj * v_own_mag + off / v_own_mag
-            dvoltage_other = off_other / voltage[other]
+            has_third = bool(plan.get("power_has_third", True))
             is_p = plan["power_is_p"]
-
             own_angle_cols = plan["power_own_angle_cols"]
             other_angle_cols = plan["power_other_angle_cols"]
             own_voltage_cols = plan["power_own_voltage_cols"]
             other_voltage_cols = plan["power_other_voltage_cols"]
-            v0 = np.where(is_p, -off.imag, off.real)
-            v1 = np.where(is_p, off_other.imag, -off_other.real)
-            v3 = np.where(is_p, dvoltage_own.real, dvoltage_own.imag)
-            v4 = np.where(is_p, dvoltage_other.real, dvoltage_other.imag)
-            if has_third:
-                dvoltage_third = off_third / voltage[third]
-                third_angle_cols = plan["power_third_angle_cols"]
-                third_voltage_cols = plan["power_third_voltage_cols"]
-                v2 = np.where(is_p, off_third.imag, -off_third.real)
-                v5 = np.where(is_p, dvoltage_third.real, dvoltage_third.imag)
-                if hasattr(H, "add_many"):
-                    H.add_many(rows, own_angle_cols, v0)
-                    H.add_many(rows, other_angle_cols, v1)
-                    H.add_many(rows, third_angle_cols, v2)
-                    H.add_many(rows, own_voltage_cols, v3)
-                    H.add_many(rows, other_voltage_cols, v4)
-                    H.add_many(rows, third_voltage_cols, v5)
+
+            native_done = False
+            if (
+                NATIVE_FILL_AC_BRANCH_POWER_JACOBIAN is not None
+                and NATIVE_IS_AVAILABLE is not None
+                and NATIVE_IS_AVAILABLE()
+                and rows.size >= 256
+            ):
+                m_pow = int(rows.size)
+                third = plan["power_third"] if has_third else None
+                y_third_conj = plan["power_y_third_conj"] if has_third else None
+                if has_third:
+                    third_angle_cols = plan["power_third_angle_cols"]
+                    third_voltage_cols = plan["power_third_voltage_cols"]
+                    block_checks = (
+                        (own_angle_cols, None, m_pow),
+                        (other_angle_cols, None, m_pow),
+                        (third_angle_cols, None, m_pow),
+                        (own_voltage_cols, None, m_pow),
+                        (other_voltage_cols, None, m_pow),
+                        (third_voltage_cols, None, m_pow),
+                    )
                 else:
-                    self._add_indexed_values(H, rows, own_angle_cols, v0)
-                    self._add_indexed_values(H, rows, other_angle_cols, v1)
-                    self._add_indexed_values(H, rows, third_angle_cols, v2)
-                    self._add_indexed_values(H, rows, own_voltage_cols, v3)
-                    self._add_indexed_values(H, rows, other_voltage_cols, v4)
-                    self._add_indexed_values(H, rows, third_voltage_cols, v5)
-            else:
-                if hasattr(H, "add_many"):
-                    H.add_many(rows, own_angle_cols, v0)
-                    H.add_many(rows, other_angle_cols, v1)
-                    H.add_many(rows, own_voltage_cols, v3)
-                    H.add_many(rows, other_voltage_cols, v4)
+                    block_checks = (
+                        (own_angle_cols, None, m_pow),
+                        (other_angle_cols, None, m_pow),
+                        (own_voltage_cols, None, m_pow),
+                        (other_voltage_cols, None, m_pow),
+                    )
+                claimed = H.try_claim_direct_scatter(block_checks) if hasattr(H, "try_claim_direct_scatter") else None
+                if claimed is not None:
+                    target_buf, slots_list = claimed
+                    if has_third:
+                        channels = (
+                            (target_buf, slots_list[0]),
+                            (target_buf, slots_list[1]),
+                            (target_buf, slots_list[2]),
+                            (target_buf, slots_list[3]),
+                            (target_buf, slots_list[4]),
+                            (target_buf, slots_list[5]),
+                        )
+                    else:
+                        channels = (
+                            (target_buf, slots_list[0]),
+                            (target_buf, slots_list[1]),
+                            (None, None),
+                            (target_buf, slots_list[2]),
+                            (target_buf, slots_list[3]),
+                            (None, None),
+                        )
+                    native_done = NATIVE_FILL_AC_BRANCH_POWER_JACOBIAN(
+                        own, other, third, is_p, y_self_conj, y_mutual_conj, y_third_conj,
+                        voltage, voltage_complex, has_third, channels,
+                    )
                 else:
-                    self._add_indexed_values(H, rows, own_angle_cols, v0)
-                    self._add_indexed_values(H, rows, other_angle_cols, v1)
-                    self._add_indexed_values(H, rows, own_voltage_cols, v3)
-                    self._add_indexed_values(H, rows, other_voltage_cols, v4)
+                    v0 = np.empty(m_pow, dtype=np.float64)
+                    v1 = np.empty(m_pow, dtype=np.float64)
+                    v3 = np.empty(m_pow, dtype=np.float64)
+                    v4 = np.empty(m_pow, dtype=np.float64)
+                    v2 = np.empty(m_pow, dtype=np.float64) if has_third else None
+                    v5 = np.empty(m_pow, dtype=np.float64) if has_third else None
+                    channels = (
+                        (v0, None),
+                        (v1, None),
+                        (v2, None),
+                        (v3, None),
+                        (v4, None),
+                        (v5, None),
+                    )
+                    if NATIVE_FILL_AC_BRANCH_POWER_JACOBIAN(
+                        own, other, third, is_p, y_self_conj, y_mutual_conj, y_third_conj,
+                        voltage, voltage_complex, has_third, channels,
+                    ):
+                        native_done = True
+                        if has_third:
+                            if hasattr(H, "add_many"):
+                                H.add_many(rows, own_angle_cols, v0)
+                                H.add_many(rows, other_angle_cols, v1)
+                                H.add_many(rows, third_angle_cols, v2)
+                                H.add_many(rows, own_voltage_cols, v3)
+                                H.add_many(rows, other_voltage_cols, v4)
+                                H.add_many(rows, third_voltage_cols, v5)
+                            else:
+                                self._add_indexed_values(H, rows, own_angle_cols, v0)
+                                self._add_indexed_values(H, rows, other_angle_cols, v1)
+                                self._add_indexed_values(H, rows, third_angle_cols, v2)
+                                self._add_indexed_values(H, rows, own_voltage_cols, v3)
+                                self._add_indexed_values(H, rows, other_voltage_cols, v4)
+                                self._add_indexed_values(H, rows, third_voltage_cols, v5)
+                        else:
+                            if hasattr(H, "add_many"):
+                                H.add_many(rows, own_angle_cols, v0)
+                                H.add_many(rows, other_angle_cols, v1)
+                                H.add_many(rows, own_voltage_cols, v3)
+                                H.add_many(rows, other_voltage_cols, v4)
+                            else:
+                                self._add_indexed_values(H, rows, own_angle_cols, v0)
+                                self._add_indexed_values(H, rows, other_angle_cols, v1)
+                                self._add_indexed_values(H, rows, own_voltage_cols, v3)
+                                self._add_indexed_values(H, rows, other_voltage_cols, v4)
+
+            if not native_done:
+                v_conj_all = np.conj(voltage_complex)
+                inv_v_all = 1.0 / np.maximum(voltage, 1e-12)
+                v_own = voltage_complex[own]
+                off_other = y_mutual_conj * v_own * v_conj_all[other]
+                if has_third:
+                    third = plan["power_third"]
+                    off_third = plan["power_y_third_conj"] * v_own * v_conj_all[third]
+                    off = off_other + off_third
+                else:
+                    off = off_other
+                v_own_mag = voltage[own]
+                dvoltage_own = 2.0 * y_self_conj * v_own_mag + off * inv_v_all[own]
+                dvoltage_other = off_other * inv_v_all[other]
+                v0 = np.where(is_p, -off.imag, off.real)
+                v1 = np.where(is_p, off_other.imag, -off_other.real)
+                v3 = np.where(is_p, dvoltage_own.real, dvoltage_own.imag)
+                v4 = np.where(is_p, dvoltage_other.real, dvoltage_other.imag)
+                if has_third:
+                    dvoltage_third = off_third * inv_v_all[third]
+                    third_angle_cols = plan["power_third_angle_cols"]
+                    third_voltage_cols = plan["power_third_voltage_cols"]
+                    v2 = np.where(is_p, off_third.imag, -off_third.real)
+                    v5 = np.where(is_p, dvoltage_third.real, dvoltage_third.imag)
+                    if hasattr(H, "add_many"):
+                        H.add_many(rows, own_angle_cols, v0)
+                        H.add_many(rows, other_angle_cols, v1)
+                        H.add_many(rows, third_angle_cols, v2)
+                        H.add_many(rows, own_voltage_cols, v3)
+                        H.add_many(rows, other_voltage_cols, v4)
+                        H.add_many(rows, third_voltage_cols, v5)
+                    else:
+                        self._add_indexed_values(H, rows, own_angle_cols, v0)
+                        self._add_indexed_values(H, rows, other_angle_cols, v1)
+                        self._add_indexed_values(H, rows, third_angle_cols, v2)
+                        self._add_indexed_values(H, rows, own_voltage_cols, v3)
+                        self._add_indexed_values(H, rows, other_voltage_cols, v4)
+                        self._add_indexed_values(H, rows, third_voltage_cols, v5)
+                else:
+                    if hasattr(H, "add_many"):
+                        H.add_many(rows, own_angle_cols, v0)
+                        H.add_many(rows, other_angle_cols, v1)
+                        H.add_many(rows, own_voltage_cols, v3)
+                        H.add_many(rows, other_voltage_cols, v4)
+                    else:
+                        self._add_indexed_values(H, rows, own_angle_cols, v0)
+                        self._add_indexed_values(H, rows, other_angle_cols, v1)
+                        self._add_indexed_values(H, rows, own_voltage_cols, v3)
+                        self._add_indexed_values(H, rows, other_voltage_cols, v4)
 
         rows = plan["current_rows"]
         if rows.size:
@@ -9104,6 +9247,13 @@ class ACStateEstimator:
                 "off_voltage_cols": empty_i,
                 "off_theta_p_rows": empty_i32,
                 "off_theta_q_rows": empty_i32,
+                "y_bal_ptr": None,
+                "y_off_idx": empty_i32,
+                "has_off": False,
+                "off_theta_p_mask": None,
+                "off_theta_q_mask": None,
+                "balance_p_mask": None,
+                "balance_q_mask": None,
                 "switch_p_rows": empty_i32,
                 "switch_q_rows": empty_i32,
                 "switch_angle_cols": empty_i,
@@ -9227,6 +9377,25 @@ class ACStateEstimator:
             acac_p_from_rows = acac_q_from_rows = acac_p_to_rows = acac_q_to_rows = np.asarray([], dtype=np.int32)
             acac_p_from_cols = acac_q_from_cols = acac_p_to_cols = acac_q_to_cols = np.asarray([], dtype=np.int64)
 
+        off_theta_p_rows = p_rows_for_balance[off_balance] if off_balance.size else np.asarray([], dtype=np.int32)
+        off_theta_q_rows = q_rows_for_balance[off_balance] if off_balance.size else np.asarray([], dtype=np.int32)
+        has_off = bool(off_balance.size > 0)
+        # 预计算平衡节点级 CSR 指针与非对角槽位索引，供 OpenMP 原生平衡雅可比核零锁并行计算
+        y_bal_ptr = None
+        if y_balance.size > 0 and balance_pos.size > 0:
+            if y_balance.size <= 1 or bool(np.all(y_balance[1:] >= y_balance[:-1])):
+                counts_yb = np.bincount(y_balance, minlength=int(balance_pos.size))
+                y_bal_ptr = np.empty(int(balance_pos.size) + 1, dtype=np.int64)
+                y_bal_ptr[0] = 0
+                np.cumsum(counts_yb, dtype=np.int64, out=y_bal_ptr[1:])
+        y_off_idx = np.full(int(y_balance.size), -1, dtype=np.int32)
+        if has_off:
+            y_off_idx[off_mask] = np.arange(int(off_balance.size), dtype=np.int32)
+        off_theta_p_mask = None if (off_theta_p_rows.size == 0 or bool(np.all(off_theta_p_rows >= 0))) else (off_theta_p_rows >= 0)
+        off_theta_q_mask = None if (off_theta_q_rows.size == 0 or bool(np.all(off_theta_q_rows >= 0))) else (off_theta_q_rows >= 0)
+        balance_p_mask = None if (p_rows_for_balance.size == 0 or bool(np.all(p_rows_for_balance >= 0))) else (p_rows_for_balance >= 0)
+        balance_q_mask = None if (q_rows_for_balance.size == 0 or bool(np.all(q_rows_for_balance >= 0))) else (q_rows_for_balance >= 0)
+
         plan = {
             "handled_mask": np.asarray(plan_table.handled, dtype=bool).copy(),
             "rows": self._int_array(rows),
@@ -9242,6 +9411,9 @@ class ACStateEstimator:
             "y_nodes_i64": y_nodes_i64,
             "y_conj": y_conj,
             "y_pos": y_pos,
+            "y_bal_ptr": y_bal_ptr,
+            "y_off_idx": y_off_idx,
+            "has_off": has_off,
             "p_rows_for_balance": p_rows_for_balance,
             "q_rows_for_balance": q_rows_for_balance,
             "balance_angle_cols": state_cols_for(angle_col, balance_pos),
@@ -9253,8 +9425,12 @@ class ACStateEstimator:
             "off_y_conj": off_y_conj,
             "off_theta_cols": state_cols_for(angle_col, off_nodes_i64),
             "off_voltage_cols": state_cols_for(voltage_col, off_nodes_i64),
-            "off_theta_p_rows": p_rows_for_balance[off_balance] if off_balance.size else np.asarray([], dtype=np.int32),
-            "off_theta_q_rows": q_rows_for_balance[off_balance] if off_balance.size else np.asarray([], dtype=np.int32),
+            "off_theta_p_rows": off_theta_p_rows,
+            "off_theta_q_rows": off_theta_q_rows,
+            "off_theta_p_mask": off_theta_p_mask,
+            "off_theta_q_mask": off_theta_q_mask,
+            "balance_p_mask": balance_p_mask,
+            "balance_q_mask": balance_q_mask,
             "switch_p_rows": switch_p_rows,
             "switch_q_rows": switch_q_rows,
             "switch_angle_cols": switch_angle_cols,
@@ -9319,86 +9495,233 @@ class ACStateEstimator:
         q_rows_for_balance = plan["q_rows_for_balance"]
 
         y_balance = plan["y_balance"]
-        if y_balance.size:
-            y_nodes = plan["y_nodes_i64"]
-            y_conj = plan["y_conj"]
-            y_pos = plan["y_pos"]
-            exp_delta = np.exp(1j * (theta[y_pos] - theta[y_nodes]))
-            y_voltage_term = y_conj * voltage[y_nodes] * exp_delta
-            term = y_voltage_term * voltage[y_pos]
-
-            off_sum = np.zeros(balance_pos.size, dtype=np.complex128)
-            off_mask = plan["off_mask"]
-            if off_mask.size and np.any(off_mask):
-                off_balance = plan["off_balance"]
-                off_term = term[off_mask]
-                off_sum = self._complex_bincount(off_balance, off_term, balance_pos.size)
-
-                theta_values = -1j * off_term
-                theta_cols = plan["off_theta_cols"]
-                theta_p_rows = plan["off_theta_p_rows"]
-                theta_q_rows = plan["off_theta_q_rows"]
-
-                voltage_values = plan["off_y_conj"] * voltage[plan["off_y_pos"]] * exp_delta[off_mask]
-                voltage_cols = plan["off_voltage_cols"]
-                self._add_indexed_value_blocks(
-                    H,
-                    (
-                        (
-                            theta_p_rows,
-                            theta_cols,
-                            theta_values.real,
-                        ),
-                        (
-                            theta_q_rows,
-                            theta_cols,
-                            theta_values.imag,
-                        ),
-                        (
-                            theta_p_rows,
-                            voltage_cols,
-                            voltage_values.real,
-                        ),
-                        (
-                            theta_q_rows,
-                            voltage_cols,
-                            voltage_values.imag,
-                        ),
-                    ),
+        y_bal_ptr = plan.get("y_bal_ptr")
+        native_bal_done = False
+        if (
+            NATIVE_FILL_AC_BALANCE_JACOBIAN is not None
+            and NATIVE_IS_AVAILABLE is not None
+            and NATIVE_IS_AVAILABLE()
+            and y_bal_ptr is not None
+            and y_balance.size > 0
+            and balance_pos.size >= 128
+        ):
+            has_off = bool(plan.get("has_off", False))
+            n_bal = int(balance_pos.size)
+            n_off = int(plan["off_balance"].size) if has_off else 0
+            bal_angle_cols = plan["balance_angle_cols"]
+            bal_voltage_cols = plan["balance_voltage_cols"]
+            bal_p_mask = plan.get("balance_p_mask")
+            bal_q_mask = plan.get("balance_q_mask")
+            if has_off:
+                off_theta_cols = plan["off_theta_cols"]
+                off_voltage_cols = plan["off_voltage_cols"]
+                off_theta_p_rows = plan["off_theta_p_rows"]
+                off_theta_q_rows = plan["off_theta_q_rows"]
+                off_p_mask = plan.get("off_theta_p_mask")
+                off_q_mask = plan.get("off_theta_q_mask")
+                block_checks = (
+                    (off_theta_cols, off_p_mask, n_off),
+                    (off_theta_cols, off_q_mask, n_off),
+                    (off_voltage_cols, off_p_mask, n_off),
+                    (off_voltage_cols, off_q_mask, n_off),
+                    (bal_angle_cols, bal_p_mask, n_bal),
+                    (bal_angle_cols, bal_q_mask, n_bal),
+                    (bal_voltage_cols, bal_p_mask, n_bal),
+                    (bal_voltage_cols, bal_q_mask, n_bal),
                 )
+            else:
+                block_checks = (
+                    (bal_angle_cols, bal_p_mask, n_bal),
+                    (bal_angle_cols, bal_q_mask, n_bal),
+                    (bal_voltage_cols, bal_p_mask, n_bal),
+                    (bal_voltage_cols, bal_q_mask, n_bal),
+                )
+            claimed = H.try_claim_direct_scatter(block_checks) if hasattr(H, "try_claim_direct_scatter") else None
+            if claimed is not None:
+                target_buf, slots_list = claimed
+                if has_off:
+                    channels = (
+                        (target_buf, slots_list[0]),
+                        (target_buf, slots_list[1]),
+                        (target_buf, slots_list[2]),
+                        (target_buf, slots_list[3]),
+                        (target_buf, slots_list[4]),
+                        (target_buf, slots_list[5]),
+                        (target_buf, slots_list[6]),
+                        (target_buf, slots_list[7]),
+                    )
+                else:
+                    channels = (
+                        (None, None),
+                        (None, None),
+                        (None, None),
+                        (None, None),
+                        (target_buf, slots_list[0]),
+                        (target_buf, slots_list[1]),
+                        (target_buf, slots_list[2]),
+                        (target_buf, slots_list[3]),
+                    )
+                native_bal_done = NATIVE_FILL_AC_BALANCE_JACOBIAN(
+                    balance_pos,
+                    y_bal_ptr,
+                    plan["y_nodes_i64"],
+                    plan["y_pos"],
+                    plan["y_conj"],
+                    plan["y_off_idx"],
+                    self._y_row_diag_conj,
+                    voltage,
+                    voltage_complex,
+                    n_off,
+                    channels,
+                )
+            else:
+                off_tp = np.empty(n_off, dtype=np.float64) if has_off else None
+                off_tq = np.empty(n_off, dtype=np.float64) if has_off else None
+                off_vp = np.empty(n_off, dtype=np.float64) if has_off else None
+                off_vq = np.empty(n_off, dtype=np.float64) if has_off else None
+                own_tp = np.empty(n_bal, dtype=np.float64)
+                own_tq = np.empty(n_bal, dtype=np.float64)
+                own_vp = np.empty(n_bal, dtype=np.float64)
+                own_vq = np.empty(n_bal, dtype=np.float64)
+                channels = (
+                    (off_tp, None),
+                    (off_tq, None),
+                    (off_vp, None),
+                    (off_vq, None),
+                    (own_tp, None),
+                    (own_tq, None),
+                    (own_vp, None),
+                    (own_vq, None),
+                )
+                if NATIVE_FILL_AC_BALANCE_JACOBIAN(
+                    balance_pos,
+                    y_bal_ptr,
+                    plan["y_nodes_i64"],
+                    plan["y_pos"],
+                    plan["y_conj"],
+                    plan["y_off_idx"],
+                    self._y_row_diag_conj,
+                    voltage,
+                    voltage_complex,
+                    n_off,
+                    channels,
+                ):
+                    native_bal_done = True
+                    if hasattr(H, "add_many"):
+                        if has_off:
+                            H.add_many(off_theta_p_rows, off_theta_cols, off_tp, off_p_mask)
+                            H.add_many(off_theta_q_rows, off_theta_cols, off_tq, off_q_mask)
+                            H.add_many(off_theta_p_rows, off_voltage_cols, off_vp, off_p_mask)
+                            H.add_many(off_theta_q_rows, off_voltage_cols, off_vq, off_q_mask)
+                        H.add_many(p_rows_for_balance, bal_angle_cols, own_tp, bal_p_mask)
+                        H.add_many(q_rows_for_balance, bal_angle_cols, own_tq, bal_q_mask)
+                        H.add_many(p_rows_for_balance, bal_voltage_cols, own_vp, bal_p_mask)
+                        H.add_many(q_rows_for_balance, bal_voltage_cols, own_vq, bal_q_mask)
+                    else:
+                        if has_off:
+                            self._add_indexed_value_blocks(
+                                H,
+                                (
+                                    (off_theta_p_rows, off_theta_cols, off_tp),
+                                    (off_theta_q_rows, off_theta_cols, off_tq),
+                                    (off_theta_p_rows, off_voltage_cols, off_vp),
+                                    (off_theta_q_rows, off_voltage_cols, off_vq),
+                                ),
+                            )
+                        self._add_indexed_value_blocks(
+                            H,
+                            (
+                                (p_rows_for_balance, bal_angle_cols, own_tp),
+                                (q_rows_for_balance, bal_angle_cols, own_tq),
+                                (p_rows_for_balance, bal_voltage_cols, own_vp),
+                                (q_rows_for_balance, bal_voltage_cols, own_vq),
+                            ),
+                        )
 
-            sum_all = self._complex_bincount(y_balance, y_voltage_term, balance_pos.size)
-        else:
-            off_sum = np.zeros(balance_pos.size, dtype=np.complex128)
-            sum_all = np.zeros(balance_pos.size, dtype=np.complex128)
+        if not native_bal_done:
+            if y_balance.size:
+                y_nodes = plan["y_nodes_i64"]
+                y_conj = plan["y_conj"]
+                y_pos = plan["y_pos"]
+                # 直接复用 voltage_complex 避免全网 20 万非零导纳元重复计算复指数 exp(1j*(theta_i - theta_k))
+                inv_v_all = 1.0 / np.maximum(voltage, 1e-12)
+                v_unit_all = voltage_complex * inv_v_all
+                v_conj_all = np.conj(voltage_complex)
+                y_voltage_term = y_conj * v_unit_all[y_pos] * v_conj_all[y_nodes]
+                term = y_voltage_term * voltage[y_pos]
 
-        own_theta_values = 1j * off_sum
-        own_voltage_values = self._y_row_diag_conj[balance_pos] * voltage[balance_pos] + sum_all
-        self._add_indexed_value_blocks(
-            H,
-            (
+                off_sum = np.zeros(balance_pos.size, dtype=np.complex128)
+                off_mask = plan["off_mask"]
+                if off_mask.size and np.any(off_mask):
+                    off_balance = plan["off_balance"]
+                    off_term = term[off_mask]
+                    off_sum = self._complex_bincount(off_balance, off_term, balance_pos.size)
+
+                    theta_values = -1j * off_term
+                    theta_cols = plan["off_theta_cols"]
+                    theta_p_rows = plan["off_theta_p_rows"]
+                    theta_q_rows = plan["off_theta_q_rows"]
+
+                    voltage_values = off_term * inv_v_all[y_nodes[off_mask]]
+                    voltage_cols = plan["off_voltage_cols"]
+                    self._add_indexed_value_blocks(
+                        H,
+                        (
+                            (
+                                theta_p_rows,
+                                theta_cols,
+                                theta_values.real,
+                            ),
+                            (
+                                theta_q_rows,
+                                theta_cols,
+                                theta_values.imag,
+                            ),
+                            (
+                                theta_p_rows,
+                                voltage_cols,
+                                voltage_values.real,
+                            ),
+                            (
+                                theta_q_rows,
+                                voltage_cols,
+                                voltage_values.imag,
+                            ),
+                        ),
+                    )
+
+                sum_all = self._complex_bincount(y_balance, y_voltage_term, balance_pos.size)
+            else:
+                off_sum = np.zeros(balance_pos.size, dtype=np.complex128)
+                sum_all = np.zeros(balance_pos.size, dtype=np.complex128)
+
+            own_theta_values = 1j * off_sum
+            own_voltage_values = self._y_row_diag_conj[balance_pos] * voltage[balance_pos] + sum_all
+            self._add_indexed_value_blocks(
+                H,
                 (
-                    p_rows_for_balance,
-                    plan["balance_angle_cols"],
-                    own_theta_values.real,
+                    (
+                        p_rows_for_balance,
+                        plan["balance_angle_cols"],
+                        own_theta_values.real,
+                    ),
+                    (
+                        q_rows_for_balance,
+                        plan["balance_angle_cols"],
+                        own_theta_values.imag,
+                    ),
+                    (
+                        p_rows_for_balance,
+                        plan["balance_voltage_cols"],
+                        own_voltage_values.real,
+                    ),
+                    (
+                        q_rows_for_balance,
+                        plan["balance_voltage_cols"],
+                        own_voltage_values.imag,
+                    ),
                 ),
-                (
-                    q_rows_for_balance,
-                    plan["balance_angle_cols"],
-                    own_theta_values.imag,
-                ),
-                (
-                    p_rows_for_balance,
-                    plan["balance_voltage_cols"],
-                    own_voltage_values.real,
-                ),
-                (
-                    q_rows_for_balance,
-                    plan["balance_voltage_cols"],
-                    own_voltage_values.imag,
-                ),
-            ),
-        )
+            )
 
         if int(getattr(self, "n_switch_current", 0)):
             end_pos = self.switch_balance_end_pos
@@ -10046,6 +10369,7 @@ class ACStateEstimator:
         _coarse_bad_data_threshold: Optional[float] = None,
         _defer_factor_refresh: bool = False,
         _woodbury_u_cache: Optional[Dict] = None,
+        _hint_lm_damping: float = 0.0,
     ) -> EstimateResult:
         """Run weighted least squares with simple damping to avoid voltage divergence."""
         if not self._prepared:
@@ -10590,7 +10914,9 @@ class ACStateEstimator:
             ):
                 diag_g = None
                 if normal_operand is not None:
-                    diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    diag_g = aat_solver.unregularized_diagonal() if aat_solver is not None else None
+                    if diag_g is None:
+                        diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
                 elif gain is not None:
                     diag_g = np.asarray(gain.diagonal() if issparse(gain) else np.diag(gain), dtype=np.float64).ravel()
                 if diag_g is not None and diag_g.size == rhs.size:
@@ -10764,7 +11090,8 @@ class ACStateEstimator:
                     # 非零残差香蕉谷极限环自愈（通用防 k-周期漏桶计数，识破连续与 2/3/4-周期交替回溯）
                     if backtrack_streak >= 12 and normal_operand is not None and aat_solver is not None:
                         if force_lm_damping < 10.0:
-                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, 1e-1))
+                            hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
+                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, hint_base))
                             curvature_damping_active = True
                             curvature_probe_steps = 0
                             curvature_probe_interval = 2
@@ -10786,7 +11113,8 @@ class ACStateEstimator:
                             fullstep_osc_streak += 1
                             if fullstep_osc_streak >= 4 and normal_operand is not None and aat_solver is not None:
                                 # 满步锯齿振荡自愈：连续满步不收缩且目标几乎不降，提前切入曲率阻尼
-                                force_lm_damping = min(10.0, max(force_lm_damping * 10.0, 1e-1))
+                                hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
+                                force_lm_damping = min(10.0, max(force_lm_damping * 10.0, hint_base))
                                 curvature_damping_active = True
                                 curvature_probe_steps = 0
                                 curvature_probe_interval = 2
@@ -10808,7 +11136,7 @@ class ACStateEstimator:
                 and not is_curvature_probe
                 and step_damping > 0.0
                 and cur_rhs_inf <= damped_kkt_tol
-                and max_correction < 5e-4
+                and max_correction < 1e-3
                 and objective_change <= damped_obj_tol
             )
             if (
@@ -10825,7 +11153,7 @@ class ACStateEstimator:
                     if (
                         curv_stagnation_streak >= 12
                         and cur_rhs_inf <= max(1e-3, 1000.0 * self.tol)
-                        and max_correction < 5e-4
+                        and max_correction < 1e-3
                         and objective_change <= damped_obj_tol
                     ):
                         damped_kkt_stagnation_ok = True
@@ -11073,6 +11401,8 @@ class ACStateEstimator:
             estimate_result._undamped_spd_failed = True
         if factor_deferred:
             estimate_result._factor_deferred = True
+        if curvature_damping_active and force_lm_damping > 0.0:
+            estimate_result._final_lm_damping = float(force_lm_damping)
         estimate_result._inplace_factor_modified = inplace_factor_modified
         # 缓存收敛步的 CHOLMOD 因子或延迟低秩 Woodbury 求解器，供后续 identify_bad_data 与坏数据剔除跨轮复用
         if factor_deferred and wb_solver is not None:
@@ -11394,6 +11724,17 @@ class ACStateEstimator:
             base_z = np.asarray(base_table.value, dtype=np.float64)
             v_cols_arr = np.arange(self.n_angle, self.base_switch_re, dtype=np.intp)
             a_cols_arr = np.arange(0, self.n_angle, dtype=np.intp)
+            init_rt = getattr(self, "_last_estimate_aat_runtime", None)
+            hub_solver = (
+                init_rt[0]
+                if (isinstance(init_rt, tuple) and len(init_rt) == 2 and init_rt[0] is not None)
+                else init_aat_solver
+            )
+            hub_plan = (
+                init_rt[1]
+                if (isinstance(init_rt, tuple) and len(init_rt) == 2)
+                else None
+            )
             warmup = run_huber_irls_warmup(
                 lambda xv, out_z: self.evaluate(xv, base_plan_tables, out=out_z),
                 lambda ze, out_r: self._measurement_residual(base_z, ze, base_plan_tables, out=out_r),
@@ -11409,6 +11750,8 @@ class ACStateEstimator:
                 a_max_rad=float(self.angle_max_rad),
                 max_iter=min(15, int(self.max_iter)),
                 huber_k=3.0,
+                shared_aat_solver=hub_solver,
+                shared_aat_plan=hub_plan,
             )
             if warmup is not None:
                 x_hub, r_hub, z_hub = warmup
@@ -12383,6 +12726,7 @@ class ACStateEstimator:
                                 _coarse_bad_data_threshold=None,
                                 _defer_factor_refresh=wb_defer and len(batch_rows) < 8,
                                 _woodbury_u_cache=anchor_u_cache,
+                                _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
                             )
                             trial_obs = getattr(trial_result, "observability", None)
                             trial_coarse_stopped = bool(getattr(trial_result, "_coarse_stopped", False))
@@ -12504,6 +12848,7 @@ class ACStateEstimator:
                     _woodbury_prev_H=wb_prev_H,
                     _defer_factor_refresh=wb_defer,
                     _woodbury_u_cache=anchor_u_cache,
+                    _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
                 )
                 trial_obs = getattr(trial_result, "observability", None)
                 trial_coarse_stopped = bool(getattr(trial_result, "_coarse_stopped", False))

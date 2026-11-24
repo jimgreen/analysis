@@ -111,12 +111,34 @@ def leverage_from_selected_inv_native(
         return None
 
 
+def build_csc_transpose_map_native(A_csc):
+    """一次性构建 ``A_csc`` 的静态行主序转置索引映射 ``(r_ptr, r_col, r_src, col_sorted)``。"""
+    if not is_native_kernels_available() or _NATIVE_MOD is None:
+        return None
+    fn = getattr(_NATIVE_MOD, "build_csc_transpose_map", None)
+    if fn is None:
+        return None
+    try:
+        n = int(A_csc.shape[0])
+        nnz = int(A_csc.nnz)
+        ap = np.ascontiguousarray(A_csc.indptr, dtype=np.int64)
+        ai = np.ascontiguousarray(A_csc.indices, dtype=np.int32)
+        r_ptr = np.empty(n + 1, dtype=np.int64)
+        r_col = np.empty(nnz, dtype=np.int32)
+        r_src = np.empty(nnz, dtype=np.int64)
+        col_sorted = bool(fn(n, ap, ai, r_ptr, r_col, r_src))
+        return r_ptr, r_col, r_src, col_sorted
+    except Exception:
+        return None
+
+
 def assemble_aat_upper_csr_native(
     A_csc,
     ia: np.ndarray,
     ja: np.ndarray,
     *,
     damping: float = 0.0,
+    transpose_map=None,
 ) -> Optional[np.ndarray]:
     """调用 OpenMP 并行原生内核按固定超集上三角模式 ``(ia, ja)`` 直接装配 ``G = A A^T (+ beta I)`` 数值数组。"""
     if not is_native_kernels_available() or _NATIVE_MOD is None:
@@ -129,9 +151,232 @@ def assemble_aat_upper_csr_native(
         ia_c = np.ascontiguousarray(ia, dtype=np.int32)
         ja_c = np.ascontiguousarray(ja, dtype=np.int32)
         a_out = np.empty(int(ja_c.size), dtype=np.float64)
+        cached_fn = getattr(_NATIVE_MOD, "assemble_aat_upper_csr_cached", None)
+        if transpose_map is not None and cached_fn is not None:
+            r_ptr, r_col, r_src, col_sorted = transpose_map
+            ok = bool(
+                cached_fn(
+                    n,
+                    ap,
+                    ai,
+                    ad,
+                    r_ptr,
+                    r_col,
+                    r_src,
+                    ia_c,
+                    ja_c,
+                    a_out,
+                    float(damping),
+                    1 if col_sorted else 0,
+                )
+            )
+            if ok:
+                return a_out
         ok = bool(_NATIVE_MOD.assemble_aat_upper_csr(n, ap, ai, ad, ia_c, ja_c, a_out, float(damping)))
         if not ok:
             return None
         return a_out
+    except Exception:
+        return None
+
+
+def complex_voltage_native(theta: np.ndarray, voltage: np.ndarray) -> Optional[np.ndarray]:
+    """调用 OpenMP 并行原生核计算复电压 ``voltage * exp(1j * theta)``。"""
+    if not is_native_kernels_available() or _NATIVE_MOD is None:
+        return None
+    fn = getattr(_NATIVE_MOD, "complex_voltage", None)
+    if fn is None:
+        return None
+    try:
+        th = np.ascontiguousarray(theta, dtype=np.float64)
+        v = np.ascontiguousarray(voltage, dtype=np.float64)
+        out = np.empty(th.shape[0], dtype=np.complex128)
+        if fn(th, v, out):
+            return out
+        return None
+    except Exception:
+        return None
+
+
+def eval_ac_branch_power_values_native(
+    values: np.ndarray,
+    rows: np.ndarray,
+    own: np.ndarray,
+    other: np.ndarray,
+    third: Optional[np.ndarray],
+    is_p: np.ndarray,
+    y_self: np.ndarray,
+    y_mutual: np.ndarray,
+    y_third: Optional[np.ndarray],
+    voltage_complex: np.ndarray,
+    has_third: bool,
+) -> bool:
+    """调用 OpenMP 并行原生核计算 AC 支路/变压器 P/Q 量测预测值并直接写入 ``values[rows]``。"""
+    if not is_native_kernels_available() or _NATIVE_MOD is None:
+        return False
+    fn = getattr(_NATIVE_MOD, "eval_ac_branch_power_values", None)
+    if fn is None:
+        return False
+    try:
+        return bool(
+            fn(
+                values,
+                np.ascontiguousarray(rows, dtype=np.int64),
+                np.ascontiguousarray(own, dtype=np.int64),
+                np.ascontiguousarray(other, dtype=np.int64),
+                np.ascontiguousarray(third, dtype=np.int64) if has_third and third is not None else None,
+                np.ascontiguousarray(is_p, dtype=np.bool_),
+                np.ascontiguousarray(y_self, dtype=np.complex128),
+                np.ascontiguousarray(y_mutual, dtype=np.complex128),
+                np.ascontiguousarray(y_third, dtype=np.complex128) if has_third and y_third is not None else None,
+                np.ascontiguousarray(voltage_complex, dtype=np.complex128),
+                1 if has_third else 0,
+            )
+        )
+    except Exception:
+        return False
+
+
+def fill_ac_branch_power_jacobian_native(
+    own: np.ndarray,
+    other: np.ndarray,
+    third: Optional[np.ndarray],
+    is_p: np.ndarray,
+    y_self_conj: np.ndarray,
+    y_mutual_conj: np.ndarray,
+    y_third_conj: Optional[np.ndarray],
+    voltage: np.ndarray,
+    voltage_complex: np.ndarray,
+    has_third: bool,
+    channels,
+) -> bool:
+    """调用 OpenMP 并行原生核计算 AC 支路/变压器 P/Q 雅可比并按 ``channels=[(dst, slots), ...]`` 写入。"""
+    if not is_native_kernels_available() or _NATIVE_MOD is None:
+        return False
+    fn = getattr(_NATIVE_MOD, "fill_ac_branch_power_jacobian", None)
+    if fn is None:
+        return False
+    try:
+        (d0, s0), (d1, s1), (d2, s2), (d3, s3), (d4, s4), (d5, s5) = channels
+        return bool(
+            fn(
+                np.ascontiguousarray(own, dtype=np.int64),
+                np.ascontiguousarray(other, dtype=np.int64),
+                np.ascontiguousarray(third, dtype=np.int64) if has_third and third is not None else None,
+                np.ascontiguousarray(is_p, dtype=np.bool_),
+                np.ascontiguousarray(y_self_conj, dtype=np.complex128),
+                np.ascontiguousarray(y_mutual_conj, dtype=np.complex128),
+                np.ascontiguousarray(y_third_conj, dtype=np.complex128) if has_third and y_third_conj is not None else None,
+                np.ascontiguousarray(voltage, dtype=np.float64),
+                np.ascontiguousarray(voltage_complex, dtype=np.complex128),
+                1 if has_third else 0,
+                d0, s0, d1, s1, d2, s2, d3, s3, d4, s4, d5, s5,
+            )
+        )
+    except Exception:
+        return False
+
+
+def fill_ac_balance_jacobian_native(
+    balance_pos: np.ndarray,
+    y_bal_ptr: np.ndarray,
+    y_nodes: np.ndarray,
+    y_pos: np.ndarray,
+    y_conj: np.ndarray,
+    y_off_idx: np.ndarray,
+    y_diag_conj: np.ndarray,
+    voltage: np.ndarray,
+    voltage_complex: np.ndarray,
+    n_off: int,
+    channels,
+) -> bool:
+    """调用 OpenMP 并行原生核单遍计算 AC 节点功率平衡雅可比（合并 off_sum/sum_all 归约）并按 ``channels`` 写入。"""
+    if not is_native_kernels_available() or _NATIVE_MOD is None:
+        return False
+    fn = getattr(_NATIVE_MOD, "fill_ac_balance_jacobian", None)
+    if fn is None:
+        return False
+    try:
+        (do0, so0), (do1, so1), (do2, so2), (do3, so3), (dw0, sw0), (dw1, sw1), (dw2, sw2), (dw3, sw3) = channels
+        return bool(
+            fn(
+                np.ascontiguousarray(balance_pos, dtype=np.int64),
+                np.ascontiguousarray(y_bal_ptr, dtype=np.int64),
+                np.ascontiguousarray(y_nodes, dtype=np.int64),
+                np.ascontiguousarray(y_pos, dtype=np.int64),
+                np.ascontiguousarray(y_conj, dtype=np.complex128),
+                np.ascontiguousarray(y_off_idx, dtype=np.int32),
+                np.ascontiguousarray(y_diag_conj, dtype=np.complex128),
+                np.ascontiguousarray(voltage, dtype=np.float64),
+                np.ascontiguousarray(voltage_complex, dtype=np.complex128),
+                int(n_off),
+                do0, so0, do1, so1, do2, so2, do3, so3,
+                dw0, sw0, dw1, sw1, dw2, sw2, dw3, sw3,
+            )
+        )
+    except Exception:
+        return False
+
+
+def parse_meas_bulk_bytes_native(
+    data_bytes: bytes,
+    ncols: int,
+    idx_pos: int,
+    dev_type_pos: int,
+    dev_name_pos: int,
+    meas_type_pos: int,
+    weight_pos: int,
+    valid_pos: int,
+    value_pos: int,
+    status_pos: int,
+    status_normal: int,
+    status_invalid: int,
+    status_removed: int,
+    dt_code_map: dict,
+    mt_code_map: dict,
+    status_code_map: dict,
+    idx_array: np.ndarray,
+    weight_values: np.ndarray,
+    value_values: np.ndarray,
+    valid_values: np.ndarray,
+    status_values: np.ndarray,
+    device_type_code_array: np.ndarray,
+    meas_type_code_array: np.ndarray,
+    device_name_id: np.ndarray,
+) -> Optional[bytes]:
+    """调用 C++17 单遍解析核高速解析标准无引号 ``<Measurement>`` 字节块，成功返回 ``\\n`` 分隔唯一设备名字节串。"""
+    if not is_native_kernels_available() or _NATIVE_MOD is None:
+        return None
+    fn = getattr(_NATIVE_MOD, "parse_meas_bulk_bytes", None)
+    if fn is None:
+        return None
+    try:
+        res = fn(
+            data_bytes,
+            int(ncols),
+            int(idx_pos),
+            int(dev_type_pos),
+            int(dev_name_pos),
+            int(meas_type_pos),
+            int(weight_pos),
+            int(valid_pos),
+            int(value_pos),
+            int(status_pos),
+            int(status_normal),
+            int(status_invalid),
+            int(status_removed),
+            dt_code_map,
+            mt_code_map,
+            status_code_map,
+            idx_array,
+            weight_values,
+            value_values,
+            valid_values,
+            status_values,
+            device_type_code_array,
+            meas_type_code_array,
+            device_name_id,
+        )
+        return res if isinstance(res, bytes) else None
     except Exception:
         return None

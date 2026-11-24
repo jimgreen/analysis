@@ -40,9 +40,13 @@ except Exception:
 
 
 try:
-    from .native_kernels import assemble_aat_upper_csr_native as NATIVE_ASSEMBLE_AAT_UPPER_CSR
+    from .native_kernels import (
+        assemble_aat_upper_csr_native as NATIVE_ASSEMBLE_AAT_UPPER_CSR,
+        build_csc_transpose_map_native as NATIVE_BUILD_CSC_TRANSPOSE_MAP,
+    )
 except Exception:
     NATIVE_ASSEMBLE_AAT_UPPER_CSR = None
+    NATIVE_BUILD_CSC_TRANSPOSE_MAP = None
 
 
 _C_INT32_P = ctypes.POINTER(ctypes.c_int32)
@@ -502,7 +506,7 @@ def build_upper_csr_from_aat(
     beta = float(damping)
     A_csc_use = A_csc if getattr(A_csc, "format", None) == "csc" else A_csc.tocsc()
 
-    # 超快路径 0（OpenMP 原生 C++ 内核）：当 A_csc 稀疏拓扑与初始超集一致（覆盖全部同轮 WLS 迭代
+    # 超快路径 0（OpenMP 原生 Gustavson 内核）：当 A_csc 稀疏拓扑与初始超集一致（覆盖全部同轮 WLS 迭代
     # 及 masked-weight 删行），直接跳过 A.tocsr()、A@A.T 与 searchsorted，按固定超集 (ia, ja) 并行装配
     if (
         NATIVE_ASSEMBLE_AAT_UPPER_CSR is not None
@@ -510,14 +514,25 @@ def build_upper_csr_from_aat(
         and cached_pattern.get("a_shape") == A_csc_use.shape
         and cached_pattern.get("a_nnz") == int(A_csc_use.nnz)
         and (beta == 0.0 or bool(cached_pattern.get("has_full_diag", False)))
-        and memoryview(cached_pattern["a_indptr"]).tobytes() == memoryview(A_csc_use.indptr).tobytes()
-        and memoryview(cached_pattern["a_indices"]).tobytes() == memoryview(A_csc_use.indices).tobytes()
+        and (
+            cached_pattern.get("a_indptr_ref") is A_csc_use.indptr
+            or np.array_equal(cached_pattern["a_indptr"], A_csc_use.indptr)
+        )
+        and (
+            cached_pattern.get("a_indices_ref") is A_csc_use.indices
+            or np.array_equal(cached_pattern["a_indices"], A_csc_use.indices)
+        )
     ):
+        t_map = cached_pattern.get("a_transpose_map")
+        if t_map is None and NATIVE_BUILD_CSC_TRANSPOSE_MAP is not None:
+            t_map = NATIVE_BUILD_CSC_TRANSPOSE_MAP(A_csc_use)
+            cached_pattern["a_transpose_map"] = t_map
         a_native = NATIVE_ASSEMBLE_AAT_UPPER_CSR(
             A_csc_use,
             cached_pattern["ia"],
             cached_pattern["ja"],
             damping=beta,
+            transpose_map=t_map,
         )
         if a_native is not None:
             return cached_pattern["ia"], cached_pattern["ja"], a_native, cached_pattern
@@ -598,9 +613,20 @@ def build_upper_csr_from_aat(
         "a_nnz": int(A_csc_use.nnz),
         "a_indptr": A_csc_use.indptr.copy(),
         "a_indices": A_csc_use.indices.copy(),
+        "a_indptr_ref": A_csc_use.indptr,
+        "a_indices_ref": A_csc_use.indices,
+        "a_transpose_map": (
+            NATIVE_BUILD_CSC_TRANSPOSE_MAP(A_csc_use)
+            if NATIVE_BUILD_CSC_TRANSPOSE_MAP is not None
+            else None
+        ),
         "has_full_diag": has_full_diag,
     }
     return ia, ja, a, new_pattern
+
+
+class MKLPardisoFactorizationError(RuntimeError):
+    """MKL PARDISO 数值分解（phase=22）失败异常（矩阵非正定或奇异），符号分析上下文依然有效可复用。"""
 
 
 class MKLPardisoFactor:
@@ -629,14 +655,6 @@ class MKLPardisoFactor:
         self._a: Optional[np.ndarray] = None
         self._pt = np.zeros(64, dtype=np.int64)
         self._iparm = np.zeros(64, dtype=np.int32)
-        self._iparm[0] = 1
-        # 大矩阵优先并行 OpenMP METIS (3)，小中矩阵串行 METIS (2) 更低开销
-        self._iparm[1] = 3 if (parallel_metis and self._n >= 8000) else 2
-        self._iparm[9] = 8
-        self._iparm[17] = -1
-        self._iparm[18] = 0
-        self._iparm[26] = 0
-        self._iparm[34] = 1  # 0-based CSR 索引
         self._perm = np.zeros(self._n, dtype=np.int32)
         self._maxfct = ctypes.c_int32(1)
         self._mnum = ctypes.c_int32(1)
@@ -649,8 +667,42 @@ class MKLPardisoFactor:
         self._last_aat_operand = None
         self._last_damping: float = 0.0
         self._cholmod_materialized = None
+        self._diag_idx: Optional[np.ndarray] = None
+        self._refresh_diag_index()
 
-        # 执行符号分析 phase=11
+        # 执行符号分析 phase=11（中大型矩阵启用两级并行分解 iparm[23]=10，若不兼容自动回退 0）
+        self._run_symbolic_analysis()
+
+    def _refresh_diag_index(self) -> None:
+        """检查上三角 CSR 每行首元素是否全为对角元 (i, i)，供 O(n) 阻尼原位更新与对角元读取。"""
+        if self._n == 0:
+            self._diag_idx = np.empty(0, dtype=np.int32)
+            return
+        if self._upper_pattern is not None and "has_full_diag" in self._upper_pattern:
+            has_full = bool(self._upper_pattern["has_full_diag"])
+        else:
+            has_full = bool(
+                np.all(self._ia[1:] > self._ia[:-1])
+                and np.array_equal(self._ja[self._ia[:-1]], np.arange(self._n, dtype=np.int32))
+            )
+        self._diag_idx = self._ia[:-1] if has_full else None
+
+    def _configure_iparm(self) -> None:
+        """配置 Intel oneMKL PARDISO 参数数组。"""
+        self._iparm.fill(0)
+        self._iparm[0] = 1
+        # 大矩阵优先并行 OpenMP METIS (3)，小中矩阵串行 METIS (2) 更低开销
+        self._iparm[1] = 3 if (self._parallel_metis and self._n >= 8000) else 2
+        self._iparm[9] = 8
+        self._iparm[17] = -1
+        self._iparm[18] = 0
+        self._iparm[26] = 0
+        self._iparm[34] = 1  # 0-based CSR 索引
+
+    def _run_symbolic_analysis(self) -> None:
+        """执行 phase=11 符号分析。"""
+        self._pt.fill(0)
+        self._configure_iparm()
         err = self._call_pardiso(11, 1, self._dummy, self._dummy, a_arr=self._dummy)
         if err != 0:
             self._closed = True
@@ -707,8 +759,41 @@ class MKLPardisoFactor:
         err = self._call_pardiso(22, 1, self._dummy, self._dummy, a_arr=a_c)
         if err != 0:
             self._factorized = False
-            raise RuntimeError(f"MKL PARDISO numerical factorization failed with error={err}")
+            raise MKLPardisoFactorizationError(f"MKL PARDISO numerical factorization failed with error={err}")
         self._factorized = True
+
+    def can_update_damping_inplace(self) -> bool:
+        """判断当前因子是否支持直接原位更新对角阻尼项而跳过 A·A^T 重算。"""
+        return (not self._closed) and (self._a is not None) and (self._diag_idx is not None)
+
+    def update_damping_and_factorize(self, new_damping: float, *, aat_operand=None) -> None:
+        """在同一 A_csc 矩阵下直接原位更新上三角对角元阻尼并重新执行 phase=22 分解。"""
+        if not self.can_update_damping_inplace():
+            raise RuntimeError("MKLPardisoFactor cannot update damping in place")
+        beta = float(new_damping)
+        delta = beta - self._last_damping
+        if delta != 0.0 and self._diag_idx.size > 0:
+            self._a[self._diag_idx] += delta
+        self._last_damping = beta
+        if aat_operand is not None:
+            self._last_aat_operand = aat_operand
+        self._cholmod_materialized = None
+        err = self._call_pardiso(22, 1, self._dummy, self._dummy, a_arr=self._a)
+        if err != 0:
+            self._factorized = False
+            raise MKLPardisoFactorizationError(f"MKL PARDISO numerical factorization failed with error={err}")
+        self._factorized = True
+
+    def unregularized_diagonal(self) -> Optional[np.ndarray]:
+        """O(n) 返回无阻尼正规方程对角元 diag(A·A^T)，避免稀疏矩阵逐元平方求和。"""
+        if self._a is None or self._diag_idx is None:
+            return None
+        if self._diag_idx.size == 0:
+            return np.empty(0, dtype=np.float64)
+        diag = self._a[self._diag_idx].astype(np.float64, copy=True)
+        if self._last_damping != 0.0:
+            diag -= self._last_damping
+        return diag
 
     def cholesky_AAt_inplace(self, A_csc, beta: float = 0.0) -> None:
         """兼容 CHOLMOD ``factor.cholesky_AAt_inplace(A, beta=...)`` 协议，供冻结因子终轮原位刷新复用。"""
@@ -723,8 +808,8 @@ class MKLPardisoFactor:
             or (
                 ia.shape == self._ia.shape
                 and ja.shape == self._ja.shape
-                and memoryview(ia).tobytes() == memoryview(self._ia).tobytes()
-                and memoryview(ja).tobytes() == memoryview(self._ja).tobytes()
+                and np.array_equal(ia, self._ia)
+                and np.array_equal(ja, self._ja)
             )
         )
         if not same_struct:
@@ -737,22 +822,12 @@ class MKLPardisoFactor:
             self._n = int(A_csc.shape[0])
             self._ia = np.ascontiguousarray(ia, dtype=np.int32)
             self._ja = np.ascontiguousarray(ja, dtype=np.int32)
-            self._pt = np.zeros(64, dtype=np.int64)
-            self._iparm = np.zeros(64, dtype=np.int32)
-            self._iparm[0] = 1
-            self._iparm[1] = 3 if (self._parallel_metis and self._n >= 8000) else 2
-            self._iparm[9] = 8
-            self._iparm[17] = -1
-            self._iparm[18] = 0
-            self._iparm[26] = 0
-            self._iparm[34] = 1
+            self._upper_pattern = new_pattern
             self._perm = np.zeros(self._n, dtype=np.int32)
             self._n_c = ctypes.c_int32(self._n)
             self._closed = False
-            err = self._call_pardiso(11, 1, self._dummy, self._dummy, a_arr=self._dummy)
-            if err != 0:
-                self._closed = True
-                raise RuntimeError(f"MKL PARDISO symbolic re-analysis failed with error={err}")
+            self._refresh_diag_index()
+            self._run_symbolic_analysis()
         self._upper_pattern = new_pattern
         self.factorize_inplace(a, aat_operand=A_csc, damping=float(beta))
 

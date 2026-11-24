@@ -6176,6 +6176,7 @@ class DCStateEstimator:
         _coarse_bad_data_threshold: Optional[float] = None,
         _defer_factor_refresh: bool = False,
         _woodbury_u_cache: Optional[Dict] = None,
+        _hint_lm_damping: float = 0.0,
     ) -> EstimateResult:
         """Solve the weighted least-squares DC state estimate with damped Newton steps."""
         if not self._prepared:
@@ -6662,7 +6663,9 @@ class DCStateEstimator:
             ):
                 diag_g = None
                 if normal_operand is not None:
-                    diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    diag_g = aat_solver.unregularized_diagonal() if aat_solver is not None else None
+                    if diag_g is None:
+                        diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
                 elif gain is not None:
                     diag_g = np.asarray(gain.diagonal() if is_sparse_matrix(gain) else np.diag(gain), dtype=np.float64).ravel()
                 if diag_g is not None and diag_g.size == rhs.size:
@@ -7322,6 +7325,17 @@ class DCStateEstimator:
         if not result.converged and max_remove > 0 and int(self.max_iter) >= 5 and n_base > 0:
             base_z = np.asarray(base_table.value, dtype=np.float64)
             v_cols_arr = np.arange(0, self.n_voltage, dtype=np.intp)
+            init_rt = getattr(self, "_last_estimate_aat_runtime", None)
+            hub_solver = (
+                init_rt[0]
+                if (isinstance(init_rt, tuple) and len(init_rt) == 2 and init_rt[0] is not None)
+                else init_aat_solver
+            )
+            hub_plan = (
+                init_rt[1]
+                if (isinstance(init_rt, tuple) and len(init_rt) == 2)
+                else None
+            )
             warmup = run_huber_irls_warmup(
                 lambda xv, out_z: self.evaluate(xv, base_plan_tables, out=out_z),
                 lambda ze, out_r: self._measurement_residual(base_z, ze, base_plan_tables, out=out_r),
@@ -7335,6 +7349,8 @@ class DCStateEstimator:
                 v_max=float(self.voltage_max),
                 max_iter=min(15, int(self.max_iter)),
                 huber_k=3.0,
+                shared_aat_solver=hub_solver,
+                shared_aat_plan=hub_plan,
             )
             if warmup is not None:
                 x_hub, r_hub, z_hub = warmup
