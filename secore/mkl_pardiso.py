@@ -694,6 +694,8 @@ class MKLPardisoFactor:
         self._last_aat_operand = None
         self._last_damping: float = 0.0
         self._cholmod_materialized = None
+        self._cholmod_symbolic_factor = None
+        self._cholmod_symbolic_ordering: Optional[str] = None
         self._diag_idx: Optional[np.ndarray] = None
         self._refresh_diag_index()
 
@@ -935,7 +937,11 @@ class MKLPardisoFactor:
         return self.solve(rhs)
 
     def materialize_cholmod_factor(self, *, ordering_method: str = "nesdis"):
-        """仅在需要整网 Takahashi 选元求逆时，按需将当前数值系统物化为 CHOLMOD 因子以提取 ``L``。"""
+        """仅在需要整网 Takahashi 选元求逆时，按需将当前数值系统物化为 CHOLMOD 因子以提取 ``L``。
+
+        同稀疏模式下持久缓存 CHOLMOD 符号分析因子（``_cholmod_symbolic_factor``），
+        坏数据多轮迭代重估后仅执行 ``cholesky_inplace`` 数值复分解，免去每轮重复图排序。
+        """
         if self._cholmod_materialized is not None:
             return self._cholmod_materialized
         if CHOLMOD_ANALYZE is None and CHOLMOD_CHOLESKY is None:
@@ -953,10 +959,14 @@ class MKLPardisoFactor:
                 if diag_v.size:
                     G_full.setdiag(diag_v)
                 if CHOLMOD_ANALYZE is not None:
-                    try:
-                        fac = CHOLMOD_ANALYZE(G_full, ordering_method=ordering_method)
-                    except Exception:
-                        fac = CHOLMOD_ANALYZE(G_full)
+                    fac = self._cholmod_symbolic_factor
+                    if fac is None or self._cholmod_symbolic_ordering != ordering_method:
+                        try:
+                            fac = CHOLMOD_ANALYZE(G_full, ordering_method=ordering_method)
+                        except Exception:
+                            fac = CHOLMOD_ANALYZE(G_full)
+                        self._cholmod_symbolic_factor = fac
+                        self._cholmod_symbolic_ordering = ordering_method
                     fac.cholesky_inplace(G_full)
                 else:
                     fac = CHOLMOD_CHOLESKY(G_full)
@@ -988,6 +998,8 @@ class MKLPardisoFactor:
             self._pt_dirty = False
             self._factorized = False
             self._cholmod_materialized = None
+            self._cholmod_symbolic_factor = None
+            self._cholmod_symbolic_ordering = None
 
     def __del__(self) -> None:
         try:

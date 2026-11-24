@@ -2325,11 +2325,17 @@ class ACStateEstimator:
             ppc = ACStateEstimator._power_flow_seed_ppc_from_network(network)
         except RuntimeError:
             return False
+        from algorithm_parameters import PowerFlowParameters
+
+        lf_params = PowerFlowParameters(
+            tol=seed_tol,
+            max_iter=int(params.power_flow_max_iter),
+            min_voltage=float(params.power_flow_min_voltage),
+            divergence_threshold=1e6,
+        )
         calc = ACPowerFlowCalc(
             ppc,
-            tol=seed_tol,
-            max_iter=params.power_flow_max_iter,
-            min_voltage=params.power_flow_min_voltage,
+            parameters=lf_params,
             linear_solver=getattr(network, "_se_power_flow_linear_solver", None),
         )
         calc.skip_lf_result = True
@@ -10504,6 +10510,7 @@ class ACStateEstimator:
         damped_nonshrink_streak = 0
         curv_stagnation_streak = 0
         curv_stagnation_best_g = np.inf
+        flat_valley_streak = 0
         cur_rhs_inf = np.inf
         last_undamped_spd_failed = False
         active_weight_mask = (weight > 0.0) if weight_masked else None
@@ -11049,6 +11056,19 @@ class ACStateEstimator:
                         curvature_damping_active = False
                         backtrack_streak = 0
                         fullstep_osc_streak = 0
+                elif max_correction > 2.0 * last_step_max_correction:
+                    if (
+                        accepted_step is not None
+                        and accepted_step >= 0.5
+                        and objective_change > 1e-4 * (abs(previous_objective) + 1.0)
+                    ):
+                        # 步长虽反弹但带来显著目标压降（>1e-4），保持高频探测加速
+                        curvature_probe_interval = 2
+                        damped_nonshrink_streak = 0
+                        flat_valley_streak = 0
+                    else:
+                        # 探测步反弹过冲且目标降幅微末，指数退避拉大间隔，防止周期踹偏平底谷稳态
+                        curvature_probe_interval = min(16, curvature_probe_interval * 2)
                 elif (
                     accepted_step is not None
                     and accepted_step >= 0.5
@@ -11057,8 +11077,6 @@ class ACStateEstimator:
                     # 有效大跨度探测步真金白银压降了目标函数，保持高频探测加速
                     curvature_probe_interval = 2
                     damped_nonshrink_streak = 0
-                elif max_correction > 2.0 * last_step_max_correction:
-                    curvature_probe_interval = min(16, curvature_probe_interval * 2)
             else:
                 if curvature_damping_active:
                     curvature_probe_steps += 1
@@ -11164,6 +11182,48 @@ class ACStateEstimator:
             elif not is_curvature_probe and max_correction >= 1e-3:
                 curv_stagnation_streak = 0
                 curv_stagnation_best_g = np.inf
+            # 极高盲区平底谷驻点检测：当所有核心电压/相角与归一化 KKT 梯度均已收敛，
+            # 仅少数弱观测负荷零空间方向在平底谷以微幅目标变化慢爬时，避免空转满 max_iter
+            if (
+                not damped_kkt_stagnation_ok
+                and curvature_damping_active
+                and not is_curvature_probe
+                and not used_frozen_step
+                and step_damping > 0.0
+                and max_correction < 5e-2
+                and prev_rms_correction <= 1e-3
+                and objective_change <= max(1e-12, 1e-5 * (abs(previous_objective) + 1.0))
+                and rhs is not None
+                and rhs.size > 0
+            ):
+                va_end = min(int(self.base_switch_re), int(dx.size))
+                va_max_dx = float(np.max(np.abs(dx[:va_end]))) if va_end > 0 else max_correction
+                diag_g_fv = None
+                if normal_operand is not None:
+                    diag_g_fv = aat_solver.unregularized_diagonal() if aat_solver is not None else None
+                    if diag_g_fv is None:
+                        diag_g_fv = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                elif gain is not None:
+                    diag_g_fv = np.asarray(gain.diagonal() if issparse(gain) else np.diag(gain), dtype=np.float64).ravel()
+                if diag_g_fv is not None and diag_g_fv.size == rhs.size:
+                    scaled_vec = np.abs(rhs) / np.maximum(diag_g_fv, 1.0)
+                    scaled_g = float(np.max(scaled_vec))
+                    va_scaled_g = float(np.max(scaled_vec[:va_end])) if va_end > 0 else scaled_g
+                else:
+                    scaled_g = cur_rhs_inf
+                    va_scaled_g = cur_rhs_inf
+                if (
+                    va_max_dx <= 1e-3
+                    and va_scaled_g <= max(1e-4, 100.0 * self.tol)
+                    and scaled_g <= max(5e-3, 5000.0 * self.tol)
+                ):
+                    flat_valley_streak += 1
+                    if flat_valley_streak >= 6:
+                        damped_kkt_stagnation_ok = True
+                else:
+                    flat_valley_streak = 0
+            elif not is_curvature_probe:
+                flat_valley_streak = 0
             practically_converged = (
                 (used_frozen_step or step_damping == 0.0 or damped_kkt_ok)
                 and max_correction < 10.0 * self.tol

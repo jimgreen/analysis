@@ -172,7 +172,7 @@ class SEScaleProfile:
             use_aat_normal_solver=(ns >= 16),
             aat_ordering_method=ordering,
             leverage_eye_max_state=lev_eye_max,
-            sparse_leverage_max_state=300_000,
+            sparse_leverage_max_state=500_000,
             exact_leverage_chunk_size=chunk,
             exact_leverage_use_sparse_rhs=(ns <= 20000 and avg_nnz > 0.0 and avg_nnz < 10.0),
             selinv_supernodal_rebuild_min_state=2000,
@@ -1867,12 +1867,12 @@ class CholmodAAtNormalEquationSolver:
             return False
         if pref == "pardiso":
             return bool(is_mkl_pardiso_available())
-        # auto 模式：极稀疏小中 DC 网（avg_nnz < 10.5 且 ns < 80000）CHOLMOD AMD 更轻快；
-        # 其余中大规模稠密耦合网及 80k+ 超大网启用多线程 MKL PARDISO
+        # auto 模式：极小稀疏网（ns < 3000 且 avg_nnz < 10.5）CHOLMOD AMD 更轻快；
+        # 中大规模网络（含高盲区导致 avg_nnz 下降的 1k~100k 节点 AC/Hybrid/Fluid）启用多线程 MKL PARDISO
         ns = int(n_state)
         if ns < _PARDISO_MIN_STATE_COUNT:
             return False
-        if nnz_a > 0 and ns < 80000 and (float(nnz_a) / float(ns)) < 10.5:
+        if nnz_a > 0 and ns < 3000 and (float(nnz_a) / float(ns)) < 10.5:
             return False
         return bool(is_mkl_pardiso_available())
 
@@ -2901,6 +2901,9 @@ def inverse_gain_for_bad_data(gain: np.ndarray, dense_state_limit: int = 5000):
     try:
         return np.linalg.inv(gain)
     except np.linalg.LinAlgError:
+        # 禁止中大型矩阵跌落 O(N^3) 稠密 SVD pinv（单次 2000 阶即耗时 >6s）
+        if gain.shape[0] > 512:
+            return None
         return np.linalg.pinv(gain)
 
 

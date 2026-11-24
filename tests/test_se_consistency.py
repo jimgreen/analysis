@@ -3980,6 +3980,205 @@ def test_fluid_se_vectorized_observability_and_bad_data_removal(tmp_path):
     assert res_h.converged
 
 
+def test_fluid_table_backed_runtime_and_pardiso_cholmod_symbolic_reuse(tmp_path):
+    """验证流体表驱动零对象编译与对象路径逐位等价、十万级稀疏杠杆上限、奇异矩阵禁稠密 SVD 及 CHOLMOD 符号复用。"""
+    from scipy.sparse import csc_matrix, csr_matrix
+    from model.gas_model import load_gas_network_from_e_file
+    from model.meas_model import Measurement, TableBackedMeasurementList
+    from secore.gas_se import GasStateEstimator
+    from secore.mkl_pardiso import (
+        MKLPardisoFactor,
+        build_upper_csr_from_aat,
+        is_mkl_pardiso_available,
+    )
+    from secore.se_math import SEScaleProfile, inverse_gain_for_bad_data
+
+    # 1. 验证 40w 状态规模档案启用稀疏选元求逆（覆盖 10w 节点 AC），且 >512 阶奇异矩阵不跌落稠密 pinv SVD
+    prof_400k = SEScaleProfile.for_problem(400_000, 900_000, 3_600_000, multi_solve=True)
+    assert prof_400k.sparse_leverage_max_state >= 500_000
+    singular_520 = csr_matrix((520, 520), dtype=np.float64)
+    assert inverse_gain_for_bad_data(singular_520, dense_state_limit=1000) is None
+
+    # 2. 验证流体 TableBackedMeasurementList 零对象绑定/向量化编译路径与显式对象列表路径逐位等价
+    gas_lines = [
+        "<GasMedium>",
+        "@ density compressibility molar_mass temperature flow_factor",
+        "# 0.8 1.0 0.018 288.15 1.0",
+        "</GasMedium>",
+        "<GasNode>",
+        "@ idx name pressure run_stat",
+    ]
+    for i in range(1, 16):
+        gas_lines.append(f"# {i} gn_{i} {10.0 - 0.02 * i:.4f} 1")
+    gas_lines += [
+        "</GasNode>",
+        "<GasSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+        "# 1 gsrc 1 PRESSURE 10.0 0.0 1.0 0.0 5.0 1",
+        "</GasSource>",
+        "<GasLoad>",
+        "@ idx name node flow_set run_stat",
+    ]
+    for k, nd in enumerate(range(8, 16), start=1):
+        gas_lines.append(f"# {k} gld_{k} {nd} 0.1 1")
+    gas_lines += [
+        "</GasLoad>",
+        "<GasPipe>",
+        "@ idx name i_node j_node conductance run_stat",
+    ]
+    for pid, child in enumerate(range(2, 16), start=1):
+        gas_lines.append(f"# {pid} gp_{child // 2}_{child} {child // 2} {child} 1.0 1")
+    gas_lines.append("</GasPipe>")
+    gas_e = tmp_path / "gas_tbl.e"
+    gas_e.write_text("\n".join(gas_lines) + "\n", encoding="utf-8")
+
+    meas_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 1
+    for i in range(1, 16):
+        meas_rows.append(f"# {mid} m_{mid} GasNode gn_{i} PRESSURE 100.0 1 {10.0 - 0.02 * i:.6f}")
+        mid += 1
+    for child in range(2, 16):
+        meas_rows.append(f"# {mid} m_{mid} GasPipe gp_{child // 2}_{child} FLOW_FROM 100.0 1 0.15")
+        mid += 1
+    meas_rows.append("</Measurement>")
+    gas_m = tmp_path / "gas_tbl.meas"
+    gas_m.write_text("\n".join(meas_rows) + "\n", encoding="utf-8")
+
+    net1 = load_gas_network_from_e_file(str(gas_e))
+    est_tbl = GasStateEstimator(net1, str(gas_m), parameters=SE_PARAMS, flat_start=True)
+    est_tbl.prepare()
+    assert isinstance(est_tbl.active_measurements, TableBackedMeasurementList)
+
+    net2 = load_gas_network_from_e_file(str(gas_e))
+    raw_objs = Measurement.read_from_file(gas_m)
+    est_obj = GasStateEstimator(net2, measurements=raw_objs, parameters=SE_PARAMS, flat_start=True)
+    est_obj.prepare()
+
+    x0 = est_tbl.initial_state()
+    assert np.allclose(est_tbl.evaluate(x0), est_obj.evaluate(x0), rtol=1e-13, atol=1e-13)
+    assert np.allclose(est_tbl.jacobian_sparse(x0).toarray(), est_obj.jacobian_sparse(x0).toarray(), rtol=1e-13, atol=1e-13)
+    res_tbl = est_tbl.estimate()
+    res_obj = est_obj.estimate()
+    assert res_tbl.converged and res_obj.converged
+    assert np.allclose(res_tbl.x, res_obj.x, rtol=1e-11, atol=1e-11)
+
+    # 3. 若 MKL PARDISO 可用，验证同稀疏模式下多次数值复分解复用 _cholmod_symbolic_factor
+    if is_mkl_pardiso_available():
+        rng = np.random.default_rng(20261125)
+        n_s = 120
+        rows, cols, vals = [], [], []
+        rid = 0
+        for i in range(n_s):
+            rows.append(rid); cols.append(i); vals.append(1.0); rid += 1
+            if i + 1 < n_s:
+                rows.extend([rid, rid]); cols.extend([i, i + 1]); vals.extend([1.0, -0.8]); rid += 1
+        H = csr_matrix((vals, (rows, cols)), shape=(rid, n_s), dtype=np.float64)
+        w1 = rng.uniform(1.0, 4.0, size=rid)
+        w2 = rng.uniform(1.0, 4.0, size=rid)
+        A1 = H.multiply(np.sqrt(w1)[:, None]).T.tocsc()
+        A2 = H.multiply(np.sqrt(w2)[:, None]).T.tocsc()
+        ia, ja, a1, pat = build_upper_csr_from_aat(A1)
+        _, _, a2, _ = build_upper_csr_from_aat(A2, cached_pattern=pat)
+        pfac = MKLPardisoFactor(n_s, ia, ja, upper_pattern=pat)
+        try:
+            pfac.factorize_inplace(a1, aat_operand=A1)
+            f1 = pfac.materialize_cholmod_factor(ordering_method="amd")
+            assert f1 is not None
+            sym_ref = pfac._cholmod_symbolic_factor
+            pfac.factorize_inplace(a2, aat_operand=A2)
+            assert pfac._cholmod_materialized is None
+            assert pfac._cholmod_symbolic_factor is sym_ref
+            f2 = pfac.materialize_cholmod_factor(ordering_method="amd")
+            assert f2 is sym_ref
+            rhs = rng.normal(size=n_s)
+            assert np.allclose(f2(rhs), pfac.solve(rhs), rtol=1e-11, atol=1e-11)
+        finally:
+            pfac.close()
+
+
+def test_fluid_bad_data_pressure_explosion_rollback_and_fullstep_damping(tmp_path):
+    """验证流体删坏压力上界爆炸回滚拦截及满步振荡自动切入曲率阻尼收敛。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    # 构造 8 节点树状蒸汽网：叶节点 8 的连接管 sp_4_8 注入显著大误差流量（-15.0 vs 真值 ~0.25），
+    # 若误删节点 8 的压力量测会由该坏流量反算出压力爆炸，验证压力上界回滚保护拦截并正确剔除坏流量。
+    lines = [
+        "<SteamMedium>",
+        "@ density compressibility molar_mass temperature heat_capacity ambient_enthalpy reference_temperature reference_enthalpy feedwater_enthalpy flow_factor",
+        "# 4.0 1.0 0.018 473.15 2.08 419.0 100.0 2676.0 419.0 1.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name pressure enthalpy temperature run_stat",
+    ]
+    for i in range(1, 9):
+        lines.append(f"# {i} sn_{i} {10.0 - 0.02 * i:.4f} 3000.0 255.76923 1")
+    lines.append("</SteamNode>")
+    lines.append("<SteamSource>\n@ idx name node control_type pressure_set flow_set alpha flow_min flow_max enthalpy_set run_stat\n# 1 ssrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 5.0 3000.0 1\n</SteamSource>")
+    lines.append("<SteamLoad>\n@ idx name node flow_set condensate_enthalpy run_stat")
+    for idx_l, nd in enumerate((5, 6, 7, 8), start=1):
+        lines.append(f"# {idx_l} sld_{nd} {nd} 0.25 419.0 1")
+    lines.append("</SteamLoad>")
+    lines.append("<SteamPipe>\n@ idx name i_node j_node conductance heat_loss run_stat")
+    for pid, child in enumerate(range(2, 9), start=1):
+        lines.append(f"# {pid} sp_{child // 2}_{child} {child // 2} {child} 1.0 1e-6 1")
+    lines.append("</SteamPipe>")
+    steam_e = tmp_path / "steam_guard.e"
+    steam_e.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # 用真实状态前向评估构造一致量测，再向叶管 sp_4_8 的 FLOW_FROM 注入大误差
+    net_ref = load_steam_network_from_e_file(str(steam_e))
+    net_ref.prepare()
+    meas_tpl = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 1
+    for i in range(1, 9):
+        meas_tpl.append(f"# {mid} m_{mid} SteamNode sn_{i} PRESSURE 100.0 1 {10.0 - 0.02 * i:.6f}")
+        mid += 1
+        meas_tpl.append(f"# {mid} m_{mid} SteamNode sn_{i} ENTHALPY 1.0 1 3000.0")
+        mid += 1
+    for child in range(2, 9):
+        meas_tpl.append(f"# {mid} m_{mid} SteamPipe sp_{child // 2}_{child} FLOW_FROM 100.0 1 0.25")
+        mid += 1
+        meas_tpl.append(f"# {mid} m_{mid} SteamPipe sp_{child // 2}_{child} PRESSURE_FROM 100.0 1 9.9")
+        mid += 1
+    meas_tpl.append("</Measurement>")
+    steam_m = tmp_path / "steam_guard.meas"
+    steam_m.write_text("\n".join(meas_tpl) + "\n", encoding="utf-8")
+    est_ref = SteamStateEstimator(net_ref, str(steam_m), parameters=SE_PARAMS, flat_start=False)
+    est_ref.prepare()
+    x_ref = est_ref.initial_state(flat_start=False)
+    h_ref = est_ref.evaluate(x_ref)
+    meas_real = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for idx_row, m_obj in enumerate(est_ref.active_measurements):
+        val = float(h_ref[idx_row])
+        if m_obj.device_name == "sp_4_8" and m_obj.meas_type == "FLOW_FROM":
+            val = -40.0
+        meas_real.append(
+            f"# {idx_row + 1} m_{idx_row + 1} {m_obj.device_type} {m_obj.device_name} {m_obj.meas_type} {m_obj.weight:.6g} 1 {val:.8g}"
+        )
+    meas_real.append("</Measurement>")
+    steam_m.write_text("\n".join(meas_real) + "\n", encoding="utf-8")
+
+    net = load_steam_network_from_e_file(str(steam_e))
+    est = SteamStateEstimator(
+        net,
+        str(steam_m),
+        parameters=SE_PARAMS.with_overrides(bad_threshold=4.0, max_iter=100),
+        flat_start=True,
+    )
+    res, rem = est.estimate_with_bad_data_removal(threshold=4.0, max_remove=10)
+    assert res.converged
+    pw = float(est.network.potential_power)
+    pressures = np.maximum(res.x[: est.n_potential], 1e-12) ** (1.0 / pw)
+    assert float(np.min(pressures)) >= 2.0
+    assert float(np.max(pressures)) <= 30.0
+    # 坏流量测点被剔除后叶节点 8 压力恢复接近真值 ~9.84
+    assert abs(float(pressures[7]) - 9.84) < 0.5
+    assert any(it.measurement.device_name == "sp_4_8" and it.measurement.meas_type == "FLOW_FROM" for it in rem)
+
+
+
+
 
 
 

@@ -560,9 +560,11 @@ class FluidNetwork:
             self.incidence = csr_matrix((n_node, 0), dtype=np.float64)
 
         if n_edge:
-            pressure_adjacency = abs(self.incidence) @ abs(self.incidence).T
-            pressure_adjacency.setdiag(0.0)
-            pressure_adjacency.eliminate_zeros()
+            # 直接由边端点构造无向邻接矩阵求连通分量，避免高开销的 |A|@|A|^T 稀疏乘法
+            pressure_adjacency = coo_matrix(
+                (np.ones(n_edge, dtype=np.int8), (self.edge_i, self.edge_j)),
+                shape=(n_node, n_node),
+            ).tocsr()
             self.island_count, self.node_island = connected_components(
                 pressure_adjacency, directed=False
             )
@@ -570,9 +572,9 @@ class FluidNetwork:
             self.island_count = n_node
             self.node_island = np.arange(n_node, dtype=np.int32)
 
-        topology_i = self.edge_i.tolist()
-        topology_j = self.edge_j.tolist()
         if self.thermal:
+            topology_i = self.edge_i.tolist()
+            topology_j = self.edge_j.tolist()
             for item in self.sources:
                 if _source_uses_explicit_return(item):
                     topology_i.append(self.node_pos_by_idx[int(item.return_node)])
@@ -588,19 +590,22 @@ class FluidNetwork:
                 if _exchanger_secondary_is_explicit(item):
                     topology_i.append(self.node_pos_by_idx[int(item.secondary_return_node)])
                     topology_j.append(self.node_pos_by_idx[int(item.secondary_supply_node)])
-        if topology_i:
-            rows = np.asarray([*topology_i, *topology_j], dtype=np.int64)
-            cols = np.asarray([*topology_j, *topology_i], dtype=np.int64)
-            adjacency = coo_matrix(
-                (np.ones(rows.size, dtype=np.float64), (rows, cols)),
-                shape=(n_node, n_node),
-            ).tocsr()
-            self.thermal_circuit_count, self.node_thermal_circuit = connected_components(
-                adjacency, directed=False
-            )
+            if topology_i:
+                ti_arr = np.asarray(topology_i, dtype=np.int64)
+                tj_arr = np.asarray(topology_j, dtype=np.int64)
+                adjacency = coo_matrix(
+                    (np.ones(ti_arr.size, dtype=np.int8), (ti_arr, tj_arr)),
+                    shape=(n_node, n_node),
+                ).tocsr()
+                self.thermal_circuit_count, self.node_thermal_circuit = connected_components(
+                    adjacency, directed=False
+                )
+            else:
+                self.thermal_circuit_count = n_node
+                self.node_thermal_circuit = np.arange(n_node, dtype=np.int32)
         else:
-            self.thermal_circuit_count = n_node
-            self.node_thermal_circuit = np.arange(n_node, dtype=np.int32)
+            self.thermal_circuit_count = int(self.island_count)
+            self.node_thermal_circuit = self.node_island.copy()
 
         if self.thermal:
             island_modes: Dict[int, bool] = {}
@@ -1018,15 +1023,25 @@ class FluidNetwork:
                 f"node {self.node_name[node_pos]} has {len(values)} pressure anchors; "
                 f"using average pressure {np.mean(values):.6f}"
             )
-        for island in range(int(self.island_count)):
-            island_nodes = np.flatnonzero(self.node_island == island)
-            if any(int(node) in fixed_pressure_by_node for node in island_nodes.tolist()):
-                continue
-            anchor = int(island_nodes[0])
-            fixed_pressure_by_node[anchor] = [float(self.node_pressure[anchor])]
-            self.warnings.append(
-                f"island {island} has no pressure-controlled source; node {self.node_name[anchor]} is the pressure anchor"
-            )
+        n_isl = int(self.island_count)
+        if n_isl > 0:
+            isl_has_anchor = np.zeros(n_isl, dtype=bool)
+            if fixed_pressure_by_node:
+                anchored_nodes = np.fromiter(fixed_pressure_by_node.keys(), dtype=np.int64, count=len(fixed_pressure_by_node))
+                isl_has_anchor[self.node_island[anchored_nodes]] = True
+            if not np.all(isl_has_anchor):
+                # O(N) 一次扫描确定各无源岛首个节点，避免 O(islands * N) 重复全扫
+                first_node_by_isl = np.full(n_isl, -1, dtype=np.int64)
+                for nd_pos, isl_id in enumerate(self.node_island.tolist()):
+                    if first_node_by_isl[isl_id] < 0:
+                        first_node_by_isl[isl_id] = nd_pos
+                for island in np.flatnonzero(~isl_has_anchor).tolist():
+                    anchor = int(first_node_by_isl[island])
+                    if anchor >= 0:
+                        fixed_pressure_by_node[anchor] = [float(self.node_pressure[anchor])]
+                        self.warnings.append(
+                            f"island {island} has no pressure-controlled source; node {self.node_name[anchor]} is the pressure anchor"
+                        )
         self.fixed_node_pos = np.asarray(sorted(fixed_pressure_by_node), dtype=np.int64)
         self.fixed_pressure = np.asarray(
             [np.mean(fixed_pressure_by_node[int(pos)]) for pos in self.fixed_node_pos], dtype=np.float64
