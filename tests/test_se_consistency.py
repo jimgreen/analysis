@@ -4257,6 +4257,257 @@ def test_fluid_zero_flow_heat_loss_jacobian_well_conditioned_and_bad_data_no_red
     assert call_cnt["n"] <= len(rem2) + 2
 
 
+def test_multi_energy_ac_fluid_identify_bad_data_no_delegate_crash_and_fast_converge(tmp_path):
+    """验证纯 AC+流体多能耦合（不含 DC）辨识与剔除坏数据不误委派崩溃，且跨能域尺度不变阻尼快速收敛。"""
+    # 构造 AC(6节点) + Gas(6节点) 多能系统（不含 DC，此前必触发 delegate.identify_bad_data RuntimeError）
+    e_text = "\n".join(
+        [
+            "<Model>",
+            "@ p_base u_unit p_unit i_unit",
+            "# 100.0 kV MW kA",
+            "</Model>",
+            "<ACNode>",
+            "@ idx name vbase voltage angle isl run_stat",
+            "# 1 ac_1 110.0 110.0 0.0 1 1",
+            "# 2 ac_2 110.0 110.0 0.0 1 1",
+            "# 3 ac_3 110.0 110.0 0.0 1 1",
+            "# 4 ac_4 110.0 110.0 0.0 1 1",
+            "# 5 ac_5 110.0 110.0 0.0 1 1",
+            "# 6 ac_6 110.0 110.0 0.0 1 1",
+            "</ACNode>",
+            "<ACBranch>",
+            "@ idx name i_node j_node r x b run_stat",
+            "# 1 br_1_2 1 2 0.008 0.04 0.005 1",
+            "# 2 br_2_3 2 3 0.008 0.04 0.005 1",
+            "# 3 br_3_4 3 4 0.008 0.04 0.005 1",
+            "# 4 br_4_5 4 5 0.008 0.04 0.005 1",
+            "# 5 br_5_6 5 6 0.008 0.04 0.005 1",
+            "# 6 br_6_1 6 1 0.010 0.05 0.005 1",
+            "</ACBranch>",
+            "<ACGenerator>",
+            "@ idx name node control_type p_set q_set v_set alpha run_stat",
+            "# 1 g_slack 1 SLACK 0.0 0.0 111.0 1.0 1",
+            "</ACGenerator>",
+            "<ACLoad>",
+            "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+            "# 1 ld_2 2 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+            "# 2 ld_3 3 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+            "# 3 ld_4 4 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+            "# 4 ld_5 5 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+            "# 5 ld_6 6 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+            "</ACLoad>",
+            "<GasMedium>",
+            "@ density compressibility molar_mass temperature flow_factor",
+            "# 0.8 1.0 0.018 288.15 1.0",
+            "</GasMedium>",
+            "<GasNode>",
+            "@ idx name pressure run_stat",
+            "# 1 gn_1 10.0 1",
+            "# 2 gn_2 9.95 1",
+            "# 3 gn_3 9.90 1",
+            "# 4 gn_4 9.88 1",
+            "# 5 gn_5 9.85 1",
+            "# 6 gn_6 9.82 1",
+            "</GasNode>",
+            "<GasSource>",
+            "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+            "# 1 gsrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 10.0 1",
+            "</GasSource>",
+            "<GasLoad>",
+            "@ idx name node flow_set run_stat",
+            "# 1 gld_4 4 0.2 1",
+            "# 2 gld_5 5 0.2 1",
+            "# 3 gld_6 6 0.2 1",
+            "</GasLoad>",
+            "<GasPipe>",
+            "@ idx name i_node j_node conductance run_stat",
+            "# 1 gp_1_2 1 2 1.0 1",
+            "# 2 gp_2_3 2 3 1.0 1",
+            "# 3 gp_3_4 3 4 1.0 1",
+            "# 4 gp_3_5 3 5 1.0 1",
+            "# 5 gp_4_6 4 6 1.0 1",
+            "# 6 gp_5_6 5 6 1.0 1",
+            "</GasPipe>",
+        ]
+    )
+    e_path = tmp_path / "me_ac_gas.e"
+    e_path.write_text(e_text + "\n", encoding="utf-8")
+
+    # 分别以 AC 真实潮流 + Gas 初始状态构造物理一致的跨能域量测，并向气网节点与电网支路各注入 1 条显著坏数据
+    from lfcore.ac_lf import ACPowerFlowCalc
+    from model.ac_array_model import build_ac_ppc_from_e_file
+    from model.gas_model import load_gas_network_from_e_file
+    from model.meas_model import Measurement
+    from secore.gas_se import GasStateEstimator
+
+    lf_ac = ACPowerFlowCalc(build_ac_ppc_from_e_file(e_path), parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_ac.prepare()
+    assert lf_ac.run(result_mode="array") == 0
+
+    ac_specs = [("ACNode", f"ac_{i}", "V") for i in range(1, 7)] + [
+        ("ACBranch", f"br_{u}_{v}", mt)
+        for (u, v) in ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 1))
+        for mt in ("P_FROM", "Q_FROM", "P_TO", "Q_TO")
+    ]
+    gas_specs = [("GasNode", f"gn_{i}", "PRESSURE") for i in range(1, 7)] + [
+        ("GasPipe", f"gp_{u}_{v}", "FLOW_FROM")
+        for (u, v) in ((1, 2), (2, 3), (3, 4), (3, 5), (4, 6), (5, 6))
+    ]
+    ac_tpl = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for k, (dt, dn, mt) in enumerate(ac_specs, start=1):
+        ac_tpl.append(f"# {k} m_{k} {dt} {dn} {mt} 100.0 1 {110.0 if mt == 'V' else 0.1}")
+    ac_tpl.append("</Measurement>")
+    ac_m_tmp = tmp_path / "ac_tpl.meas"
+    ac_m_tmp.write_text("\n".join(ac_tpl) + "\n", encoding="utf-8")
+    ac_ref = ACStateEstimator(str(e_path), str(ac_m_tmp), parameters=SE_PARAMS, flat_start=True, auto_prepare=False)
+    ac_ref.prepare()
+    ac_ref.file_voltage = np.asarray(lf_ac.ppc["bus"][:, lf_ac.ppc["bus_cols"]["voltage"]], dtype=np.float64).copy()
+    ac_ref.file_theta = np.asarray(lf_ac.ppc["bus"][:, lf_ac.ppc["bus_cols"]["angle"]], dtype=np.float64).copy()
+    h_ac = ac_ref.evaluate(ac_ref.initial_state(flat=False))
+
+    g_net = load_gas_network_from_e_file(str(e_path))
+    g_net.prepare()
+    g_dummy = [Measurement(i + 1, f"gm_{i + 1}", gas_specs[i][0], gas_specs[i][1], gas_specs[i][2], 100.0, True, 0.0) for i in range(len(gas_specs))]
+    g_ref = GasStateEstimator(g_net, measurements=g_dummy, parameters=SE_PARAMS, flat_start=False)
+    g_ref.prepare()
+    h_gas = g_ref.evaluate(g_ref.initial_state(flat_start=False))
+
+    real_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 1
+    for i, (dt, dn, mt) in enumerate(ac_specs):
+        val = float(h_ac[i]) * (110.0 if mt == "V" else 100.0)
+        if dn == "br_3_4" and mt == "P_FROM":
+            val += 80.0
+        real_lines.append(f"# {mid} m_{mid} {dt} {dn} {mt} 100.0 1 {val:.8g}")
+        mid += 1
+    for i, (dt, dn, mt) in enumerate(gas_specs):
+        val = float(h_gas[i])
+        if dn == "gn_5" and mt == "PRESSURE":
+            val = 14.5
+        real_lines.append(f"# {mid} m_{mid} {dt} {dn} {mt} 100.0 1 {val:.8g}")
+        mid += 1
+    real_lines.append("</Measurement>")
+    m_path = tmp_path / "me_ac_gas.meas"
+    m_path.write_text("\n".join(real_lines) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(
+        str(e_path),
+        str(m_path),
+        parameters=SE_PARAMS.with_overrides(bad_threshold=4.0, max_iter=100),
+        flat_start=True,
+        auto_prepare=False,
+    )
+    est.prepare()
+    res0 = est.estimate()
+    assert res0.converged
+    bad0, _ = est.identify_bad_data(res0, threshold=4.0)
+    assert len(bad0) >= 2
+    res_clean, removed = est.estimate_with_bad_data_removal(threshold=4.0, max_remove=5)
+    assert res_clean.converged
+    assert len(removed) >= 2
+    rem_pairs = {(it.measurement.device_type, it.measurement.meas_type) for it in removed}
+    assert ("GasNode", "PRESSURE") in rem_pairs
+    assert ("ACBranch", "P_FROM") in rem_pairs
+
+
+def test_multi_energy_hybrid_ac_dc_gas_reuses_ac_gen_state_col_observable(tmp_path):
+    """验证 AC+DC+Gas 含 Gas2AcE 耦合时复用电侧 AC_GEN_P 状态列，不产生全零不可观测列。"""
+    hyb_e, hyb_m = _generate_hybrid_case(10, 4, tmp_path)
+    hyb_text = hyb_e.read_text(encoding="utf-8")
+    # 提取生成的 ACGenerator 编号，选取最后一台（PV 机优先）接入 Gas2AcE
+    ac_gen_idxs = []
+    in_gen = False
+    for ln in hyb_text.splitlines():
+        s = ln.strip()
+        if s == "<ACGenerator>":
+            in_gen = True
+        elif s == "</ACGenerator>":
+            in_gen = False
+        elif in_gen and s.startswith("#"):
+            ac_gen_idxs.append(int(s.split()[1]))
+    assert ac_gen_idxs
+    target_gen_idx = ac_gen_idxs[-1]
+    gas_blocks = "\n".join(
+        [
+            "<GasMedium>",
+            "@ density compressibility molar_mass temperature flow_factor",
+            "# 0.8 1.0 0.018 288.15 1.0",
+            "</GasMedium>",
+            "<GasNode>",
+            "@ idx name pressure run_stat",
+            "# 1 gn_1 10.0 1",
+            "# 2 gn_2 9.6 1",
+            "# 3 gn_3 9.2 1",
+            "</GasNode>",
+            "<GasSource>",
+            "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+            "# 1 gs_1 1 PRESSURE 10.0 0.0 1.0 0.0 10.0 1",
+            "</GasSource>",
+            "<GasLoad>",
+            "@ idx name node flow_set run_stat",
+            "# 1 gld_2 2 0.05 1",
+            "# 2 gld_3 3 0.15 1",
+            "</GasLoad>",
+            "<GasPipe>",
+            "@ idx name i_node j_node conductance run_stat",
+            "# 1 gp_1_2 1 2 1.0 1",
+            "# 2 gp_2_3 2 3 1.0 1",
+            "# 3 gp_1_3 1 3 1.0 1",
+            "</GasPipe>",
+            "<Gas2AcE>",
+            "@ idx name idx_gas_load_t1 idx_ac_gen_t2 control_type g2e_coeff run_stat",
+            f"# 1 gt_1 1 {target_gen_idx} FLOW 500.0 1",
+            "</Gas2AcE>",
+        ]
+    )
+    e_path = tmp_path / "me_ac_dc_gas_reuse.e"
+    e_path.write_text(hyb_text + "\n" + gas_blocks + "\n", encoding="utf-8")
+
+    # 在原 AC+DC 量测末尾追加气网压力与流量量测
+    base_m_lines = [ln for ln in hyb_m.read_text(encoding="utf-8").splitlines() if ln.strip() != "</Measurement>"]
+    max_idx = max(int(ln.split()[1]) for ln in base_m_lines if ln.startswith("#"))
+    gas_meas_specs = [
+        ("GasNode", "gn_1", "PRESSURE", 10.0),
+        ("GasNode", "gn_2", "PRESSURE", 9.6),
+        ("GasNode", "gn_3", "PRESSURE", 9.2),
+        ("GasPipe", "gp_1_2", "FLOW_FROM", 0.1),
+        ("GasPipe", "gp_2_3", "FLOW_FROM", 0.1),
+        ("GasPipe", "gp_1_3", "FLOW_FROM", 0.1),
+    ]
+    for offset, (dt, dn, mt, val) in enumerate(gas_meas_specs, start=1):
+        mid = max_idx + offset
+        base_m_lines.append(f"# {mid} gm_{mid} {dt} {dn} {mt} 100.0 1 {val}")
+    base_m_lines.append("</Measurement>")
+    m_path = tmp_path / "me_ac_dc_gas_reuse.meas"
+    m_path.write_text("\n".join(base_m_lines) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(
+        str(e_path),
+        str(m_path),
+        parameters=SE_PARAMS.with_overrides(max_iter=100),
+        flat_start=True,
+        auto_prepare=False,
+    )
+    est.prepare()
+
+    # 1. 验证 Gas2AcE 耦合计划直接复用电侧 AC_GEN_P 状态列（未追加多余控制状态）
+    assert len(est.multi_energy_se_coupling_plans) == 1
+    plan = est.multi_energy_se_coupling_plans[0]
+    assert 0 <= plan.control_col < est.electric_state_count
+    assert est.multi_energy_coupling_state_slice.start == est.multi_energy_coupling_state_slice.stop
+
+    # 2. 验证联合雅可比不存在任何全零列且可观测性为 True
+    x0 = est._multi_energy_initial_state()
+    H0 = est._multi_energy_jacobian_sparse(x0).tocsc()
+    col_nnz = np.diff(H0.indptr)
+    assert int(np.sum(col_nnz == 0)) == 0
+    obs = est._multi_energy_observability_analysis(x0)
+    assert obs.observable
+    assert obs.rank == est.multi_energy_state_count
+
+
+
+
 
 
 

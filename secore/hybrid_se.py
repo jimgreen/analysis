@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.sparse import block_diag, coo_matrix, csr_matrix, eye as sparse_eye, hstack, vstack
+from scipy.sparse import block_diag, coo_matrix, csr_matrix, diags, eye as sparse_eye, hstack, vstack
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -2581,7 +2581,24 @@ class HybridStateEstimator:
             endpoint_row = endpoint_jacobians[endpoint.provider].getrow(endpoint.row)
             control_col = -1
             prior_measurement_row = -1
-            if direct_fluid_electric or endpoint_row.nnz == 0:
+            reused_unit_state_col = -1
+            if (
+                direct_fluid_electric
+                and endpoint_row.nnz == 1
+                and abs(float(endpoint_row.data[0]) - 1.0) <= 1.0e-12
+            ):
+                # 当受控电端（如 AC+DC 混合模式下的 ACGenerator P_GEN / DCGenerator P_GEN）
+                # 在子域状态向量中已有专属单位状态列时，直接复用该列作为耦合控制列，
+                # 避免新建重复控制列并覆写 dependent_measurement_rows 导致原子域列沦为全零不可观测列。
+                endpoint_slice = (
+                    self.electric_state_slice
+                    if endpoint.provider == "electric"
+                    else self.fluid_state_slices[endpoint.provider]
+                )
+                reused_unit_state_col = endpoint_slice.start + int(endpoint_row.indices[0])
+            if reused_unit_state_col >= 0:
+                control_col = reused_unit_state_col
+            elif direct_fluid_electric or endpoint_row.nnz == 0:
                 control_col = self.multi_energy_state_count + len(control_initial)
                 control_initial.append(
                     dependent_setpoint if direct_fluid_electric else t1_value
@@ -3405,10 +3422,12 @@ class HybridStateEstimator:
                 if steam_estimator.network.node_enthalpy.size
                 else -np.inf,
             )
+            # 仅防物理发散（2 倍参考上限），避免将带正常正向波动（如 +5%）的蒸汽焓状态锁死在设定值上导致线搜索停滞
+            upper_enthalpy = max(maximum_enthalpy * 2.0, minimum_enthalpy + 1000.0) if np.isfinite(maximum_enthalpy) else np.inf
             x[enthalpy_start:state_slice.stop] = np.clip(
                 x[enthalpy_start:state_slice.stop],
                 minimum_enthalpy,
-                maximum_enthalpy,
+                upper_enthalpy,
             )
         return x
 
@@ -3501,6 +3520,7 @@ class HybridStateEstimator:
         verbose: bool = False,
         final_diagnostics: bool = True,
         observability: Optional[ObservabilityResult] = None,
+        _hint_lm_damping: float = 0.0,
     ) -> EstimateResult:
         self._prepare_multi_energy_se_layout()
         x = self._multi_energy_initial_state() if x0 is None else np.asarray(x0, dtype=np.float64).copy()
@@ -3529,11 +3549,19 @@ class HybridStateEstimator:
             ):
                 cached_H = cache.get("H")
 
-        weight = self._multi_energy_weight[rows]
+        n_me_state = int(self.multi_energy_state_count)
+        weight = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
         uniform_weight = self._uniform_weight(weight)
         weights_are_uniform = uniform_weight is not None
         weighted_residual = None if weights_are_uniform else np.empty_like(weight)
-        normal_solver = NormalEquationSolver(assume_fixed_pattern=True)
+        use_aat = n_me_state >= 64
+        aat_solver = (
+            CholmodAAtNormalEquationSolver(assume_fixed_pattern=False, ordering_method="auto", multi_solve=True)
+            if use_aat
+            else None
+        )
+        aat_plan: Optional[CholmodAAtNormalEquationPlan] = None
+        normal_solver = NormalEquationSolver(assume_fixed_pattern=False)
         normal_pattern = None
         z_est = np.empty(rows.size, dtype=np.float64)
         residual = np.empty_like(z_est)
@@ -3547,6 +3575,8 @@ class HybridStateEstimator:
         iteration = 0
         H = None
         gain = None
+        evaluated_at_final_x = False
+        z_est_valid = False
         if verbose:
             _print_iteration_header()
 
@@ -3569,76 +3599,160 @@ class HybridStateEstimator:
                     return True
             return False
 
-        force_lm_damping = 0.0
-        for iteration in range(1, self.max_iter + 1):
-            if _me_state_out_of_bounds(x):
-                break
-            step_damping = float(force_lm_damping)
-            z_est[:] = self._evaluate_multi_energy(x)[rows]
-            self._multi_energy_measurement_residual(
-                z_est,
-                measurement_rows=rows,
-                out=residual,
-            )
-            objective = self._weighted_objective(weight, residual)
-            residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
-            if iteration == 1 and cached_H is not None:
-                H = cached_H
-                cached_H = None
-            else:
-                H = self._multi_energy_jacobian_sparse(x)[rows]
-            if normal_pattern is None:
-                normal_pattern = _normal_equation_structural_pattern(H)
+        def _solve_me_step(H_cur, res_cur: np.ndarray, damping_val: float):
+            nonlocal aat_plan, normal_pattern, gain
+            if use_aat and aat_solver is not None and is_sparse_matrix(H_cur) and H_cur.nnz > 0:
+                H_csr = H_cur if getattr(H_cur, "format", None) == "csr" else H_cur.tocsr()
+                if not H_csr.has_sorted_indices:
+                    H_csr.sort_indices()
+                if aat_plan is None or not aat_plan.matches(H_csr):
+                    aat_plan = CholmodAAtNormalEquationPlan.from_jacobian(H_csr)
+                A_csc, rhs_vec = aat_plan.assemble(
+                    H_csr,
+                    res_cur,
+                    weight,
+                    assume_fixed_weights=False,
+                    copy_rhs=False,
+                    assume_pattern_matches=True,
+                )
+                diag_g = np.bincount(
+                    A_csc.indices,
+                    weights=A_csc.data * A_csc.data,
+                    minlength=n_me_state,
+                )
+                if damping_val > 0.0:
+                    # 跨电/气/热/氢/蒸汽多能域尺度不变 Jacobi 列均衡 + Marquardt 相对阻尼
+                    col_scale = 1.0 / np.sqrt(np.maximum(diag_g, 1e-12))
+                    A_scaled = A_csc.copy()
+                    A_scaled.data = A_csc.data * col_scale[A_csc.indices]
+                    rhs_scaled = rhs_vec * col_scale
+                    dx_scaled, _ = aat_solver.solve(
+                        A_scaled,
+                        rhs_scaled,
+                        return_factor_diag=False,
+                        damping=damping_val,
+                    )
+                    dx_out = np.asarray(dx_scaled, dtype=np.float64) * col_scale
+                else:
+                    dx_raw, _ = aat_solver.solve(
+                        A_csc,
+                        rhs_vec,
+                        return_factor_diag=False,
+                        damping=0.0,
+                    )
+                    dx_out = np.asarray(dx_raw, dtype=np.float64)
+                return dx_out, rhs_vec, diag_g
+
+            if normal_pattern is None and is_sparse_matrix(H_cur):
+                normal_pattern = _normal_equation_structural_pattern(H_cur)
             if weighted_residual is not None:
-                np.multiply(weight, residual, out=weighted_residual)
-            gain, rhs = build_normal_equations(
-                H,
-                residual,
+                np.multiply(weight, res_cur, out=weighted_residual)
+            gain_cur, rhs_vec = build_normal_equations(
+                H_cur,
+                res_cur,
                 weight,
                 uniform_weight=uniform_weight,
                 weights_are_uniform=weights_are_uniform,
                 weighted_residual=weighted_residual,
                 normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=True,
+                assume_normal_pattern_matches=False,
             )
-            if getattr(self, "matrix_dump_dir", None) is not None:
-                self._dump_iteration_matrices(iteration, H, weight, gain)
-            if step_damping > 0.0:
-                if is_sparse_matrix(gain):
-                    diag_vals = np.asarray(gain.diagonal(), dtype=np.float64)
-                    pos_diag = diag_vals[np.isfinite(diag_vals) & (diag_vals > 0.0)]
-                    diag_scale = max(1.0, float(np.median(pos_diag))) if pos_diag.size else 1.0
-                    damped_gain = gain + sparse_eye(gain.shape[0], format="csc", dtype=np.float64) * (diag_scale * step_damping)
+            gain = gain_cur
+            if is_sparse_matrix(gain_cur):
+                diag_g = np.asarray(gain_cur.diagonal(), dtype=np.float64)
+                if damping_val > 0.0:
+                    damped_g = (gain_cur.tocsc() + diags(damping_val * np.maximum(diag_g, 1e-12), format="csc")).tocsc()
+                    dx_raw, _ = normal_solver.solve(damped_g, rhs_vec, return_factor_diag=False)
                 else:
-                    diag_vals = np.diag(gain)
-                    pos_diag = diag_vals[np.isfinite(diag_vals) & (diag_vals > 0.0)]
-                    diag_scale = max(1.0, float(np.median(pos_diag))) if pos_diag.size else 1.0
-                    damped_gain = np.array(gain, dtype=np.float64, copy=True)
-                    damped_gain[np.diag_indices_from(damped_gain)] += diag_scale * step_damping
-                dx, _factor_diag = NormalEquationSolver().solve(
-                    damped_gain,
-                    rhs,
-                    return_factor_diag=final_diagnostics,
-                )
+                    dx_raw, _ = normal_solver.solve(gain_cur, rhs_vec, return_factor_diag=False)
             else:
-                dx, _factor_diag = normal_solver.solve(
-                    gain,
-                    rhs,
-                    return_factor_diag=final_diagnostics,
-                )
-            if dx.size and not np.all(np.isfinite(dx)):
-                if force_lm_damping < 1.0:
-                    force_lm_damping = max(force_lm_damping * 10.0, 1e-4)
-                    continue
+                diag_g = np.asarray(np.diag(gain_cur), dtype=np.float64)
+                if damping_val > 0.0:
+                    damped_g = np.array(gain_cur, dtype=np.float64, copy=True)
+                    damped_g[np.diag_indices_from(damped_g)] += damping_val * np.maximum(diag_g, 1e-12)
+                    dx_raw, _ = normal_solver.solve(damped_g, rhs_vec, return_factor_diag=False)
+                else:
+                    dx_raw, _ = normal_solver.solve(gain_cur, rhs_vec, return_factor_diag=False)
+            return np.asarray(dx_raw, dtype=np.float64), rhs_vec, diag_g
+
+        force_lm_damping = max(0.0, float(_hint_lm_damping))
+        last_used_damping = 0.0
+        backtrack_streak = 0
+        fullstep_osc_streak = 0
+        stagnation_streak = 0
+        curvature_damping_active = force_lm_damping > 0.0
+        tried_undamped_escape = False
+        prev_scaled_correction = np.inf
+        self._last_estimate_cholmod_factor = None
+
+        for iteration in range(1, self.max_iter + 1):
+            if _me_state_out_of_bounds(x):
                 break
+            if not z_est_valid:
+                z_est[:] = self._evaluate_multi_energy(x)[rows]
+                self._multi_energy_measurement_residual(
+                    z_est,
+                    measurement_rows=rows,
+                    out=residual,
+                )
+                objective = self._weighted_objective(weight, residual)
+                residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+                z_est_valid = True
+            if iteration == 1 and cached_H is not None:
+                H = cached_H
+                cached_H = None
+            else:
+                H = self._multi_energy_jacobian_sparse(x)[rows]
+
+            step_damping = float(force_lm_damping)
+            dx = None
+            rhs = None
+            diag_g = None
+            try:
+                dx, rhs, diag_g = _solve_me_step(H, residual, step_damping)
+            except Exception:
+                dx = None
+            if dx is None or (dx.size and not np.all(np.isfinite(dx))):
+                for beta_try in (1e-4, 1e-2, 1e-1, 1.0, 10.0):
+                    if beta_try <= step_damping:
+                        continue
+                    try:
+                        dx_try, rhs_try, diag_try = _solve_me_step(H, residual, beta_try)
+                        if dx_try.size == n_me_state and np.all(np.isfinite(dx_try)):
+                            dx, rhs, diag_g = dx_try, rhs_try, diag_try
+                            step_damping = beta_try
+                            force_lm_damping = beta_try
+                            break
+                    except Exception:
+                        continue
+            if dx is None or (dx.size and not np.all(np.isfinite(dx))):
+                break
+
+            last_used_damping = step_damping
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
             scaled_correction = (
                 float(np.max(np.abs(dx) / np.maximum(1.0, np.abs(x))))
                 if dx.size
                 else 0.0
             )
-            if scaled_correction < self.tol and step_damping == 0.0:
+            kkt_inf = (
+                float(np.max(np.abs(rhs) / np.maximum(diag_g, 1.0)))
+                if (rhs is not None and diag_g is not None and rhs.size > 0)
+                else np.inf
+            )
+            if step_damping == 0.0 and scaled_correction < self.tol:
                 converged = True
+                evaluated_at_final_x = True
+                if verbose:
+                    _print_iteration(iteration, objective, residual_inf, max_correction, None, True)
+                break
+            if (
+                step_damping > 0.0
+                and scaled_correction < max(1e-5, 10.0 * self.tol)
+                and kkt_inf <= max(1e-4, 100.0 * self.tol)
+            ):
+                converged = True
+                evaluated_at_final_x = True
                 if verbose:
                     _print_iteration(iteration, objective, residual_inf, max_correction, None, True)
                 break
@@ -3654,8 +3768,12 @@ class HybridStateEstimator:
                 max_a_dx = float(np.max(np.abs(dx[me_a_cols])))
                 if max_a_dx > 0.75:
                     step_scale = min(step_scale, 0.75 / max_a_dx)
+
+            previous_objective = objective
+            obj_tol = max(1e-12, 1e-10 * (abs(objective) + 1.0))
+            ls_slope = -float(np.dot(rhs, dx)) if (rhs is not None and rhs.size == dx.size) else 0.0
             oob_trials = 0
-            for _attempt in range(16):
+            for _attempt in range(20):
                 raw_candidate = x + step_scale * dx
                 if _me_state_out_of_bounds(raw_candidate):
                     oob_trials += 1
@@ -3677,7 +3795,7 @@ class HybridStateEstimator:
                     out=candidate_residual,
                 )
                 candidate_objective = self._weighted_objective(weight, candidate_residual)
-                if np.isfinite(candidate_objective) and candidate_objective <= objective + 1.0e-12:
+                if np.isfinite(candidate_objective) and candidate_objective <= objective + obj_tol:
                     relative_objective_change = abs(objective - candidate_objective) / max(1.0, abs(objective))
                     x = candidate
                     z_est, candidate_z_est = candidate_z_est, z_est
@@ -3691,18 +3809,100 @@ class HybridStateEstimator:
                         and scaled_correction < np.sqrt(self.tol)
                     )
                     break
-                step_scale *= 0.5
+                if ls_slope < 0.0 and np.isfinite(candidate_objective):
+                    denom = 2.0 * (candidate_objective - objective - ls_slope * step_scale)
+                    if np.isfinite(denom) and denom > 1e-30:
+                        s_quad = (-ls_slope * step_scale * step_scale) / denom
+                        step_scale = float(np.clip(s_quad, 0.1 * step_scale, 0.5 * step_scale))
+                    else:
+                        step_scale *= 0.5
+                else:
+                    step_scale *= 0.5
+
             if not accepted:
-                if force_lm_damping < 1.0:
-                    force_lm_damping = max(force_lm_damping * 10.0, 1e-4)
-                    continue
-                break
-            if step_scale < 1e-3 and scaled_correction > 1e-2:
-                if force_lm_damping >= 1.0:
+                if tried_undamped_escape:
+                    # 连续平底谷停滞后尝试无阻尼脱困仍无下降，确认已到达局部极小驻点
+                    converged = True
+                    evaluated_at_final_x = True
                     break
-                force_lm_damping = min(1.0, max(force_lm_damping * 10.0, 1e-4))
+                if force_lm_damping < 100.0:
+                    force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
+                    curvature_damping_active = True
+                    backtrack_streak = 0
+                    continue
+                if kkt_inf <= max(1e-3, 1000.0 * self.tol) and scaled_correction < 1e-3:
+                    converged = True
+                evaluated_at_final_x = True
+                break
+
+            obj_change = abs(previous_objective - objective)
+            actual_scaled_dx = step_scale * scaled_correction
+            # 自适应阻尼调节：识别香蕉谷交替回溯与满步慢发散，温和切入/放松曲率阻尼
+            if step_scale >= 0.5:
+                backtrack_streak = max(0, backtrack_streak - 1)
+                if (
+                    step_damping == 0.0
+                    and scaled_correction > max(self.tol, 1e-5)
+                    and scaled_correction >= 0.95 * prev_scaled_correction
+                    and obj_change <= 1e-4 * (abs(previous_objective) + 1.0)
+                ):
+                    fullstep_osc_streak += 1
+                    if fullstep_osc_streak >= 4:
+                        force_lm_damping = max(force_lm_damping, 0.1)
+                        curvature_damping_active = True
+                        fullstep_osc_streak = 0
+                else:
+                    fullstep_osc_streak = 0
+                if force_lm_damping > 0.0:
+                    if curvature_damping_active:
+                        if scaled_correction < 0.98 * prev_scaled_correction:
+                            force_lm_damping = force_lm_damping * 0.5
+                            if force_lm_damping < 1e-4:
+                                force_lm_damping = 0.0
+                                curvature_damping_active = False
+                    else:
+                        force_lm_damping = force_lm_damping * 0.25
+                        if force_lm_damping < 1e-6:
+                            force_lm_damping = 0.0
             else:
-                force_lm_damping = 0.0
+                fullstep_osc_streak = 0
+                backtrack_streak += 2
+                if backtrack_streak >= 4 or step_scale < 1e-2:
+                    force_lm_damping = min(10.0, max(force_lm_damping * 10.0, 1e-2))
+                    backtrack_streak = 0
+            prev_scaled_correction = scaled_correction
+
+            # 带阻尼稳态停滞与平底谷驻点检测
+            if tried_undamped_escape:
+                if obj_change <= max(1e-10, 1e-6 * (abs(previous_objective) + 1.0)):
+                    # 无阻尼脱困试探未能令目标函数实质下降，确认已到达非光滑局部极小驻点
+                    stationary = True
+                else:
+                    tried_undamped_escape = False
+                    stagnation_streak = 0
+            elif (
+                step_damping > 0.0
+                and scaled_correction < 1e-3
+                and kkt_inf <= max(5e-4, 500.0 * self.tol)
+                and obj_change <= max(1e-12, 1e-7 * (abs(previous_objective) + 1.0))
+            ):
+                stationary = True
+            elif (
+                obj_change <= max(1e-12, 1e-8 * (abs(previous_objective) + 1.0))
+                and actual_scaled_dx <= max(1e-5, 10.0 * self.tol)
+            ):
+                stagnation_streak += 1
+                if stagnation_streak >= 3:
+                    if step_damping > 0.0:
+                        force_lm_damping = 0.0
+                        curvature_damping_active = False
+                        tried_undamped_escape = True
+                        stagnation_streak = 0
+                    else:
+                        stationary = True
+            else:
+                stagnation_streak = 0
+
             if stationary:
                 converged = True
                 if verbose:
@@ -3711,31 +3911,44 @@ class HybridStateEstimator:
             if verbose:
                 _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, False)
 
-        z_est[:] = self._evaluate_multi_energy(x)[rows]
-        self._multi_energy_measurement_residual(
-            z_est,
-            measurement_rows=rows,
-            out=residual,
-        )
-        objective = self._weighted_objective(weight, residual)
-        residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+        if not z_est_valid:
+            z_est[:] = self._evaluate_multi_energy(x)[rows]
+            self._multi_energy_measurement_residual(
+                z_est,
+                measurement_rows=rows,
+                out=residual,
+            )
+            objective = self._weighted_objective(weight, residual)
+            residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
         if scaled_correction < self.tol:
             converged = True
-        if final_diagnostics or H is None or gain is None:
-            H = self._multi_energy_jacobian_sparse(x)[rows]
-            normal_pattern = _normal_equation_structural_pattern(H)
-            if weighted_residual is not None:
-                np.multiply(weight, residual, out=weighted_residual)
-            gain, _rhs = build_normal_equations(
-                H,
-                residual,
-                weight,
-                uniform_weight=uniform_weight,
-                weights_are_uniform=weights_are_uniform,
-                weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
-                assume_normal_pattern_matches=True,
-            )
+
+        # 若未在最终点求雅可比且需要诊断，则在最终点补求 H 与 gain（无阻尼收敛时直接复用 aat 因子）
+        if not evaluated_at_final_x:
+            if final_diagnostics or H is None:
+                H = self._multi_energy_jacobian_sparse(x)[rows]
+                gain = None
+        if final_diagnostics and gain is None and H is not None:
+            if not (use_aat and aat_solver is not None and last_used_damping == 0.0 and evaluated_at_final_x and aat_solver.last_cholmod_factor is not None):
+                normal_pattern = _normal_equation_structural_pattern(H)
+                if weighted_residual is not None:
+                    np.multiply(weight, residual, out=weighted_residual)
+                gain, _rhs = build_normal_equations(
+                    H,
+                    residual,
+                    weight,
+                    uniform_weight=uniform_weight,
+                    weights_are_uniform=weights_are_uniform,
+                    weighted_residual=weighted_residual,
+                    normal_pattern=normal_pattern,
+                    assume_normal_pattern_matches=False,
+                )
+        if use_aat and aat_solver is not None and last_used_damping == 0.0 and evaluated_at_final_x and aat_solver.last_cholmod_factor is not None and H is not None:
+            self._last_estimate_cholmod_factor = (id(H), aat_solver.last_cholmod_factor)
+            self._last_estimate_aat_runtime = (aat_solver, aat_plan)
+        else:
+            self._last_estimate_cholmod_factor = None
+
         result = EstimateResult(
             converged=bool(converged and observability.observable),
             iterations=int(iteration),
@@ -3752,6 +3965,7 @@ class HybridStateEstimator:
             measurement_table=measurement_table_take(self._multi_energy_measurement_table, rows),
         )
         result.multi_energy_rows = rows.copy()
+        result._final_lm_damping = float(force_lm_damping)
         self.multi_energy_estimate_result = result
         return result
 
@@ -3979,7 +4193,7 @@ class HybridStateEstimator:
         verbose: bool,
         observability: Optional[ObservabilityResult] = None,
     ) -> Tuple[EstimateResult, List[BadDataItem]]:
-        remove_limit, _per_round_limit = resolve_bad_data_limits(
+        remove_limit, per_round_limit = resolve_bad_data_limits(
             int(self.multi_energy_control_measurement_slice.start),
             max_remove=max_remove,
             max_remove_per_round=max_remove_per_round,
@@ -3987,40 +4201,162 @@ class HybridStateEstimator:
             param_max_remove_per_round=getattr(self.params, "max_remove_per_round", None),
         )
         rows = np.arange(self.multi_energy_measurement_count, dtype=np.int64)
-        x0 = None
-        result = None
-        removed: List[BadDataItem] = []
+        ctrl_start = int(self.multi_energy_control_measurement_slice.start)
         current_observability = observability
-        while True:
-            result = self._estimate_multi_energy(
-                x0=x0,
-                measurement_rows=rows,
-                verbose=verbose,
-                final_diagnostics=True,
-                observability=current_observability,
-            )
-            bad_items, _normalized = self.identify_bad_data(result, threshold)
-            removable = []
+        result = self._estimate_multi_energy(
+            x0=None,
+            measurement_rows=rows,
+            verbose=verbose,
+            final_diagnostics=True,
+            observability=current_observability,
+        )
+        removed: List[BadDataItem] = []
+        if remove_limit <= 0 or (not result.converged and not (result.observability.observable and np.isfinite(result.objective))):
+            return result, removed
+
+        blocked_global_rows: set = set()
+        need_identify = True
+        bad_items: List[BadDataItem] = []
+        normalized = np.empty(0, dtype=np.float64)
+        col_degrees: Optional[np.ndarray] = None
+        local_to_item: Dict[int, BadDataItem] = {}
+        unconverged_streak = 0 if result.converged else 1
+
+        while len(removed) < remove_limit:
+            if need_identify:
+                bad_items, normalized = self.identify_bad_data(result, threshold)
+                cur_w = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
+                cur_act = np.ones(rows.size, dtype=bool)
+                col_degrees = (
+                    compute_active_column_degrees(result.H, cur_act, cur_w)
+                    if result.H is not None
+                    else None
+                )
+                local_to_item = {int(it.row_pos): it for it in bad_items}
+                need_identify = False
+            if not bad_items:
+                break
+
+            cand_locals: List[int] = []
             for item in bad_items:
-                global_row = int(rows[int(item.row_pos)])
-                if global_row < self.multi_energy_control_measurement_slice.start:
-                    removable.append((item, global_row))
-            if not removable or len(removed) >= remove_limit:
+                lpos = int(item.row_pos)
+                if 0 <= lpos < rows.size:
+                    grow = int(rows[lpos])
+                    if grow < ctrl_start and grow not in blocked_global_rows:
+                        cand_locals.append(lpos)
+            if not cand_locals:
                 break
-            worst, global_row = removable[0]
-            trial_rows = rows[rows != global_row]
-            trial_observability = self._multi_energy_observability_analysis(
-                result.x,
-                measurement_rows=trial_rows,
-            )
-            if not trial_observability.observable:
+
+            remaining = remove_limit - len(removed)
+            batch_limit = max(1, min(per_round_limit, remaining))
+            if result.H is not None and len(cand_locals) >= 2 and batch_limit >= 2:
+                cand_norms = [float(normalized[p]) for p in cand_locals]
+                sel_idx = select_independent_bad_data_batch(
+                    result.H,
+                    cand_locals,
+                    cand_norms,
+                    threshold,
+                    min_batch_norm=max(float(threshold), 4.5),
+                    max_batch=batch_limit,
+                    min_hops=3,
+                )
+                selected_locals = [cand_locals[k] for k in sel_idx] if sel_idx else [cand_locals[0]]
+            else:
+                selected_locals = [cand_locals[0]]
+
+            # 列覆盖可观测性保护：禁止把任意状态列的全部支撑量测删空
+            if result.H is not None and col_degrees is not None:
+                safe_pos, _ = filter_batch_preserving_column_coverage(result.H, selected_locals, col_degrees)
+                safe_locals = [selected_locals[k] for k in safe_pos]
+                if not safe_locals:
+                    probe = cand_locals[: min(len(cand_locals), 20)]
+                    p_pos, _ = filter_batch_preserving_column_coverage(result.H, probe, col_degrees)
+                    if p_pos:
+                        safe_locals = [probe[p_pos[0]]]
+            else:
+                safe_locals = selected_locals
+            if not safe_locals:
                 break
-            removed.append(worst)
-            rows = trial_rows
-            x0 = result.x
-            current_observability = trial_observability
-        if result is None:
-            raise RuntimeError("multi-energy bad-data estimation did not start")
+
+            # 结构满秩前置拦截：若删批后导致降秩则折半收缩或跳过临界行
+            trial_locals = list(safe_locals)
+            if result.H is not None:
+                cur_w = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
+                while trial_locals:
+                    t_mask = np.ones(rows.size, dtype=bool)
+                    t_w = cur_w.copy()
+                    t_mask[trial_locals] = False
+                    t_w[trial_locals] = 0.0
+                    if check_active_structural_full_rank(result.H, t_mask, t_w):
+                        break
+                    if len(trial_locals) == 1:
+                        blocked_global_rows.add(int(rows[trial_locals[0]]))
+                        trial_locals = []
+                        break
+                    trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+            if not trial_locals:
+                if len(blocked_global_rows) >= 32:
+                    break
+                continue
+
+            # 带回滚与折半退避的重估：防止误删隐式临界测点导致发散或目标严重恶化
+            accepted_trial = False
+            while trial_locals:
+                drop_mask = np.ones(rows.size, dtype=bool)
+                drop_mask[trial_locals] = False
+                trial_rows = rows[drop_mask]
+                trial_obs = self._multi_energy_observability_analysis(
+                    result.x,
+                    measurement_rows=trial_rows,
+                )
+                if not trial_obs.observable:
+                    if len(trial_locals) == 1:
+                        blocked_global_rows.add(int(rows[trial_locals[0]]))
+                        break
+                    trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+                    continue
+                hint_damp = float(getattr(result, "_final_lm_damping", 0.0))
+                trial_res = self._estimate_multi_energy(
+                    x0=result.x,
+                    measurement_rows=trial_rows,
+                    verbose=verbose,
+                    final_diagnostics=True,
+                    observability=trial_obs,
+                    _hint_lm_damping=hint_damp,
+                )
+                trial_ok = (
+                    np.isfinite(trial_res.objective)
+                    and (
+                        trial_res.converged
+                        or (not result.converged and trial_res.objective < result.objective)
+                    )
+                    and (
+                        not result.converged
+                        or trial_res.objective <= result.objective * 1.05 + 1e-6
+                    )
+                )
+                if trial_ok:
+                    for lp in trial_locals:
+                        removed.append(local_to_item[lp])
+                    rows = trial_rows
+                    result = trial_res
+                    current_observability = trial_obs
+                    unconverged_streak = 0 if result.converged else (unconverged_streak + 1)
+                    need_identify = True
+                    accepted_trial = True
+                    break
+                if len(trial_locals) == 1:
+                    blocked_global_rows.add(int(rows[trial_locals[0]]))
+                    break
+                trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+
+            if not accepted_trial:
+                if not result.converged or len(blocked_global_rows) >= 16:
+                    break
+                continue
+            if unconverged_streak >= 3:
+                break
+
         return result, removed
 
     def _prepare_uncoupled_direct_delegate(self, side: str, profile_start: float) -> "HybridStateEstimator":
@@ -10881,7 +11217,12 @@ class HybridStateEstimator:
         threshold: Optional[float] = None,
     ) -> Tuple[List[BadDataItem], np.ndarray]:
         profile_start = time.perf_counter() if self.profile_enabled else None
-        delegate = self._delegate()
+        # 多能耦合模式的结果包含全局联合状态与 _multi_energy_measurement_table，严禁委派给单侧 AC/DC 子估计器
+        is_multi_energy_result = bool(getattr(self, "fluid_estimators", None)) and (
+            getattr(result, "multi_energy_rows", None) is not None
+            or int(getattr(result.x, "size", -1)) == int(getattr(self, "multi_energy_state_count", -2))
+        )
+        delegate = None if is_multi_energy_result else self._delegate()
         if delegate is not None:
             return delegate.identify_bad_data(result, threshold)
         threshold = self.params.bad_threshold if threshold is None else threshold
@@ -10912,20 +11253,32 @@ class HybridStateEstimator:
             )
             else None
         )
-        sparse_leverage_available = self.n_state <= SEScaleProfile.for_problem(self.n_state).sparse_leverage_max_state and (
+        effective_n_state = (
+            int(result.H.shape[1])
+            if result.H is not None
+            else int(self.multi_energy_state_count if is_multi_energy_result else self.n_state)
+        )
+        sparse_leverage_available = effective_n_state <= SEScaleProfile.for_problem(effective_n_state).sparse_leverage_max_state and (
             cached_factor is not None or CHOLMOD_CHOLESKY is not None
         )
-        if not sparse_leverage_available and self.n_state > 5000 and (
+        if not sparse_leverage_available and effective_n_state > 5000 and (
             result.H is None or (result.gain is None and cached_factor is None)
         ):
             leverage = None
         else:
-            jacobian_measurements = (
-                result.measurements
-                if len(result.measurements) == result.residual.size
-                else getattr(self, "active_measurements", result.measurements)
-            )
-            H = result.H if result.H is not None else self.jacobian_sparse(result.x, jacobian_measurements)
+            if result.H is not None:
+                H = result.H
+            elif is_multi_energy_result:
+                me_rows = getattr(result, "multi_energy_rows", None)
+                H_full = self._multi_energy_jacobian_sparse(result.x)
+                H = H_full[me_rows] if me_rows is not None else H_full
+            else:
+                jacobian_measurements = (
+                    result.measurements
+                    if len(result.measurements) == result.residual.size
+                    else getattr(self, "active_measurements", result.measurements)
+                )
+                H = self.jacobian_sparse(result.x, jacobian_measurements)
             gain = result.gain
             if gain is None and cached_factor is None:
                 gain, _rhs = build_normal_equations(H, result.residual, weights)
@@ -10943,9 +11296,15 @@ class HybridStateEstimator:
                 else None
             )
             leverage = measurement_leverage_for_bad_data(
-                H, gain, cholmod_factor=cached_factor, aat_operand=cached_aat_op
+                H,
+                gain,
+                cholmod_factor=cached_factor,
+                aat_operand=cached_aat_op,
+                dense_state_limit=256 if is_multi_energy_result else 5000,
+                sparse_threshold=256 if is_multi_energy_result else None,
+                sparse_state_limit=500_000 if is_multi_energy_result else None,
             )
-            if leverage is None and gain is None and self.n_state <= 5000:
+            if leverage is None and gain is None and effective_n_state <= (256 if is_multi_energy_result else 5000):
                 # 极少数极端情况稀疏杠杆回退时再兜底构造增益矩阵
                 gain, _rhs = build_normal_equations(H, result.residual, weights)
                 leverage = measurement_leverage_for_bad_data(H, gain)
