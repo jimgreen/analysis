@@ -4506,6 +4506,244 @@ def test_multi_energy_hybrid_ac_dc_gas_reuses_ac_gen_state_col_observable(tmp_pa
     assert obs.rank == est.multi_energy_state_count
 
 
+def test_steam_near_zero_flow_enthalpy_step_escapes_high_damping_lock(tmp_path):
+    """验证含近似零流量管段且两端焓值存在差异的蒸汽网不会锁死在高阻尼慢爬满 200 步。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    e_text = "\n".join(
+        [
+            "<SteamMedium>",
+            "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+            "# 2.1 2500.0 419.0 2800.0 200.0",
+            "</SteamMedium>",
+            "<SteamNode>",
+            "@ idx name pressure enthalpy run_stat",
+            "# 1 sn_1 10.0 3000.0 1",
+            "# 2 sn_2 9.95 2990.0 1",
+            "# 3 sn_3 9.95 2920.0 1",
+            "# 4 sn_4 9.90 2950.0 1",
+            "</SteamNode>",
+            "<SteamSource>",
+            "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+            "# 1 ss_1 1 PRESSURE 10.0 0.0 3000.0 1.0 0.0 50.0 1",
+            "</SteamSource>",
+            "<SteamLoad>",
+            "@ idx name node flow_set condensate_enthalpy run_stat",
+            "# 1 sl_4 4 0.5 419.0 1",
+            "</SteamLoad>",
+            "<SteamPipe>",
+            "@ idx name i_node j_node conductance heat_loss run_stat",
+            "# 1 sp_1_2 1 2 1.5 2e-5 1",
+            "# 2 sp_2_3 2 3 1.5 2e-5 1",
+            "# 3 sp_2_4 2 4 1.5 2e-5 1",
+            "# 4 sp_3_4 3 4 1.5 2e-5 1",
+            "</SteamPipe>",
+        ]
+    )
+    e_path = tmp_path / "steam_zero_flow.e"
+    e_path.write_text(e_text + "\n", encoding="utf-8")
+
+    # 制造节点 2 与节点 3 压差近似 0 但焓值差 90 kJ/kg 的零流量非光滑边界场景
+    m_text = "\n".join(
+        [
+            "<Measurement>",
+            "@ idx name dev_type dev_name meas_type weight valid value",
+            "# 1 m1 SteamNode sn_1 PRESSURE 400.0 1 10.02",
+            "# 2 m2 SteamNode sn_2 PRESSURE 400.0 1 9.95",
+            "# 3 m3 SteamNode sn_3 PRESSURE 400.0 1 9.95",
+            "# 4 m4 SteamNode sn_4 PRESSURE 400.0 1 9.88",
+            "# 5 m5 SteamNode sn_1 ENTHALPY 4.0 1 3010.0",
+            "# 6 m6 SteamNode sn_2 ENTHALPY 4.0 1 3035.0",
+            "# 7 m7 SteamNode sn_3 ENTHALPY 4.0 1 2945.0",
+            "# 8 m8 SteamNode sn_4 ENTHALPY 4.0 1 2960.0",
+            "# 9 m9 SteamPipe sp_1_2 FLOW_FROM 100.0 1 1.0",
+            "# 10 m10 SteamPipe sp_2_3 FLOW_FROM 100.0 1 0.0",
+            "# 11 m11 SteamPipe sp_2_4 FLOW_FROM 100.0 1 0.5",
+            "# 12 m12 SteamPipe sp_3_4 FLOW_FROM 100.0 1 0.5",
+            "# 13 m13 SteamPipe sp_2_3 H_TO 4.0 1 2990.0",
+            "# 14 m14 SteamPipe sp_2_4 H_TO 4.0 1 3030.0",
+            "# 15 m15 SteamPipe sp_3_4 H_TO 4.0 1 2950.0",
+            "</Measurement>",
+        ]
+    )
+    m_path = tmp_path / "steam_zero_flow.meas"
+    m_path.write_text(m_text + "\n", encoding="utf-8")
+
+    net = load_steam_network_from_e_file(str(e_path))
+    est = SteamStateEstimator(net, str(m_path), parameters=SE_PARAMS.with_overrides(max_iter=200), flat_start=True)
+    est.prepare()
+    res = est.estimate()
+    assert res.converged
+    assert res.iterations < 60
+
+
+def test_multi_energy_boundary_voltage_warm_start_recovers_and_converges(tmp_path):
+    """验证多能耦合在电压紧贴下界 voltage_floor 的恶劣初值下不会于 it=1 误判越界，能够投影恢复并收敛。"""
+    hyb_e, hyb_m = _generate_hybrid_case(6, 4, tmp_path)
+    gas_blocks = "\n".join(
+        [
+            "<GasMedium>",
+            "@ density compressibility molar_mass temperature flow_factor",
+            "# 0.8 1.0 0.018 288.15 1.0",
+            "</GasMedium>",
+            "<GasNode>",
+            "@ idx name pressure run_stat",
+            "# 1 gn_1 10.0 1",
+            "# 2 gn_2 9.6 1",
+            "# 3 gn_3 9.2 1",
+            "</GasNode>",
+            "<GasSource>",
+            "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+            "# 1 gs_1 1 PRESSURE 10.0 0.0 1.0 0.0 10.0 1",
+            "</GasSource>",
+            "<GasLoad>",
+            "@ idx name node flow_set run_stat",
+            "# 1 gld_2 2 0.05 1",
+            "# 2 gld_3 3 0.15 1",
+            "</GasLoad>",
+            "<GasPipe>",
+            "@ idx name i_node j_node conductance run_stat",
+            "# 1 gp_1_2 1 2 1.0 1",
+            "# 2 gp_2_3 2 3 1.0 1",
+            "# 3 gp_1_3 1 3 1.0 1",
+            "</GasPipe>",
+        ]
+    )
+    e_path = tmp_path / "me_wall_recover.e"
+    e_path.write_text(hyb_e.read_text(encoding="utf-8") + "\n" + gas_blocks + "\n", encoding="utf-8")
+
+    base_m = [ln for ln in hyb_m.read_text(encoding="utf-8").splitlines() if ln.strip() != "</Measurement>"]
+    max_idx = max(int(ln.split()[1]) for ln in base_m if ln.startswith("#"))
+    for k, (dt, dn, mt, val) in enumerate(
+        [
+            ("GasNode", "gn_1", "PRESSURE", 10.0),
+            ("GasNode", "gn_2", "PRESSURE", 9.6),
+            ("GasNode", "gn_3", "PRESSURE", 9.2),
+            ("GasPipe", "gp_1_2", "FLOW_FROM", 0.5),
+            ("GasPipe", "gp_2_3", "FLOW_FROM", 0.3),
+            ("GasPipe", "gp_1_3", "FLOW_FROM", 0.4),
+        ],
+        start=1,
+    ):
+        base_m.append(f"# {max_idx + k} gm_{k} {dt} {dn} {mt} 100.0 1 {val}")
+    base_m.append("</Measurement>")
+    m_path = tmp_path / "me_wall_recover.meas"
+    m_path.write_text("\n".join(base_m) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(
+        str(e_path),
+        str(m_path),
+        parameters=SE_PARAMS.with_overrides(max_iter=100),
+        flat_start=True,
+        auto_prepare=False,
+    )
+    est.prepare()
+    # 人为构造一个母线电压紧贴 voltage_floor 的贴墙初值，验证线搜索先投影不于 it=1 自杀且能收敛
+    x_wall = est._multi_energy_initial_state()
+    v_cols = est._multi_energy_voltage_cols
+    assert v_cols.size > 0
+    x_wall[v_cols[-1]] = float(est.voltage_floor) + 1e-5
+    res = est._estimate_multi_energy(x0=x_wall)
+    assert res.converged
+    assert res.iterations < 50
+
+
+def test_dc_and_hybrid_warm_start_no_lf_para_dependency(tmp_path):
+    """验证 DC 与 Hybrid 在 flat_start=False 热启动下不依赖磁盘 data/lf/lf.para，稳定完成潮流种子初始化并收敛。"""
+    dc_dir = tmp_path / "dc_warm"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(9, dc_dir, seed=2041)
+    dc_est = DCStateEstimator(
+        dc_e,
+        dc_m,
+        parameters=SE_PARAMS.with_overrides(flat_start=False),
+        flat_start=False,
+    )
+    dc_res = dc_est.estimate()
+    assert dc_res.converged
+
+    hyb_dir = tmp_path / "hyb_warm"
+    hyb_dir.mkdir(parents=True, exist_ok=True)
+    hyb_e, hyb_m = _generate_hybrid_case(8, 4, hyb_dir)
+    hyb_est = HybridStateEstimator(
+        hyb_e,
+        hyb_m,
+        parameters=SE_PARAMS.with_overrides(flat_start=False),
+        flat_start=False,
+    )
+    hyb_res = hyb_est.estimate()
+    assert hyb_res.converged
+
+
+def test_multi_energy_small_dc_steam_transient_zero_col_converges(tmp_path):
+    """验证小规模 DC+Steam 盲区流向翻转产生瞬态零列时，Jacobi 列均衡与零列保护能稳定收敛不奇异退出。"""
+    dc_e, dc_m = _generate_dc_case(5, tmp_path, seed=2042)
+    steam_blocks = "\n".join(
+        [
+            "<SteamMedium>",
+            "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+            "# 2.1 2500.0 419.0 2800.0 200.0",
+            "</SteamMedium>",
+            "<SteamNode>",
+            "@ idx name pressure enthalpy run_stat",
+            "# 1 sn_1 10.0 3000.0 1",
+            "# 2 sn_2 9.8 2980.0 1",
+            "# 3 sn_3 9.7 2960.0 1",
+            "</SteamNode>",
+            "<SteamSource>",
+            "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+            "# 1 ss_1 1 PRESSURE 10.0 0.0 3000.0 1.0 0.0 50.0 1",
+            "</SteamSource>",
+            "<SteamLoad>",
+            "@ idx name node flow_set condensate_enthalpy run_stat",
+            "# 1 sl_3 3 0.3 419.0 1",
+            "</SteamLoad>",
+            "<SteamPipe>",
+            "@ idx name i_node j_node conductance heat_loss run_stat",
+            "# 1 sp_1_2 1 2 1.5 2e-5 1",
+            "# 2 sp_2_3 2 3 1.5 2e-5 1",
+            "</SteamPipe>",
+        ]
+    )
+    e_path = tmp_path / "me_dc_steam_zcol.e"
+    e_path.write_text(dc_e.read_text(encoding="utf-8") + "\n" + steam_blocks + "\n", encoding="utf-8")
+
+    # 省略末端节点 sn_3 的直接 ENTHALPY 量测，并注入反号流量诱发流向翻转形成瞬态零列
+    m_lines = [ln for ln in dc_m.read_text(encoding="utf-8").splitlines() if ln.strip() != "</Measurement>"]
+    max_idx = max(int(ln.split()[1]) for ln in m_lines if ln.startswith("#"))
+    extra = [
+        ("SteamNode", "sn_1", "PRESSURE", 400.0, 10.0),
+        ("SteamNode", "sn_2", "PRESSURE", 400.0, 9.8),
+        ("SteamNode", "sn_3", "PRESSURE", 400.0, 9.7),
+        ("SteamNode", "sn_1", "ENTHALPY", 4.0, 3000.0),
+        ("SteamNode", "sn_2", "ENTHALPY", 4.0, 2980.0),
+        ("SteamPipe", "sp_1_2", "FLOW_FROM", 100.0, 0.3),
+        ("SteamPipe", "sp_2_3", "FLOW_FROM", 100.0, -0.5),
+        ("SteamPipe", "sp_1_2", "H_TO", 4.0, 2980.0),
+        ("SteamPipe", "sp_2_3", "H_TO", 4.0, 2960.0),
+    ]
+    for k, (dt, dn, mt, w, val) in enumerate(extra, start=1):
+        m_lines.append(f"# {max_idx + k} sm_{k} {dt} {dn} {mt} {w} 1 {val}")
+    m_lines.append("</Measurement>")
+    m_path = tmp_path / "me_dc_steam_zcol.meas"
+    m_path.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(
+        str(e_path),
+        str(m_path),
+        parameters=SE_PARAMS.with_overrides(max_iter=100),
+        flat_start=True,
+        auto_prepare=False,
+    )
+    est.prepare()
+    res, _ = est.estimate_with_bad_data_removal()
+    assert res.converged
+
+
+
+
+
 
 
 

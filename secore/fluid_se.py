@@ -2418,6 +2418,8 @@ class FluidStateEstimator:
         lm_damping = max(0.0, float(_hint_lm_damping))
         backtrack_streak = 0
         stagnation_streak = 0
+        high_damp_stagnation_streak = 0
+        high_damp_slow_streak = 0
         fullstep_osc_streak = 0
         curvature_damping_active = False
         prev_max_correction = np.inf
@@ -2472,9 +2474,18 @@ class FluidStateEstimator:
             gain_cur = (H_cur.T @ weighted_H).tocsc()
             rhs_vec = np.asarray(H_cur.T @ (weight * res_cur), dtype=np.float64)
             diag_g = np.asarray(gain_cur.diagonal(), dtype=np.float64)
-            if damping_val > 0.0:
-                gain_reg = (gain_cur + diags(damping_val * np.maximum(diag_g, 1e-12), format="csc")).tocsc()
-                dx_raw, _ = normal_solver.solve(gain_reg, rhs_vec, return_factor_diag=False)
+            zero_diag_mask = diag_g <= 1e-12
+            if damping_val > 0.0 or bool(np.any(zero_diag_mask)):
+                # 小规模同样执行 Jacobi 列均衡 Marquardt 阻尼，并对流向翻转产生的瞬态零列做稳定零位移约束
+                col_scale = np.where(zero_diag_mask, 1.0, 1.0 / np.sqrt(np.maximum(diag_g, 1e-12)))
+                D_scale = diags(col_scale, format="csc")
+                scaled_g = (D_scale @ gain_cur @ D_scale).tocsc()
+                eff_damp = max(damping_val, 1e-6)
+                diag_add = np.where(zero_diag_mask, 1.0 + eff_damp, eff_damp)
+                gain_reg = (scaled_g + diags(diag_add, format="csc")).tocsc()
+                rhs_scaled = np.where(zero_diag_mask, 0.0, rhs_vec * col_scale)
+                dx_scaled, _ = normal_solver.solve(gain_reg, rhs_scaled, return_factor_diag=False)
+                dx_raw = np.where(zero_diag_mask, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
             else:
                 dx_raw, _ = normal_solver.solve(gain_cur, rhs_vec, return_factor_diag=False)
             gain = gain_cur
@@ -2642,28 +2653,59 @@ class FluidStateEstimator:
                 converged = True
                 break
 
-            # 非光滑边界（如上游追踪热损 q=0 翻转台阶）局部极小驻点检测：
-            # 若目标函数 9 位有效数字不变且实际相对位移 <= max(tol, 1e-6)，先做 1 次无阻尼脱困试探，
-            # 试探后仍停滞则确认到达不可微边界极小驻点并优雅退出。
-            if (
+            # 非光滑边界（如零流量管段上游追踪热损/焓值翻转台阶）局部极小驻点与高阻尼锁死脱困检测：
+            # 1) 若上一步刚做完无阻尼脱困试探但目标函数未见实质下降，确认已到达非光滑边界极小驻点并优雅退出；
+            # 2) 若目标函数 9 位有效数字不变且实际相对位移极小，或在高阻尼 (>=1.0) 下连续多步相对降幅极微 (<1e-5)，
+            #    先做 1 次无阻尼脱困试探，试探后仍停滞则优雅收敛，释放外层坏数据剔除流程。
+            rel_obj_tol_high_damp = max(1e-12, 1e-5 * (abs(prev_objective) + 1.0))
+            rel_obj_tol_slow = max(1e-12, 5e-4 * (abs(prev_objective) + 1.0))
+            if tried_undamped_escape:
+                if obj_change <= max(1e-10, 5e-4 * (abs(prev_objective) + 1.0)):
+                    converged = True
+                    break
+                tried_undamped_escape = False
+                stagnation_streak = 0
+                high_damp_stagnation_streak = 0
+                high_damp_slow_streak = 0
+            elif (
                 obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
                 and actual_rel_dx <= max(1e-6, self.tol)
             ):
                 stagnation_streak += 1
-                if tried_undamped_escape:
-                    converged = True
-                    break
                 if stagnation_streak >= 3:
                     if step_damping > 0.0:
                         lm_damping = 0.0
+                        curvature_damping_active = False
                         tried_undamped_escape = True
                         stagnation_streak = 0
+                        high_damp_stagnation_streak = 0
+                        high_damp_slow_streak = 0
                     else:
                         converged = True
                         break
+            elif step_damping >= 1.0 and obj_change <= rel_obj_tol_high_damp:
+                stagnation_streak = 0
+                high_damp_stagnation_streak += 1
+                high_damp_slow_streak += 1
+                if high_damp_stagnation_streak >= 6:
+                    lm_damping = 0.0
+                    curvature_damping_active = False
+                    tried_undamped_escape = True
+                    high_damp_stagnation_streak = 0
+                    high_damp_slow_streak = 0
+            elif step_damping >= 1.0 and obj_change <= rel_obj_tol_slow:
+                stagnation_streak = 0
+                high_damp_stagnation_streak = 0
+                high_damp_slow_streak += 1
+                if high_damp_slow_streak >= 12:
+                    lm_damping = 0.0
+                    curvature_damping_active = False
+                    tried_undamped_escape = True
+                    high_damp_slow_streak = 0
             else:
                 stagnation_streak = 0
-                tried_undamped_escape = False
+                high_damp_stagnation_streak = 0
+                high_damp_slow_streak = 0
 
         if not evaluated_at_final_x:
             if cached_z_est is not None:
@@ -2857,6 +2899,7 @@ class FluidStateEstimator:
                 return res, removed_items
 
             unconverged_streak = 0 if res.converged else 1
+            unconverged_total_rounds = 0 if res.converged else 1
             # 缓存当前状态下的坏数据识别与列覆盖度，跳过临界行或回滚重试时免去重复矩阵求逆
             need_identify = True
             bad_list: List[BadDataItem] = []
@@ -2952,6 +2995,19 @@ class FluidStateEstimator:
                         _weight_override=t_weight,
                         _hint_lm_damping=hint_damp,
                     )
+                    # 热启动未能收敛时自动以平启动重试一次，避免被高阻尼坏初值锁死
+                    if not trial_res.converged:
+                        flat_res = self.estimate(
+                            x0=None,
+                            observability=obs,
+                            _weight_override=t_weight,
+                            _hint_lm_damping=0.0,
+                        )
+                        if flat_res.converged or (
+                            np.isfinite(flat_res.objective)
+                            and (not np.isfinite(trial_res.objective) or flat_res.objective < trial_res.objective)
+                        ):
+                            trial_res = flat_res
                     if self.n_potential > 0:
                         trial_pot = np.maximum(trial_res.x[: self.n_potential], 1e-12)
                         trial_min_p = float(np.min(trial_pot)) ** (1.0 / pw)
@@ -2982,6 +3038,7 @@ class FluidStateEstimator:
                         )
                     )
                     if trial_ok:
+                        prev_obj_accepted = float(res.objective)
                         cur_weight = t_weight
                         active_mask[trial_rows] = False
                         act_tbl = getattr(self.active_measurements, "table", None)
@@ -2997,7 +3054,15 @@ class FluidStateEstimator:
                                     tbl_status[r_idx] = MEAS_STATUS_REMOVED
                             removed_items.append(item)
                         res = trial_res
-                        unconverged_streak = 0 if res.converged else (unconverged_streak + 1)
+                        if res.converged:
+                            unconverged_streak = 0
+                            unconverged_total_rounds = 0
+                        else:
+                            unconverged_total_rounds += 1
+                            if np.isfinite(prev_obj_accepted) and res.objective <= 0.85 * prev_obj_accepted:
+                                unconverged_streak = 0
+                            else:
+                                unconverged_streak += 1
                         need_identify = True
                         accepted_trial = True
                         break
@@ -3010,7 +3075,7 @@ class FluidStateEstimator:
                     if not res.converged or len(blocked_rows_set) >= 16:
                         break
                     continue
-                if unconverged_streak >= 3:
+                if unconverged_streak >= 3 or unconverged_total_rounds >= 10:
                     break
 
             self.bad_data = removed_items

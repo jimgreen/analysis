@@ -2748,11 +2748,18 @@ class DCStateEstimator:
         ppc = DCStateEstimator._power_flow_seed_ppc_from_network(network)
         if ppc is None:
             return False
+        from algorithm_parameters import PowerFlowParameters
+
+        # 显式传入潮流参数对象，避免热启动种子求解在无 data/lf/lf.para 文件时触发 FileNotFoundError
+        lf_params = PowerFlowParameters(
+            tol=seed_tol,
+            max_iter=int(params.power_flow_max_iter),
+            min_voltage=float(params.power_flow_min_voltage),
+            divergence_threshold=1e6,
+        )
         calc = DCPowerFlowCalc(
             ppc,
-            tol=seed_tol,
-            max_iter=params.power_flow_max_iter,
-            min_voltage=params.power_flow_min_voltage,
+            parameters=lf_params,
             result_mode="none",
             linear_solver=getattr(network, "_se_power_flow_linear_solver", None),
         )

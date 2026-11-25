@@ -11410,6 +11410,40 @@ class ACStateEstimator:
             gain = full_normal_equation_from_lower(gain)
             if start is not None:
                 self._record_profile_time("solve.full_gain_from_lower", time.perf_counter() - start)
+        # 有界约束 KKT 驻点核验：若迭代因高阻尼停滞退出但未越界且步长已很小，
+        # 扣除贴死 voltage_floor 且搜索方向继续指向墙外的有效不等式约束分量后，
+        # 若全部核心电压/相角归一化梯度均已满足容差，确认已收敛至有界约束最优解
+        if (
+            (not converged)
+            and (not coarse_stopped)
+            and iteration >= 3
+            and np.isfinite(objective)
+            and max_correction <= 2e-2
+            and H is not None
+            and not _state_out_of_bounds(x)
+        ):
+            w_chk = weight
+            if H.shape[0] == residual.size and w_chk.size == residual.size:
+                rhs_chk = np.asarray(H.T @ (w_chk * residual), dtype=np.float64)
+                if hasattr(H, "power"):
+                    dg_chk = np.asarray(H.power(2).T @ w_chk, dtype=np.float64).ravel()
+                else:
+                    dg_chk = np.asarray(np.sum((H * H) * w_chk[:, None], axis=0), dtype=np.float64).ravel()
+                if rhs_chk.size == x.size and dg_chk.size == x.size:
+                    vc_chk = np.arange(self.n_angle, self.base_switch_re, dtype=np.int64)
+                    ac_chk = np.arange(self.n_angle, dtype=np.int64)
+                    if vc_chk.size:
+                        v_pin = vc_chk[(x[vc_chk] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[vc_chk] < 0.0)]
+                        if v_pin.size:
+                            rhs_chk[v_pin] = 0.0
+                    sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
+                    va_g_chk = 0.0
+                    if vc_chk.size:
+                        va_g_chk = max(va_g_chk, float(np.max(sv_chk[vc_chk])))
+                    if ac_chk.size:
+                        va_g_chk = max(va_g_chk, float(np.max(sv_chk[ac_chk])))
+                    if va_g_chk <= max(1e-4, 100.0 * self.tol):
+                        converged = True
         if observability is None:
             if (converged or coarse_stopped) and aat_solver is not None and aat_solver.last_cholmod_factor is not None:
                 observability = ObservabilityResult(
@@ -12388,6 +12422,23 @@ class ACStateEstimator:
                             masked_weights[r_i] = new_w
                             effective_base_weights[r_i] = new_w
                             boosted = True
+            # 若配额用满后贴墙节点无电压伪量测可提权，但存在把节点电压直接拉死在物理极限墙上的极端离群真实 V 测点，
+            # 将该离群真实 V 测点安全降权至极弱（1e-4，保持列覆盖且不突破 max_remove 配额）以解救发散节点
+            if not boosted and result.residual is not None:
+                for c in ext_cols:
+                    for r in H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]:
+                        r_i = int(r)
+                        if (
+                            active_mask[r_i]
+                            and (not base_is_pseudo[r_i])
+                            and int(mt_arr[r_i]) in VOLTAGE_PSEUDO_MEAS_TYPE_CODES
+                            and masked_weights[r_i] > 1e-3
+                        ):
+                            w_r = float(masked_weights[r_i])
+                            if abs(float(result.residual[r_i])) * np.sqrt(w_r) > max(2.0 * float(threshold), 8.0):
+                                masked_weights[r_i] = 1e-4
+                                effective_base_weights[r_i] = 1e-4
+                                boosted = True
             if not boosted:
                 return False
             weight_boosted = True
@@ -12429,14 +12480,14 @@ class ACStateEstimator:
 
         while True:
             if len(removed) >= max_remove:
-                if rescue_rounds < 3 and _try_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break
             if (
                 (not result.converged)
                 and (not bool(getattr(result, "_coarse_stopped", False)))
-                and rescue_rounds < 3
+                and rescue_rounds < 6
                 and unconverged_total_rounds >= 6
                 and len(bad_items) < 32
                 and _try_boundary_node_rescue()
@@ -12448,7 +12499,7 @@ class ACStateEstimator:
                 and (not bool(getattr(result, "_coarse_stopped", False)))
                 and (unconverged_stall_rounds >= 8 or unconverged_total_rounds >= 20)
             ):
-                if rescue_rounds < 3 and _try_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break

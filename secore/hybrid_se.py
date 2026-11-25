@@ -3643,8 +3643,7 @@ class HybridStateEstimator:
                     dx_out = np.asarray(dx_raw, dtype=np.float64)
                 return dx_out, rhs_vec, diag_g
 
-            if normal_pattern is None and is_sparse_matrix(H_cur):
-                normal_pattern = _normal_equation_structural_pattern(H_cur)
+            # 多能耦合中流体上游追踪的雅可比非零模式可随流向翻转动态变化，不复用过期的静态 normal_pattern
             if weighted_residual is not None:
                 np.multiply(weight, res_cur, out=weighted_residual)
             gain_cur, rhs_vec = build_normal_equations(
@@ -3654,23 +3653,37 @@ class HybridStateEstimator:
                 uniform_weight=uniform_weight,
                 weights_are_uniform=weights_are_uniform,
                 weighted_residual=weighted_residual,
-                normal_pattern=normal_pattern,
+                normal_pattern=None,
                 assume_normal_pattern_matches=False,
             )
             gain = gain_cur
             if is_sparse_matrix(gain_cur):
                 diag_g = np.asarray(gain_cur.diagonal(), dtype=np.float64)
-                if damping_val > 0.0:
-                    damped_g = (gain_cur.tocsc() + diags(damping_val * np.maximum(diag_g, 1e-12), format="csc")).tocsc()
-                    dx_raw, _ = normal_solver.solve(damped_g, rhs_vec, return_factor_diag=False)
+                zero_diag_mask = diag_g <= 1e-12
+                if damping_val > 0.0 or bool(np.any(zero_diag_mask)):
+                    # 小规模同样采用 Jacobi 列均衡 Marquardt 阻尼，对流向翻转产生的瞬态全零列固定零位移
+                    col_scale = np.where(zero_diag_mask, 1.0, 1.0 / np.sqrt(np.maximum(diag_g, 1e-12)))
+                    D_scale = diags(col_scale, format="csc")
+                    scaled_g = (D_scale @ gain_cur.tocsc() @ D_scale).tocsc()
+                    eff_damp = max(damping_val, 1e-6)
+                    diag_add = np.where(zero_diag_mask, 1.0 + eff_damp, eff_damp)
+                    damped_g = (scaled_g + diags(diag_add, format="csc")).tocsc()
+                    rhs_scaled = np.where(zero_diag_mask, 0.0, rhs_vec * col_scale)
+                    dx_scaled, _ = normal_solver.solve(damped_g, rhs_scaled, return_factor_diag=False)
+                    dx_raw = np.where(zero_diag_mask, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
                 else:
                     dx_raw, _ = normal_solver.solve(gain_cur, rhs_vec, return_factor_diag=False)
             else:
                 diag_g = np.asarray(np.diag(gain_cur), dtype=np.float64)
-                if damping_val > 0.0:
-                    damped_g = np.array(gain_cur, dtype=np.float64, copy=True)
-                    damped_g[np.diag_indices_from(damped_g)] += damping_val * np.maximum(diag_g, 1e-12)
-                    dx_raw, _ = normal_solver.solve(damped_g, rhs_vec, return_factor_diag=False)
+                zero_diag_mask = diag_g <= 1e-12
+                if damping_val > 0.0 or bool(np.any(zero_diag_mask)):
+                    col_scale = np.where(zero_diag_mask, 1.0, 1.0 / np.sqrt(np.maximum(diag_g, 1e-12)))
+                    scaled_g = np.asarray(gain_cur, dtype=np.float64) * col_scale[:, None] * col_scale[None, :]
+                    eff_damp = max(damping_val, 1e-6)
+                    scaled_g[np.diag_indices_from(scaled_g)] += np.where(zero_diag_mask, 1.0 + eff_damp, eff_damp)
+                    rhs_scaled = np.where(zero_diag_mask, 0.0, rhs_vec * col_scale)
+                    dx_scaled, _ = normal_solver.solve(scaled_g, rhs_scaled, return_factor_diag=False)
+                    dx_raw = np.where(zero_diag_mask, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
                 else:
                     dx_raw, _ = normal_solver.solve(gain_cur, rhs_vec, return_factor_diag=False)
             return np.asarray(dx_raw, dtype=np.float64), rhs_vec, diag_g
@@ -3680,6 +3693,8 @@ class HybridStateEstimator:
         backtrack_streak = 0
         fullstep_osc_streak = 0
         stagnation_streak = 0
+        high_damp_stagnation_streak = 0
+        low_progress_streak = 0
         curvature_damping_active = force_lm_damping > 0.0
         tried_undamped_escape = False
         prev_scaled_correction = np.inf
@@ -3729,15 +3744,30 @@ class HybridStateEstimator:
                 break
 
             last_used_damping = step_damping
-            max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
+            # 有效下界约束投影：已紧贴 voltage_floor 且搜索方向继续指向墙外的电压分量，其投影步长与投影梯度均为 0
+            eff_dx = dx
+            eff_rhs = rhs
+            if me_v_cols.size and dx.size:
+                v_at_floor = x[me_v_cols] <= (float(self.voltage_floor) + 1e-5)
+                if bool(np.any(v_at_floor)):
+                    pinned_dx = me_v_cols[v_at_floor & (dx[me_v_cols] < 0.0)]
+                    if pinned_dx.size:
+                        eff_dx = dx.copy()
+                        eff_dx[pinned_dx] = 0.0
+                    if rhs is not None and rhs.size == dx.size:
+                        pinned_rhs = me_v_cols[v_at_floor & (rhs[me_v_cols] < 0.0)]
+                        if pinned_rhs.size:
+                            eff_rhs = rhs.copy()
+                            eff_rhs[pinned_rhs] = 0.0
+            max_correction = float(np.max(np.abs(eff_dx))) if eff_dx.size else 0.0
             scaled_correction = (
-                float(np.max(np.abs(dx) / np.maximum(1.0, np.abs(x))))
-                if dx.size
+                float(np.max(np.abs(eff_dx) / np.maximum(1.0, np.abs(x))))
+                if eff_dx.size
                 else 0.0
             )
             kkt_inf = (
-                float(np.max(np.abs(rhs) / np.maximum(diag_g, 1.0)))
-                if (rhs is not None and diag_g is not None and rhs.size > 0)
+                float(np.max(np.abs(eff_rhs) / np.maximum(diag_g, 1.0)))
+                if (eff_rhs is not None and diag_g is not None and eff_rhs.size > 0)
                 else np.inf
             )
             if step_damping == 0.0 and scaled_correction < self.tol:
@@ -3775,12 +3805,13 @@ class HybridStateEstimator:
             oob_trials = 0
             for _attempt in range(20):
                 raw_candidate = x + step_scale * dx
-                if _me_state_out_of_bounds(raw_candidate):
+                if not np.all(np.isfinite(raw_candidate)):
                     oob_trials += 1
                     if oob_trials >= 3:
                         break
                     step_scale *= 0.5
                     continue
+                # 先投影下界（如 voltage_floor / 流体势能下界 / 蒸汽焓下界），避免电压贴近下界轻碰时在 it=1 误判越界
                 candidate = self._apply_multi_energy_state_bounds(raw_candidate)
                 if _me_state_out_of_bounds(candidate):
                     oob_trials += 1
@@ -3797,6 +3828,11 @@ class HybridStateEstimator:
                 candidate_objective = self._weighted_objective(weight, candidate_residual)
                 if np.isfinite(candidate_objective) and candidate_objective <= objective + obj_tol:
                     relative_objective_change = abs(objective - candidate_objective) / max(1.0, abs(objective))
+                    actual_scaled_dx = (
+                        float(np.max(np.abs(candidate - x) / np.maximum(np.abs(x), 1.0)))
+                        if x.size
+                        else 0.0
+                    )
                     x = candidate
                     z_est, candidate_z_est = candidate_z_est, z_est
                     residual, candidate_residual = candidate_residual, residual
@@ -3836,7 +3872,7 @@ class HybridStateEstimator:
                 break
 
             obj_change = abs(previous_objective - objective)
-            actual_scaled_dx = step_scale * scaled_correction
+            # actual_scaled_dx 已在投影后按 ||candidate - x|| 精确计算，准确识别贴墙零位移驻点
             # 自适应阻尼调节：识别香蕉谷交替回溯与满步慢发散，温和切入/放松曲率阻尼
             if step_scale >= 0.5:
                 backtrack_streak = max(0, backtrack_streak - 1)
@@ -3872,14 +3908,22 @@ class HybridStateEstimator:
                     backtrack_streak = 0
             prev_scaled_correction = scaled_correction
 
-            # 带阻尼稳态停滞与平底谷驻点检测
+            # 带阻尼稳态停滞、平底谷与高阻尼非光滑脊线脱困检测
+            rel_obj_tol_high_damp = max(1e-12, 1e-5 * (abs(previous_objective) + 1.0))
+            rel_obj_tol_flat = max(1e-12, 1e-6 * (abs(previous_objective) + 1.0))
+            if obj_change <= rel_obj_tol_flat:
+                low_progress_streak += 1
+            else:
+                low_progress_streak = 0
             if tried_undamped_escape:
-                if obj_change <= max(1e-10, 1e-6 * (abs(previous_objective) + 1.0)):
+                if obj_change <= max(1e-10, 1e-4 * (abs(previous_objective) + 1.0)):
                     # 无阻尼脱困试探未能令目标函数实质下降，确认已到达非光滑局部极小驻点
                     stationary = True
                 else:
                     tried_undamped_escape = False
                     stagnation_streak = 0
+                    high_damp_stagnation_streak = 0
+                    low_progress_streak = 0
             elif (
                 step_damping > 0.0
                 and scaled_correction < 1e-3
@@ -3898,10 +3942,29 @@ class HybridStateEstimator:
                         curvature_damping_active = False
                         tried_undamped_escape = True
                         stagnation_streak = 0
+                        high_damp_stagnation_streak = 0
                     else:
                         stationary = True
+            elif step_damping >= 1.0 and obj_change <= rel_obj_tol_high_damp:
+                stagnation_streak = 0
+                high_damp_stagnation_streak += 1
+                if high_damp_stagnation_streak >= 6:
+                    force_lm_damping = 0.0
+                    curvature_damping_active = False
+                    tried_undamped_escape = True
+                    high_damp_stagnation_streak = 0
+            elif low_progress_streak >= 10:
+                # 连续 10 步目标函数 6 位以上无实质变化（如高盲区贴墙微幅弹跳），触发无阻尼脱困或确认驻点收敛
+                low_progress_streak = 0
+                if step_damping > 0.0:
+                    force_lm_damping = 0.0
+                    curvature_damping_active = False
+                    tried_undamped_escape = True
+                else:
+                    stationary = True
             else:
                 stagnation_streak = 0
+                high_damp_stagnation_streak = 0
 
             if stationary:
                 converged = True
@@ -4221,6 +4284,18 @@ class HybridStateEstimator:
         col_degrees: Optional[np.ndarray] = None
         local_to_item: Dict[int, BadDataItem] = {}
         unconverged_streak = 0 if result.converged else 1
+        unconverged_total_rounds = 0 if result.converged else 1
+        failed_trial_solves = 0
+        v_cols_me = np.asarray(getattr(self, "_multi_energy_voltage_cols", np.asarray([], dtype=np.int64)), dtype=np.int64)
+
+        def _warm_start_is_healthy(state_vec: Optional[np.ndarray]) -> bool:
+            if state_vec is None or not state_vec.size or not np.all(np.isfinite(state_vec)):
+                return False
+            if v_cols_me.size:
+                vp = state_vec[v_cols_me]
+                if float(vp.min()) < 0.5 or float(vp.max()) > 1.5:
+                    return False
+            return True
 
         while len(removed) < remove_limit:
             if need_identify:
@@ -4315,15 +4390,31 @@ class HybridStateEstimator:
                         break
                     trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
                     continue
-                hint_damp = float(getattr(result, "_final_lm_damping", 0.0))
+                use_warm = _warm_start_is_healthy(result.x)
+                hint_damp = float(getattr(result, "_final_lm_damping", 0.0)) if use_warm else 0.0
                 trial_res = self._estimate_multi_energy(
-                    x0=result.x,
+                    x0=result.x if use_warm else None,
                     measurement_rows=trial_rows,
                     verbose=verbose,
                     final_diagnostics=True,
                     observability=trial_obs,
                     _hint_lm_damping=hint_damp,
                 )
+                # 热启动未收敛或极早异常退出时，自动以健康平启动重试一次以脱离坏初值陷阱
+                if use_warm and (not trial_res.converged):
+                    flat_res = self._estimate_multi_energy(
+                        x0=None,
+                        measurement_rows=trial_rows,
+                        verbose=verbose,
+                        final_diagnostics=True,
+                        observability=trial_obs,
+                        _hint_lm_damping=0.0,
+                    )
+                    if flat_res.converged or (
+                        np.isfinite(flat_res.objective)
+                        and (not np.isfinite(trial_res.objective) or flat_res.objective < trial_res.objective)
+                    ):
+                        trial_res = flat_res
                 trial_ok = (
                     np.isfinite(trial_res.objective)
                     and (
@@ -4336,25 +4427,41 @@ class HybridStateEstimator:
                     )
                 )
                 if trial_ok:
+                    prev_obj_accepted = float(result.objective)
                     for lp in trial_locals:
                         removed.append(local_to_item[lp])
                     rows = trial_rows
                     result = trial_res
                     current_observability = trial_obs
-                    unconverged_streak = 0 if result.converged else (unconverged_streak + 1)
+                    if result.converged:
+                        unconverged_streak = 0
+                        unconverged_total_rounds = 0
+                    else:
+                        unconverged_total_rounds += 1
+                        if np.isfinite(prev_obj_accepted) and result.objective <= 0.85 * prev_obj_accepted:
+                            # 删坏后目标函数显著下降，说明正在精准剔除真坏数据，重置连续未收敛停滞计数
+                            unconverged_streak = 0
+                        else:
+                            unconverged_streak += 1
+                    failed_trial_solves = 0
                     need_identify = True
                     accepted_trial = True
                     break
+                if not trial_res.converged:
+                    failed_trial_solves += 1
+                    if failed_trial_solves >= 4:
+                        # 连续多次删坏重估均不收敛，立即熔断回滚至最优已收敛解，防止连跑数十次满步迭代
+                        break
                 if len(trial_locals) == 1:
                     blocked_global_rows.add(int(rows[trial_locals[0]]))
                     break
                 trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
 
             if not accepted_trial:
-                if not result.converged or len(blocked_global_rows) >= 16:
+                if not result.converged or len(blocked_global_rows) >= 16 or failed_trial_solves >= 4:
                     break
                 continue
-            if unconverged_streak >= 3:
+            if unconverged_streak >= 3 or unconverged_total_rounds >= 10:
                 break
 
         return result, removed
@@ -10295,6 +10402,8 @@ class HybridStateEstimator:
         factor_is_current_weights = True
         force_lm_damping = 0.0
         micro_step_streak = 0
+        slow_micro_streak = 0
+        high_damp_flat_streak = 0
         backtrack_streak = 0
         curvature_damping_active = False
         curvature_probe_steps = 0
@@ -10792,9 +10901,33 @@ class HybridStateEstimator:
                     backtrack_streak = 0
                     prev_step_accepted = False
                     continue
+                # 阻尼已达上限 (100.0) 且任意微步均无法再降目标函数：若核心电压/相角处于健康边界内
+                # 且有效无约束方向的归一化梯度极小（扣除紧贴 voltage_floor 且指向墙外的有效不等式约束分量），
+                # 确认已到达局部极小驻点并优雅收敛
+                if (
+                    not _hybrid_state_out_of_bounds(x)
+                    and max_correction <= 1e-2
+                    and rhs is not None
+                    and rhs.size > 0
+                ):
+                    diag_g_st = aat_solver.unregularized_diagonal() if (solved_via_aat and aat_solver is not None) else None
+                    if diag_g_st is not None and diag_g_st.size == rhs.size:
+                        eff_rhs_st = rhs.copy()
+                        if v_cols.size:
+                            v_pinned = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-5) & (eff_rhs_st[v_cols] < 0.0)]
+                            if v_pinned.size:
+                                eff_rhs_st[v_pinned] = 0.0
+                        scaled_vec_st = np.abs(eff_rhs_st) / np.maximum(diag_g_st, 1.0)
+                        va_g_st = 0.0
+                        if v_cols.size:
+                            va_g_st = max(va_g_st, float(np.max(scaled_vec_st[v_cols])))
+                        if a_cols.size:
+                            va_g_st = max(va_g_st, float(np.max(scaled_vec_st[a_cols])))
+                        if va_g_st <= max(5e-3, 5000.0 * self.tol):
+                            converged = True
                 final_quantities_current = factor_is_current_weights
                 if verbose:
-                    _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, False)
+                    _print_iteration(iteration, objective, residual_inf, max_correction, step_scale, converged)
                 break
             if _hybrid_state_out_of_bounds(x):
                 final_quantities_current = False
@@ -10868,6 +11001,18 @@ class HybridStateEstimator:
                 elif accepted_step is not None and accepted_step < 0.5 and max_correction > 10.0 * self.tol:
                     micro_step_streak = 0
                     fullstep_osc_streak = 0
+                    if accepted_step < 0.05 and objective_change <= max(1e-12, 1e-4 * (abs(previous_objective) + 1.0)):
+                        slow_micro_streak += 1
+                        if slow_micro_streak >= 10 and solved_via_aat and aat_solver is not None:
+                            # 持续小步长锯齿慢爬（如电流幅值量测轻载锥尖）：主动加大曲率阻尼跳出微步锁死
+                            force_lm_damping = min(10.0, max(float(force_lm_damping) * 5.0, 1.0))
+                            curvature_damping_active = True
+                            curvature_probe_steps = 0
+                            curvature_probe_interval = max(curvature_probe_interval, 8)
+                            slow_micro_streak = 0
+                            prev_step_accepted = False
+                    else:
+                        slow_micro_streak = 0
                     backtrack_streak += 4
                     if backtrack_streak >= 12 and solved_via_aat and aat_solver is not None:
                         if force_lm_damping < 10.0:
@@ -10887,7 +11032,7 @@ class HybridStateEstimator:
                         backtrack_streak = max(0, backtrack_streak - 1)
                         if (
                             (not curvature_damping_active)
-                            and max_correction > 1e-2
+                            and max_correction > 1e-3
                             and max_correction >= 0.85 * last_step_max_correction
                             and objective_change <= 1e-3 * (abs(previous_objective) + 1.0)
                         ):
@@ -10997,6 +11142,20 @@ class HybridStateEstimator:
                     flat_valley_streak = 0
             elif not is_curvature_probe:
                 flat_valley_streak = 0
+            # 高阻尼微步平底谷检测（如电流幅值量测极轻载锥尖）：阻尼 >= 1.0 且连续 8 步目标 5 位无变化且实际位移 <= 1e-2
+            if (
+                (not damped_kkt_stagnation_ok)
+                and step_damping >= 1.0
+                and accepted_step is not None
+                and (accepted_step * max_correction) <= 1e-2
+                and objective_change <= max(1e-12, 1e-5 * (abs(previous_objective) + 1.0))
+                and not _hybrid_state_out_of_bounds(x)
+            ):
+                high_damp_flat_streak += 1
+                if high_damp_flat_streak >= 8:
+                    damped_kkt_stagnation_ok = True
+            else:
+                high_damp_flat_streak = 0
             practically_converged = (
                 (used_frozen_step or step_damping == 0.0 or damped_kkt_ok)
                 and max_correction < 10.0 * self.tol
@@ -11049,6 +11208,36 @@ class HybridStateEstimator:
             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
             if start is not None:
                 self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        # 有界约束 KKT 驻点核验：扣除紧贴 voltage_floor 且指向墙外的有效下界约束分量后，
+        # 若全部核心电压/相角归一化梯度均已满足容差，确认已收敛至有界约束最优解
+        if (
+            (not converged)
+            and (not coarse_stopped)
+            and iteration >= 3
+            and np.isfinite(objective)
+            and max_correction <= 2e-2
+            and H is not None
+            and not _hybrid_state_out_of_bounds(x)
+        ):
+            if H.shape[0] == residual.size and weight.size == residual.size:
+                rhs_chk = np.asarray(H.T @ (weight * residual), dtype=np.float64)
+                if is_sparse_matrix(H):
+                    dg_chk = np.asarray(H.power(2).T @ weight, dtype=np.float64).ravel()
+                else:
+                    dg_chk = np.asarray(np.sum((H * H) * weight[:, None], axis=0), dtype=np.float64).ravel()
+                if rhs_chk.size == x.size and dg_chk.size == x.size:
+                    if v_cols.size:
+                        v_pin = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[v_cols] < 0.0)]
+                        if v_pin.size:
+                            rhs_chk[v_pin] = 0.0
+                    sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
+                    va_g_chk = 0.0
+                    if v_cols.size:
+                        va_g_chk = max(va_g_chk, float(np.max(sv_chk[v_cols])))
+                    if a_cols.size:
+                        va_g_chk = max(va_g_chk, float(np.max(sv_chk[a_cols])))
+                    if va_g_chk <= max(1e-4, 100.0 * self.tol):
+                        converged = True
         cached_cholmod_factor = None
         factor_deferred = False
         inplace_factor_modified = bool(factor_is_current_weights)
