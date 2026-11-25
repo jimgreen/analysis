@@ -5586,3 +5586,65 @@ def check_active_structural_full_rank(
         return False
     return int(sparse_structural_rank(sub)) >= n_cols
 
+
+def build_switch_current_curvature_columns(
+    n_state: int,
+    sw_rows: np.ndarray,
+    col_re: np.ndarray,
+    col_im: np.ndarray,
+    x: np.ndarray,
+    residual: np.ndarray,
+    weight: np.ndarray,
+    *,
+    min_curv: float = 1e-2,
+) -> Tuple[Optional[SP_CSC_MATRIX], bool]:
+    """为零阻抗支路/断路器电流幅值负残差测点构造精确秩 1 半正定二阶曲率列矩阵 V_curv。
+
+    对电流幅值量测 h(I) = sqrt(I_re^2 + I_im^2) 且残差 r = z - |I| < 0：
+        -w * r * nabla^2 |I| = (w * (-r) / |I|) * t * t^T >= 0,
+    其中切向单位向量 t = (-I_im / |I|, I_re / |I|)^T。
+    将该精确半正定二阶曲率项以额外稀疏列 V_curv 追加到 A_csc 右侧（使 A A^T + V V^T 成为
+    精确半正定二阶牛顿海森矩阵），其稀疏非零模式是原正规方程的严格子集，能彻底消除轻载零阻抗
+    支路在 I ≈ 0 锥尖附近的 50~100 倍 Gauss-Newton 切向过冲振荡。
+    为保证相邻迭代可复用符号分析，V_curv 固定保留 sw_rows.size 列与每列 2 个排序后的非零位置，
+    仅在存在满足 curv > min_curv 的活跃负残差测点时返回 (V_csc, True)，否则短路返回 (None, False)。
+    """
+    k = int(sw_rows.size)
+    if k <= 0 or n_state <= 0:
+        return None, False
+    w_s = weight[sw_rows]
+    r_s = residual[sw_rows]
+    neg_mask = (w_s > 0.0) & (r_s < 0.0)
+    if not np.any(neg_mask):
+        return None, False
+    ire = x[col_re]
+    iim = x[col_im]
+    imag = np.hypot(ire, iim)
+    active = neg_mask & (imag > 1e-12)
+    if not np.any(active):
+        return None, False
+    curv = np.zeros(k, dtype=np.float64)
+    curv[active] = (w_s[active] * (-r_s[active])) / imag[active]
+    sig_mask = curv > float(min_curv)
+    if not np.any(sig_mask):
+        return None, False
+    amp = np.zeros(k, dtype=np.float64)
+    amp[sig_mask] = np.sqrt(curv[sig_mask]) / imag[sig_mask]
+    v_re = -amp * iim
+    v_im = amp * ire
+    # 保证每列行号严格升序（通常 col_re < col_im，此处显式兼容一般顺序）
+    swap = col_re > col_im
+    row0 = np.where(swap, col_im, col_re).astype(np.int32, copy=False)
+    row1 = np.where(swap, col_re, col_im).astype(np.int32, copy=False)
+    val0 = np.where(swap, v_im, v_re)
+    val1 = np.where(swap, v_re, v_im)
+    indices = np.empty(2 * k, dtype=np.int32)
+    indices[0::2] = row0
+    indices[1::2] = row1
+    data = np.empty(2 * k, dtype=np.float64)
+    data[0::2] = val0
+    data[1::2] = val1
+    indptr = np.arange(0, 2 * k + 1, 2, dtype=np.int32)
+    return SP_CSC_MATRIX((data, indices, indptr), shape=(int(n_state), k)), True
+
+

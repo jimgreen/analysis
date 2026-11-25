@@ -7905,10 +7905,69 @@ class DCStateEstimator:
                 x0 = result.x.copy()
             return any_progressed
 
+        flat_fallback_tried = bool(self.flat_start)
+
+        def _try_dc_flat_start_fallback() -> bool:
+            """热启动叠加坏数据未收敛时，在当前活跃量测集上执行一次平启动兜底重算。"""
+            nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
+            nonlocal x0, flat_fallback_tried, unconverged_stall_rounds, unconverged_total_rounds
+            if result.converged or flat_fallback_tried:
+                return False
+            flat_fallback_tried = True
+            x_flat = self.initial_state(flat=True)
+            flat_res = self.estimate(
+                base_plan_tables,
+                x0=x_flat,
+                verbose=verbose,
+                _defer_observability=True,
+                _weight_override=masked_weights,
+                _value_override=masked_values,
+                _shared_aat_solver=shared_aat_solver,
+                _shared_aat_plan=shared_aat_plan,
+            )
+            prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
+            flat_obj = float(flat_res.objective) if np.isfinite(flat_res.objective) else float("inf")
+            if not (flat_res.converged or (np.isfinite(flat_obj) and flat_obj < 0.8 * prev_obj)):
+                return False
+            result = flat_res
+            if _can_warm_start_from(result):
+                x0 = result.x.copy()
+            fac_p = getattr(self, "_last_estimate_cholmod_factor", None)
+            cur_factor = fac_p[1] if (isinstance(fac_p, tuple) and len(fac_p) == 2 and fac_p[0] == id(result)) else None
+            cur_leverage = None
+            _reset_anchor(result, cur_factor, None)
+            bad_items = []
+            normalized = None
+            full_normalized_valid = False
+            unconverged_stall_rounds = 0
+            unconverged_total_rounds = 0
+            return True
+
+        def _prioritize_unconverged_candidates(cands: List[BadDataItem]) -> List[BadDataItem]:
+            """未收敛态下抑制近临界健康测点因 1-h_ii -> 0 放大的假阳性，优先按加权残差 sqrt(w)*|r| 剔除显性坏数据。"""
+            if result.converged or len(cands) <= 1:
+                return cands
+            scored = []
+            for item in cands:
+                rp = int(getattr(item, "row_pos", -1))
+                w_i = float(masked_weights[rp]) if 0 <= rp < n_base else float(getattr(item.measurement, "weight", 0.0))
+                r_i = (
+                    float(result.residual[rp])
+                    if (result.residual is not None and 0 <= rp < result.residual.size)
+                    else float(item.residual)
+                )
+                scored.append((abs(r_i) * float(np.sqrt(max(w_i, 0.0))), item))
+            strong = [pair for pair in scored if pair[0] > float(threshold)]
+            chosen = strong if strong else scored
+            chosen.sort(key=lambda pair: pair[0], reverse=True)
+            return [pair[1] for pair in chosen]
+
         while True:
             if len(removed) >= max_remove:
                 if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
+                    continue
+                if _try_dc_flat_start_fallback():
                     continue
                 break
             if (
@@ -7923,6 +7982,8 @@ class DCStateEstimator:
                 if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
+                if _try_dc_flat_start_fallback():
+                    continue
                 break
             round_idx += 1
             if verbose:
@@ -7930,12 +7991,12 @@ class DCStateEstimator:
                     f"Bad-data removal round {round_idx}: "
                     f"measurements={int(np.count_nonzero(active_mask))}"
                 )
-            candidates = [
+            candidates = _prioritize_unconverged_candidates([
                 item
                 for item in bad_items
                 if (int(item.measurement.idx), str(item.measurement.name)) not in protected_keys
                 and not (0 <= int(getattr(item, "row_pos", -1)) < n_base and bool(base_is_pseudo[int(item.row_pos)]))
-            ]
+            ])
             if not candidates:
                 if not full_normalized_valid:
                     _refresh_exact_factor_for_current()
@@ -7951,12 +8012,12 @@ class DCStateEstimator:
                     _reset_anchor(result, cur_factor, cur_leverage)
                     for item in bad_items:
                         item.row_pos = int(keep_rows_cur[int(item.row_pos)])
-                    candidates = [
+                    candidates = _prioritize_unconverged_candidates([
                         item
                         for item in bad_items
                         if (int(item.measurement.idx), str(item.measurement.name)) not in protected_keys
                         and not (0 <= int(getattr(item, "row_pos", -1)) < n_base and bool(base_is_pseudo[int(item.row_pos)]))
-                    ]
+                    ])
                     if not candidates:
                         if result.converged:
                             self._last_bad_data_cache = (id(final_res), float(threshold), list(bad_items), normalized)
@@ -8420,7 +8481,11 @@ class DCStateEstimator:
                 if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
+                if _try_dc_flat_start_fallback():
+                    continue
                 break
+        if not result.converged and _try_dc_flat_start_fallback():
+            pass
         if not full_normalized_valid:
             _refresh_exact_factor_for_current()
         final_res, final_norm = _finalize_masked_result(result, cur_factor, normalized)

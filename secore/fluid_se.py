@@ -2430,6 +2430,61 @@ class FluidStateEstimator:
         self.observability = result
         return result
 
+    def state_base_scales(self) -> np.ndarray:
+        """构造流体状态向量的物理特征基准向量 D_x（用于求解空间内生无量纲标幺化，外部输入输出保持有名值不变）。"""
+        cached = getattr(self, "_cached_state_base_scales", None)
+        net = self.network
+        cache_key = (id(net), int(self.state_count))
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        scales = np.ones(int(self.state_count), dtype=np.float64)
+        if self.state_count <= 0:
+            self._cached_state_base_scales = (cache_key, scales)
+            return scales
+
+        # 1. 节点压力势能基准：p_base^potential_power（使势能标幺值归一化至 O(1)）
+        if self.n_potential > 0:
+            p_vals = np.asarray(net.node_pressure, dtype=np.float64)
+            p_pos = p_vals[np.isfinite(p_vals) & (p_vals > 1e-6)]
+            p_base = float(np.median(p_pos)) if p_pos.size else 1.0
+            pot_base = max(p_base ** int(net.potential_power), 1e-6)
+            scales[: self.n_potential] = pot_base
+
+        # 2. 受控管段流量基准：取管段设定/源/负荷特征流量中位数（下限 1.0 防零流除零）
+        if self.n_regulated > 0:
+            f_samples = []
+            for arr in (
+                getattr(net, "edge_flow_set", None),
+                getattr(net, "source_flow_set", None),
+                getattr(net, "demand", None),
+            ):
+                if arr is not None:
+                    a = np.abs(np.asarray(arr, dtype=np.float64))
+                    a = a[np.isfinite(a) & (a > 1e-6)]
+                    if a.size:
+                        f_samples.append(a)
+            f_base = float(np.median(np.concatenate(f_samples))) if f_samples else 1.0
+            f_base = max(f_base, 1.0)
+            scales[self.base_regulated_flow : self.base_supply_temperature] = f_base
+
+        # 3. 热网供/回水温度基准：T_base
+        if net.thermal and self.base_enthalpy > self.base_temperature:
+            t_arr = np.abs(np.asarray(net.initial_temperature_state, dtype=np.float64))
+            t_pos = t_arr[np.isfinite(t_arr) & (t_arr > 1.0)]
+            t_base = max(float(np.median(t_pos)) if t_pos.size else 50.0, 1.0)
+            scales[self.base_temperature : self.base_enthalpy] = t_base
+
+        # 4. 蒸汽网比焓基准：h_base（典型值 ~2800-3000 kJ/kg，标幺后 O(1)）
+        if net.steam and self.state_count > self.base_enthalpy:
+            h_arr = np.abs(np.asarray(net.node_enthalpy, dtype=np.float64))
+            h_pos = h_arr[np.isfinite(h_arr) & (h_arr > 1.0)]
+            h_base = max(float(np.median(h_pos)) if h_pos.size else 2500.0, 1.0)
+            scales[self.base_enthalpy :] = h_base
+
+        self._cached_state_base_scales = (cache_key, scales)
+        return scales
+
     def estimate(
         self,
         *,
@@ -2485,8 +2540,10 @@ class FluidStateEstimator:
         last_used_damping = 0.0
         self._last_aat_solver = None
         self._last_weight_used = weight
+        state_scales = self.state_base_scales()
 
         def _solve_step(H_cur: csr_matrix, res_cur: np.ndarray, damping_val: float):
+            """在无量纲标幺状态空间 x_pu = x / D_x 下组装并求解正规方程，再还原物理增量 dx = D_x * dx_pu。"""
             nonlocal aat_plan, gain
             if use_aat and aat_solver is not None and H_cur.nnz > 0:
                 if not H_cur.has_sorted_indices:
@@ -2501,53 +2558,65 @@ class FluidStateEstimator:
                     copy_rhs=False,
                     assume_pattern_matches=True,
                 )
-                diag_g = np.bincount(
-                    A_csc.indices,
-                    weights=A_csc.data * A_csc.data,
+                # 标幺化：A_pu = D_x * A_csc, rhs_pu = D_x * rhs_vec（对无阻尼步与阻尼步均消除跨物理量尺度差）
+                A_pu = A_csc.copy()
+                A_pu.data = A_csc.data * state_scales[A_csc.indices]
+                rhs_pu = rhs_vec * state_scales
+                diag_pu = np.bincount(
+                    A_pu.indices,
+                    weights=A_pu.data * A_pu.data,
                     minlength=self.state_count,
                 )
+                diag_g = diag_pu / np.maximum(state_scales * state_scales, 1e-24)
                 if damping_val > 0.0:
-                    # Jacobi 列均衡 + Marquardt 相对阻尼，保证压力/流量/温度/焓值跨量纲尺度不变
-                    col_scale = 1.0 / np.sqrt(np.maximum(diag_g, 1e-12))
-                    A_scaled = A_csc.copy()
-                    A_scaled.data = A_csc.data * col_scale[A_csc.indices]
-                    rhs_scaled = rhs_vec * col_scale
+                    # 在标幺正规方程上叠加 Jacobi 列均衡 Marquardt 相对阻尼
+                    col_scale = 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12))
+                    A_scaled = A_pu.copy()
+                    A_scaled.data = A_pu.data * col_scale[A_pu.indices]
+                    rhs_scaled = rhs_pu * col_scale
                     dx_scaled, _ = aat_solver.solve(
                         A_scaled,
                         rhs_scaled,
                         return_factor_diag=False,
                         damping=damping_val,
                     )
-                    dx_out = np.asarray(dx_scaled, dtype=np.float64) * col_scale
+                    dx_pu = np.asarray(dx_scaled, dtype=np.float64) * col_scale
                 else:
                     dx_raw, _ = aat_solver.solve(
-                        A_csc,
-                        rhs_vec,
+                        A_pu,
+                        rhs_pu,
                         return_factor_diag=False,
                         damping=0.0,
                     )
-                    dx_out = np.asarray(dx_raw, dtype=np.float64)
+                    dx_pu = np.asarray(dx_raw, dtype=np.float64)
+                dx_out = dx_pu * state_scales
                 return dx_out, rhs_vec, diag_g
-            weighted_H = diags(weight) @ H_cur
-            gain_cur = (H_cur.T @ weighted_H).tocsc()
-            rhs_vec = np.asarray(H_cur.T @ (weight * res_cur), dtype=np.float64)
-            diag_g = np.asarray(gain_cur.diagonal(), dtype=np.float64)
-            zero_diag_mask = diag_g <= 1e-12
+            # 中小规模路径同样在标幺状态空间 H_pu = H * D_x 组装良态正规方程
+            H_pu = H_cur.copy()
+            if H_pu.nnz > 0:
+                H_pu.data = H_cur.data * state_scales[H_cur.indices]
+            weighted_H_pu = diags(weight) @ H_pu
+            gain_pu = (H_pu.T @ weighted_H_pu).tocsc()
+            rhs_pu = np.asarray(H_pu.T @ (weight * res_cur), dtype=np.float64)
+            rhs_vec = rhs_pu / np.maximum(state_scales, 1e-12)
+            diag_pu = np.asarray(gain_pu.diagonal(), dtype=np.float64)
+            diag_g = diag_pu / np.maximum(state_scales * state_scales, 1e-24)
+            zero_diag_mask = diag_pu <= 1e-12
             if damping_val > 0.0 or bool(np.any(zero_diag_mask)):
-                # 小规模同样执行 Jacobi 列均衡 Marquardt 阻尼，并对流向翻转产生的瞬态零列做稳定零位移约束
-                col_scale = np.where(zero_diag_mask, 1.0, 1.0 / np.sqrt(np.maximum(diag_g, 1e-12)))
+                col_scale = np.where(zero_diag_mask, 1.0, 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12)))
                 D_scale = diags(col_scale, format="csc")
-                scaled_g = (D_scale @ gain_cur @ D_scale).tocsc()
+                scaled_g = (D_scale @ gain_pu @ D_scale).tocsc()
                 eff_damp = max(damping_val, 1e-6)
                 diag_add = np.where(zero_diag_mask, 1.0 + eff_damp, eff_damp)
                 gain_reg = (scaled_g + diags(diag_add, format="csc")).tocsc()
-                rhs_scaled = np.where(zero_diag_mask, 0.0, rhs_vec * col_scale)
+                rhs_scaled = np.where(zero_diag_mask, 0.0, rhs_pu * col_scale)
                 dx_scaled, _ = normal_solver.solve(gain_reg, rhs_scaled, return_factor_diag=False)
-                dx_raw = np.where(zero_diag_mask, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
+                dx_pu = np.where(zero_diag_mask, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
             else:
-                dx_raw, _ = normal_solver.solve(gain_cur, rhs_vec, return_factor_diag=False)
-            gain = gain_cur
-            return np.asarray(dx_raw, dtype=np.float64), rhs_vec, diag_g
+                dx_pu, _ = normal_solver.solve(gain_pu, rhs_pu, return_factor_diag=False)
+            dx_raw = np.asarray(dx_pu, dtype=np.float64) * state_scales
+            gain = None
+            return dx_raw, rhs_vec, diag_g
 
         for iteration in range(1, self.max_iter + 1):
             if cached_z_est is not None:
@@ -2806,6 +2875,7 @@ class FluidStateEstimator:
             measurement_table=active_table,
         )
         result._final_lm_damping = float(lm_damping)
+        result._state_base_scales = state_scales
         self.result = result
         self._write_back_state(x)
         return result
@@ -2843,16 +2913,26 @@ class FluidStateEstimator:
                 dtype=bool,
             )
 
-        # 使用精确杠杆 h_ii = diag(H G^-1 H^T) 计算标准化残差 r_N = |r_i| / sqrt(1/w_i - h_ii)
+        # 使用精确杠杆 h_ii = diag(H G^-1 H^T) = diag(H_pu G_pu^-1 H_pu^T) 在标幺良态空间计算标准化残差
         leverage = None
         if result.H is not None and result.gain is not None and result.H.shape[0] == n_meas and self.state_count > 0:
             cached_solver = getattr(self, "_last_aat_solver", None)
             cached_fac = cached_solver.last_cholmod_factor if cached_solver is not None else None
             cached_op = cached_solver.last_normal_operand if cached_solver is not None else None
+            state_scales = getattr(result, "_state_base_scales", None)
+            if state_scales is None or np.asarray(state_scales).size != int(result.H.shape[1]):
+                state_scales = self.state_base_scales()
+            state_scales = np.asarray(state_scales, dtype=np.float64)
+            H_csr = result.H if getattr(result.H, "format", None) == "csr" else result.H.tocsr()
+            H_pu = H_csr.copy()
+            if H_pu.nnz > 0:
+                H_pu.data = H_csr.data * state_scales[H_csr.indices]
+            D_s = diags(state_scales, format="csc")
+            gain_pu = (D_s @ result.gain.tocsc() @ D_s).tocsr()
             try:
                 leverage = measurement_leverage_for_bad_data(
-                    result.H,
-                    result.gain,
+                    H_pu,
+                    gain_pu,
                     cholmod_factor=cached_fac,
                     aat_operand=cached_op,
                     dense_state_limit=256,

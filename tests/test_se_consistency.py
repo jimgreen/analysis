@@ -5292,6 +5292,373 @@ def test_measurement_prefilter_fluid_and_para_file_configuration(tmp_path: Path)
     assert pref_reasons[12] == "dead_island"
 
 
+def test_fluid_and_multi_energy_internal_pu_scaling_preserves_physical_io(tmp_path):
+    """验证流体单域与电-气多能联合求解空间无量纲标幺化：外部输入输出有名值不变、坏数据杠杆精确一致。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    # 1. 蒸汽单域大跨度量级验证（压力 ~10 MPa、比焓 ~3000 kJ/kg、流量 ~0.25）
+    steam_e = tmp_path / "steam_pu.e"
+    steam_e.write_text(
+        "\n".join(
+            [
+                "<SteamMedium>",
+                "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+                "# 2.1 2500.0 419.0 2800.0 200.0",
+                "</SteamMedium>",
+                "<SteamNode>",
+                "@ idx name pressure enthalpy run_stat",
+                "# 1 sn_1 10.0 3000.0 1",
+                "# 2 sn_2 9.8 2985.0 1",
+                "# 3 sn_3 9.6 2970.0 1",
+                "</SteamNode>",
+                "<SteamSource>",
+                "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+                "# 1 ss_1 1 PRESSURE 10.0 0.0 3000.0 1.0 0.0 50.0 1",
+                "</SteamSource>",
+                "<SteamLoad>",
+                "@ idx name node flow_set condensate_enthalpy run_stat",
+                "# 1 sl_2 2 0.20 419.0 1",
+                "# 2 sl_3 3 0.20 419.0 1",
+                "</SteamLoad>",
+                "<SteamPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat",
+                "# 1 sp_1_2 1 2 1.2 2e-5 1",
+                "# 2 sp_2_3 2 3 1.2 2e-5 1",
+                "# 3 sp_1_3 1 3 0.8 2e-5 1",
+                "</SteamPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    steam_m = tmp_path / "steam_pu.meas"
+    steam_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value",
+                "# 1 m1 SteamNode sn_1 PRESSURE 400.0 1 10.0",
+                "# 2 m2 SteamNode sn_2 PRESSURE 400.0 1 9.8",
+                "# 3 m3 SteamNode sn_3 PRESSURE 400.0 1 9.6",
+                "# 4 m4 SteamNode sn_1 ENTHALPY 4.0 1 3000.0",
+                "# 5 m5 SteamNode sn_2 ENTHALPY 4.0 1 2985.0",
+                "# 6 m6 SteamNode sn_3 ENTHALPY 4.0 1 2970.0",
+                "# 7 m7 SteamPipe sp_1_2 FLOW_FROM 100.0 1 0.25",
+                "# 8 m8 SteamPipe sp_2_3 FLOW_FROM 100.0 1 0.10",
+                "# 9 m9 SteamPipe sp_1_3 FLOW_FROM 100.0 1 0.15",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    s_net = load_steam_network_from_e_file(str(steam_e))
+    s_est = SteamStateEstimator(s_net, str(steam_m), parameters=SE_PARAMS, flat_start=False)
+    s_est.prepare()
+    # 先用真值构造严格自洽的量测，再注入 1 条比焓大坏数据
+    x_true = s_est.initial_state()
+    z_true = s_est.evaluate(x_true, s_est.active_measurements)
+    s_base = s_est.state_base_scales()
+    assert s_base.size == x_true.size
+    assert float(s_base.max()) > 1000.0  # 比焓基准 ~3000 kJ/kg
+    assert float(s_base.min()) < 100.0   # 压力/流量基准远小于比焓
+    meas_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for idx_i, (m_obj, zv) in enumerate(zip(s_est.active_measurements, z_true), start=1):
+        val = float(zv) + (180.0 if idx_i == 6 else 0.0)
+        meas_lines.append(
+            f"# {idx_i} m{idx_i} {m_obj.device_type} {m_obj.device_name} {m_obj.meas_type} {m_obj.weight} 1 {val:.6f}"
+        )
+    # 额外为 sn_3 增加一条健康比焓冗余量测，保证坏数据可辨识
+    meas_lines.append(f"# 10 m10 SteamNode sn_3 ENTHALPY 4.0 1 {float(z_true[5]):.6f}")
+    meas_lines.append("</Measurement>")
+    steam_m.write_text("\n".join(meas_lines) + "\n", encoding="utf-8")
+
+    s_est2 = SteamStateEstimator(load_steam_network_from_e_file(str(steam_e)), str(steam_m), parameters=SE_PARAMS, flat_start=True)
+    res_s, rem_s = s_est2.estimate_with_bad_data_removal(threshold=3.5, max_remove=3)
+    assert res_s.converged
+    assert [int(it.measurement.idx) for it in rem_s] == [6]
+    # 外部状态向量与网络物理有名值必须保持原始量纲（比焓 ~3000、压力 ~10）
+    assert np.allclose(res_s.x, x_true, rtol=1e-4, atol=1e-3)
+    assert float(s_est2.network.nodes[0].pressure) == pytest.approx(10.0, abs=1e-2)
+    assert float(s_est2.network.nodes[0].enthalpy) == pytest.approx(3000.0, abs=1.0)
+
+    # 2. 电-气多能联合标幺化：电侧基准严格为 1.0，气侧基准按势能自动归一，外部输出有名值严格一致
+    me_e = tmp_path / "me_pu.e"
+    me_e.write_text(
+        "\n".join(
+            [
+                "<Model>",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100.0 kV MW kA",
+                "</Model>",
+                "<ACNode>",
+                "@ idx name vbase voltage angle isl run_stat",
+                "# 1 ac_1 110.0 110.0 0.0 1 1",
+                "# 2 ac_2 110.0 109.5 -1.0 1 1",
+                "# 3 ac_3 110.0 109.0 -2.0 1 1",
+                "</ACNode>",
+                "<ACBranch>",
+                "@ idx name i_node j_node r x b run_stat",
+                "# 1 br_1_2 1 2 0.01 0.05 0.002 1",
+                "# 2 br_2_3 2 3 0.01 0.05 0.002 1",
+                "# 3 br_1_3 1 3 0.015 0.06 0.002 1",
+                "</ACBranch>",
+                "<ACGenerator>",
+                "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                "# 1 g1 1 SLACK 0.0 0.0 110.0 1.0 1",
+                "</ACGenerator>",
+                "<ACLoad>",
+                "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                "# 1 ld2 2 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+                "# 2 ld3 3 0.2 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+                "</ACLoad>",
+                "<GasMedium>",
+                "@ density compressibility molar_mass temperature flow_factor",
+                "# 0.8 1.0 0.018 288.15 1.0",
+                "</GasMedium>",
+                "<GasNode>",
+                "@ idx name pressure run_stat",
+                "# 1 gn_1 80.0 1",
+                "# 2 gn_2 79.0 1",
+                "# 3 gn_3 78.0 1",
+                "</GasNode>",
+                "<GasSource>",
+                "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+                "# 1 gs_1 1 PRESSURE 80.0 0.0 1.0 0.0 50.0 1",
+                "</GasSource>",
+                "<GasLoad>",
+                "@ idx name node flow_set run_stat",
+                "# 1 gl_2 2 0.5 1",
+                "# 2 gl_3 3 0.5 1",
+                "</GasLoad>",
+                "<GasPipe>",
+                "@ idx name i_node j_node conductance run_stat",
+                "# 1 gp_1_2 1 2 1.0 1",
+                "# 2 gp_2_3 2 3 1.0 1",
+                "# 3 gp_1_3 1 3 0.8 1",
+                "</GasPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    me_m = tmp_path / "me_pu.meas"
+    me_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value",
+                "# 1 m1 ACNode ac_1 V 100.0 1 110.0",
+                "# 2 m2 ACNode ac_2 V 100.0 1 109.5",
+                "# 3 m3 ACNode ac_3 V 100.0 1 109.0",
+                "# 4 m4 ACBranch br_1_2 P_FROM 100.0 1 20.0",
+                "# 5 m5 ACBranch br_1_2 Q_FROM 100.0 1 5.0",
+                "# 6 m6 ACBranch br_2_3 P_FROM 100.0 1 10.0",
+                "# 7 m7 ACBranch br_2_3 Q_FROM 100.0 1 2.0",
+                "# 8 m8 ACBranch br_1_3 P_FROM 100.0 1 20.0",
+                "# 9 m9 ACBranch br_1_3 Q_FROM 100.0 1 5.0",
+                "# 10 m10 GasNode gn_1 PRESSURE 400.0 1 80.0",
+                "# 11 m11 GasNode gn_2 PRESSURE 400.0 1 79.0",
+                "# 12 m12 GasNode gn_3 PRESSURE 400.0 1 78.0",
+                "# 13 m13 GasPipe gp_1_2 FLOW_FROM 100.0 1 1.0",
+                "# 14 m14 GasPipe gp_2_3 FLOW_FROM 100.0 1 0.5",
+                "# 15 m15 GasPipe gp_1_3 FLOW_FROM 100.0 1 1.0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    me_est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS, flat_start=False)
+    me_est.prepare()
+    me_base = me_est._multi_energy_state_base_scales()
+    gas_sl = me_est.fluid_state_slices["gas"]
+    assert np.allclose(me_base[: gas_sl.start], 1.0)
+    assert float(me_base[gas_sl].max()) > 1000.0  # 气网压力平方 p^2 ~ 6400
+    ac_sub = me_est._ac_sub_estimator
+    gas_sub = me_est.fluid_estimators["gas"]
+    x_ac_true = ac_sub.initial_state(flat=False)
+    x_gas_true = gas_sub.initial_state()
+    z_ac_true = ac_sub.evaluate(x_ac_true, ac_sub.active_measurements)
+    z_gas_true = gas_sub.evaluate(x_gas_true, gas_sub.active_measurements)
+    ac_idx_arr = np.asarray(ac_sub.active_measurements.table.idx, dtype=np.int64)
+    z_by_idx = {int(mid): float(zv) for mid, zv in zip(ac_idx_arr, z_ac_true)}
+    for m_obj, zv in zip(gas_sub.active_measurements, z_gas_true):
+        z_by_idx[int(m_obj.idx)] = float(zv)
+    # 注入一条气网压力坏数据（+12 MPa）并保留一条冗余压力量测
+    me_specs = [
+        ("ACNode", "ac_1", "V", 100.0, 110.0),
+        ("ACNode", "ac_2", "V", 100.0, 110.0),
+        ("ACNode", "ac_3", "V", 100.0, 110.0),
+        ("ACBranch", "br_1_2", "P_FROM", 100.0, 100.0),
+        ("ACBranch", "br_1_2", "Q_FROM", 100.0, 100.0),
+        ("ACBranch", "br_2_3", "P_FROM", 100.0, 100.0),
+        ("ACBranch", "br_2_3", "Q_FROM", 100.0, 100.0),
+        ("ACBranch", "br_1_3", "P_FROM", 100.0, 100.0),
+        ("ACBranch", "br_1_3", "Q_FROM", 100.0, 100.0),
+        ("GasNode", "gn_1", "PRESSURE", 400.0, 1.0),
+        ("GasNode", "gn_2", "PRESSURE", 400.0, 1.0),
+        ("GasNode", "gn_3", "PRESSURE", 400.0, 1.0),
+        ("GasPipe", "gp_1_2", "FLOW_FROM", 100.0, 1.0),
+        ("GasPipe", "gp_2_3", "FLOW_FROM", 100.0, 1.0),
+        ("GasPipe", "gp_1_3", "FLOW_FROM", 100.0, 1.0),
+    ]
+    me_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for idx_i, (dt, dn, mt, wt, scale) in enumerate(me_specs, start=1):
+        val = z_by_idx[idx_i] * scale
+        if idx_i == 12:
+            val += 12.0
+        me_lines.append(f"# {idx_i} m{idx_i} {dt} {dn} {mt} {wt} 1 {val:.6f}")
+    me_lines.append(f"# 16 m16 GasNode gn_3 PRESSURE 400.0 1 {z_by_idx[12]:.6f}")
+    me_lines.append("</Measurement>")
+    me_m.write_text("\n".join(me_lines) + "\n", encoding="utf-8")
+
+    me_est2 = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS, flat_start=True)
+    res_me, rem_me = me_est2.estimate_with_bad_data_removal(threshold=3.5, max_remove=3)
+    assert res_me.converged
+    assert [str(it.measurement.name) for it in rem_me] == ["m12"]
+    va_len = int(ac_sub.base_switch_re)
+    assert np.allclose(res_me.x[:va_len], x_ac_true[:va_len], rtol=1e-4, atol=1e-4)
+    assert np.allclose(res_me.x[gas_sl], x_gas_true, rtol=1e-4, atol=1e-2)
+    assert float(me_est2.fluid_estimators["gas"].network.nodes[0].pressure) == pytest.approx(80.0, abs=1e-2)
+
+
+def test_switch_current_exact_curvature_and_jacobi_damping_soft_cap(tmp_path):
+    """验证零阻抗支路电流幅值负残差精确秩 1 半正定二阶曲率修正及 Jacobi 阻尼软限幅。"""
+    from scipy.sparse import csc_matrix
+    from secore.se_math import CholmodAAtNormalEquationSolver, build_switch_current_curvature_columns
+
+    # 1. 单元测试曲率列构造：正残差短路返回 None，负残差精确匹配 (w*(-r)/|I|) * t * t^T
+    x_vec = np.array([0.0, 1.0, 0.03, 0.04], dtype=np.float64)  # |I| = 0.05, t = (-0.8, 0.6)
+    sw_rows = np.array([0], dtype=np.int64)
+    col_re = np.array([2], dtype=np.int64)
+    col_im = np.array([3], dtype=np.int64)
+    w_vec = np.array([2000.0], dtype=np.float64)
+
+    V_pos, has_pos = build_switch_current_curvature_columns(4, sw_rows, col_re, col_im, x_vec, np.array([0.05]), w_vec)
+    assert not has_pos and V_pos is None
+
+    V_neg, has_neg = build_switch_current_curvature_columns(4, sw_rows, col_re, col_im, x_vec, np.array([-0.05]), w_vec)
+    assert has_neg and V_neg is not None
+    expected_curv = (2000.0 * 0.05) / 0.05
+    t = np.array([0.0, 0.0, -0.8, 0.6], dtype=np.float64)
+    assert np.allclose((V_neg @ V_neg.T).toarray(), expected_curv * np.outer(t, t), atol=1e-12)
+
+    # 2. 单元测试 Jacobi 缩放空间保持严格原值阻尼：damping=0.5 与 damping=10.0 均精确按调用方阻尼求解
+    A_het = csc_matrix(np.diag([1.0, 1e4]))
+    rhs_het = np.array([1.0, 1e8], dtype=np.float64)
+    solver = CholmodAAtNormalEquationSolver()
+    sol_half, _ = solver.solve(A_het, rhs_het, damping=0.5)
+    # diag(G) = [1, 1e8], G_sc = I, (I + 0.5 I) y = [1, 1e4] -> x = [1/1.5, 1/1.5]
+    assert np.allclose(sol_half, np.array([1.0 / 1.5, 1.0 / 1.5]), rtol=1e-10)
+    sol_ten, _ = solver.solve(A_het, rhs_het, damping=10.0)
+    # 严格原值阻尼 (I + 10.0 I) y = [1, 1e4] -> x = [1/11.0, 1/11.0]
+    assert np.allclose(sol_ten, np.array([1.0 / 11.0, 1.0 / 11.0]), rtol=1e-10)
+
+    # 3. 端到端含轻载零阻抗支路与矛盾功率/电流坏数据的 AC 场景：补齐精确曲率后快速稳定收敛
+    e_path = tmp_path / "ac_zb_curv.e"
+    e_path.write_text(
+        "\n".join(
+            [
+                "<Model>",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100.0 kV MW kA",
+                "</Model>",
+                "<ACNode>",
+                "@ idx name vbase voltage angle isl run_stat",
+                "# 1 b1 110.0 110.0 0.0 1 1",
+                "# 2 b2 110.0 110.0 0.0 1 1",
+                "# 3 b3 110.0 109.8 -0.2 1 1",
+                "</ACNode>",
+                "<ACZeroBranch>",
+                "@ idx name i_node j_node run_stat",
+                "# 1 zb_1_2 1 2 1",
+                "</ACZeroBranch>",
+                "<ACBranch>",
+                "@ idx name i_node j_node r x b run_stat",
+                "# 1 br_2_3 2 3 0.01 0.05 0.002 1",
+                "# 2 br_1_3 1 3 0.01 0.05 0.002 1",
+                "</ACBranch>",
+                "<ACGenerator>",
+                "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                "# 1 g1 1 SLACK 0.0 0.0 110.0 1.0 1",
+                "</ACGenerator>",
+                "<ACLoad>",
+                "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                "# 1 ld3 3 0.001 1.0 0.0 0.0 0.0005 1.0 0.0 0.0 1",
+                "</ACLoad>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # 故意在轻载零阻抗支路上给高权重矛盾功率 Q_FROM=-15 MW 与极小电流幅值 I_FROM=0.0002 kA（无坏数据剔除，强制在锥尖求解）
+    m_path = tmp_path / "ac_zb_curv.meas"
+    m_path.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value",
+                "# 1 m1 ACNode b1 V 2000.0 1 110.0",
+                "# 2 m2 ACNode b2 V 2000.0 1 110.0",
+                "# 3 m3 ACNode b3 V 2000.0 1 109.99",
+                "# 4 m4 ACZeroBranch zb_1_2 Q_FROM 2000.0 1 -15.0",
+                "# 5 m5 ACZeroBranch zb_1_2 I_FROM 2000.0 1 0.0002",
+                "# 6 m6 ACBranch br_2_3 P_FROM 500.0 1 0.05",
+                "# 7 m7 ACBranch br_2_3 Q_FROM 500.0 1 0.025",
+                "# 8 m8 ACBranch br_1_3 P_FROM 500.0 1 0.05",
+                "# 9 m9 ACBranch br_1_3 Q_FROM 500.0 1 0.025",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    est = ACStateEstimator(e_path, m_path, parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    res = est.estimate()
+    assert res.converged
+    assert res.iterations < 40
+
+
+def test_unconverged_bdr_prioritization_and_warm_start_flat_fallback(tmp_path):
+    """验证热启动失稳自动平启动兜底，以及带坏数据未收敛态 BDR 优先剔除真大坏数据而非近临界健康量测。"""
+    # 1. 构造含强坏数据且人为将热启动初始电压/相角拉至偏远恶劣点的交流场景，
+    #    验证 flat_start=False 也能自动平启动兜底收敛并精准剔除真坏数据
+    ac_dir = tmp_path / "ac_warm_fb"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(9, ac_dir, seed=2035)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    bad_idx = None
+    for ln in lines:
+        if ln.startswith("#") and " ACBranch " in ln and " P_FROM " in ln and bad_idx is None:
+            parts = ln.split()
+            bad_idx = int(parts[1])
+            parts[-1] = f"{float(parts[-1]) + 250.0:.6f}"
+            edited.append(" ".join(parts))
+        else:
+            edited.append(ln)
+    ac_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+    assert bad_idx is not None
+
+    est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS, flat_start=False)
+    est.prepare()
+    # 故意将热启动初始电压拉至偏离真值的恶劣边界并叠加相角大幅扰动
+    est.file_voltage[:] = 0.55
+    est.file_theta[:] = np.linspace(-1.2, 1.2, est.n_nodes)
+    res, rem = est.estimate_with_bad_data_removal(threshold=3.5, max_remove=5)
+    assert res.converged
+    assert [int(item.measurement.idx) for item in rem] == [bad_idx]
+
+    # 2. 验证在 max_iter=2 的未收敛状态下，BDR 第一轮即优先选中注入的大坏数据（而非误删其他健康量测）
+    est_short = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(max_iter=2), flat_start=True)
+    _, rem_short = est_short.estimate_with_bad_data_removal(threshold=3.5, max_remove=3)
+    assert len(rem_short) >= 1
+    assert int(rem_short[0].measurement.idx) == bad_idx
+
+
+
 
 
 

@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from scipy.sparse import coo_matrix, csr_matrix, issparse
+from scipy.sparse import coo_matrix, csr_matrix, hstack as sp_hstack, issparse
 from scipy.sparse.csgraph import connected_components as sp_connected_components
 from scipy.sparse.csgraph import maximum_bipartite_matching as sp_maximum_bipartite_matching
 
@@ -138,6 +138,7 @@ from secore.se_math import (
     SparseJacobianBuilder,
     angle_residual_mask,
     build_normal_equations,
+    build_switch_current_curvature_columns,
     check_active_structural_full_rank,
     compute_active_column_degrees,
     compute_normalized_residuals_for_bad_data,
@@ -10575,6 +10576,7 @@ class ACStateEstimator:
         curvature_damping_active = False
         curvature_probe_steps = 0
         curvature_probe_interval = 2
+        last_regular_obj_drop = 0.0
         fullstep_osc_streak = 0
         damped_nonshrink_streak = 0
         curv_stagnation_streak = 0
@@ -10598,6 +10600,18 @@ class ACStateEstimator:
         v_max_bound = float(self.voltage_max)
         a_min_bound = float(self.angle_min_rad)
         a_max_bound = float(self.angle_max_rad)
+
+        # 预提取零阻抗支路/断路器电流幅值测点，供负残差锥尖附近精确秩 1 半正定二阶曲率修正使用
+        sw_curv_rows = np.asarray([], dtype=np.int64)
+        sw_curv_col_re = np.asarray([], dtype=np.int64)
+        sw_curv_col_im = np.asarray([], dtype=np.int64)
+        if int(getattr(self, "n_switch_current", 0)) > 0:
+            zc_plan = self._vector_plans_for_measurement_plan_tables(measurement_plan_tables).get("zero_current")
+            if zc_plan is not None and zc_plan["current_rows"].size > 0:
+                sw_curv_rows = np.asarray(zc_plan["current_rows"], dtype=np.int64)
+                sw_cidx = np.asarray(zc_plan["current_idx"], dtype=np.int64)
+                sw_curv_col_re = int(self.base_switch_re) + sw_cidx
+                sw_curv_col_im = int(self.base_switch_im) + sw_cidx
 
         def _dx_needs_lm_guard(dx_vec: np.ndarray, *, strict_step: bool = True) -> bool:
             """判断无阻尼步是否非有限、剧烈过冲或直接越出物理电压允许范围 [voltage_min, voltage_max]。"""
@@ -10665,6 +10679,7 @@ class ACStateEstimator:
 
             used_frozen_step = False
             used_woodbury_step = False
+            used_sw_curv = False
             is_curvature_probe = False
             cur_rhs_inf = np.inf
             rhs = None
@@ -10934,9 +10949,23 @@ class ACStateEstimator:
                     else float(force_lm_damping)
                 )
                 if normal_operand is not None and aat_solver is not None:
+                    solve_operand = normal_operand
+                    if sw_curv_rows.size > 0:
+                        V_curv, has_sw_curv = build_switch_current_curvature_columns(
+                            self.n_state,
+                            sw_curv_rows,
+                            sw_curv_col_re,
+                            sw_curv_col_im,
+                            x,
+                            residual,
+                            weight,
+                        )
+                        if has_sw_curv and V_curv is not None:
+                            solve_operand = sp_hstack([normal_operand, V_curv], format="csc")
+                            used_sw_curv = True
                     use_fast_lm_handoff = step_damping == 0.0 and self.n_state >= 500
                     dx, _ = aat_solver.solve(
-                        normal_operand,
+                        solve_operand,
                         rhs,
                         return_factor_diag=False,
                         damping=step_damping,
@@ -10952,7 +10981,7 @@ class ACStateEstimator:
                     if step_damping == 0.0 and _dx_needs_lm_guard(dx, strict_step=True):
                         for beta_try in (1e-2, 1e-1, 1.0, 10.0):
                             dx_lm, _ = aat_solver.solve(
-                                normal_operand,
+                                solve_operand,
                                 rhs,
                                 return_factor_diag=False,
                                 damping=beta_try,
@@ -10964,8 +10993,23 @@ class ACStateEstimator:
                                 if not _dx_needs_lm_guard(dx, strict_step=False):
                                     break
                 else:
+                    solve_gain = gain
+                    if sw_curv_rows.size > 0 and solve_gain is not None:
+                        V_curv, has_sw_curv = build_switch_current_curvature_columns(
+                            self.n_state,
+                            sw_curv_rows,
+                            sw_curv_col_re,
+                            sw_curv_col_im,
+                            x,
+                            residual,
+                            weight,
+                        )
+                        if has_sw_curv and V_curv is not None:
+                            curv_term = V_curv @ V_curv.T
+                            solve_gain = (solve_gain + curv_term).tocsc() if issparse(solve_gain) else (solve_gain + curv_term.toarray())
+                            used_sw_curv = True
                     dx, _ = normal_solver.solve(
-                        gain,
+                        solve_gain,
                         rhs,
                         return_factor_diag=False,
                     )
@@ -10973,7 +11017,7 @@ class ACStateEstimator:
                     self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
                 frozen_steps = 0
                 wb_solver = None
-                factor_is_current_weights = True
+                factor_is_current_weights = not used_sw_curv
                 if dx.size and not np.all(np.isfinite(dx)):
                     final_quantities_current = False
                     break
@@ -11037,6 +11081,27 @@ class ACStateEstimator:
                     oob_candidates += 1
                     # 严禁为避开单个越界节点把全局步长压成贴墙微步空转：最多折半 3 次即切向 LM 阻尼或判发散退出
                     if oob_candidates >= 3:
+                        # 仅在阻尼上限近驻点时，若个别电压节点紧贴边界墙向墙外推，尝试一次边界投影裁剪释放其余节点收敛
+                        if (
+                            force_lm_damping >= 100.0
+                            and max_correction <= 5e-2
+                            and self.base_switch_re > self.n_angle
+                            and not is_curvature_probe
+                        ):
+                            proj_cand = candidate.copy()
+                            v_slice = proj_cand[self.n_angle : self.base_switch_re]
+                            np.clip(v_slice, v_min_bound + 1e-6, v_max_bound - 1e-6, out=v_slice)
+                            if not _state_out_of_bounds(proj_cand):
+                                self.evaluate(proj_cand, measurement_plan_tables, out=cand_z_est)
+                                self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                                proj_obj = self._weighted_objective(weight, cand_residual)
+                                if np.isfinite(proj_obj) and proj_obj < objective - max(1e-12, 1e-8 * (abs(objective) + 1.0)):
+                                    x = proj_cand
+                                    z_est, cand_z_est = cand_z_est, z_est
+                                    residual, cand_residual = cand_residual, residual
+                                    objective = proj_obj
+                                    accepted_step = step_scale
+                                    accepted = True
                         break
                     step_scale *= 0.5
                     continue
@@ -11096,6 +11161,38 @@ class ACStateEstimator:
                     backtrack_streak = 0
                     prev_step_accepted = False
                     continue
+                # 阻尼已达上限 (100.0) 且任意微步均无法再降目标函数：若核心电压/相角处于健康边界内
+                # 且有效无约束方向的归一化梯度极小（扣除紧贴物理电压边界且指向墙外的有效不等式约束分量），
+                # 确认已到达带约束局部极小驻点并优雅收敛
+                if (
+                    not _state_out_of_bounds(x)
+                    and max_correction <= 5e-2
+                    and rhs is not None
+                    and rhs.size > 0
+                ):
+                    diag_g_st = (
+                        aat_solver.unregularized_diagonal()
+                        if (normal_operand is not None and aat_solver is not None)
+                        else None
+                    )
+                    if diag_g_st is None and normal_operand is not None:
+                        diag_g_st = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    if diag_g_st is not None and diag_g_st.size == rhs.size:
+                        eff_rhs_st = rhs.copy()
+                        if self.base_switch_re > self.n_angle:
+                            v_slice_st = x[self.n_angle : self.base_switch_re]
+                            r_v_st = eff_rhs_st[self.n_angle : self.base_switch_re]
+                            pin_lo = (v_slice_st <= float(self.voltage_floor) + 1e-3) & (r_v_st < 0.0)
+                            pin_hi = (v_slice_st >= float(self.voltage_max) - 1e-3) & (r_v_st > 0.0)
+                            if np.any(pin_lo):
+                                r_v_st[pin_lo] = 0.0
+                            if np.any(pin_hi):
+                                r_v_st[pin_hi] = 0.0
+                        scaled_vec_st = np.abs(eff_rhs_st) / np.maximum(diag_g_st, 1.0)
+                        va_end_st = min(int(self.base_switch_re), int(scaled_vec_st.size))
+                        va_g_st = float(np.max(scaled_vec_st[:va_end_st])) if va_end_st > 0 else 0.0
+                        if va_g_st <= max(5e-3, 5000.0 * self.tol):
+                            converged = True
                 final_quantities_current = factor_is_current_weights
                 break
 
@@ -11103,7 +11200,11 @@ class ACStateEstimator:
                 final_quantities_current = False
                 break
 
-            prev_step_accepted = False if used_woodbury_step else (True if (used_frozen_step or step_damping == 0.0) else False)
+            prev_step_accepted = (
+                False
+                if (used_woodbury_step or used_sw_curv)
+                else (True if (used_frozen_step or step_damping == 0.0) else False)
+            )
             last_step_max_correction = prev_max_correction
             prev_max_correction = max_correction
             prev_rms_correction = float(np.sqrt(float(np.dot(dx, dx)) / dx.size)) if dx.size else 0.0
@@ -11126,17 +11227,22 @@ class ACStateEstimator:
                         backtrack_streak = 0
                         fullstep_osc_streak = 0
                 elif max_correction > 2.0 * last_step_max_correction:
+                    probe_beats_regular = (
+                        accepted_step is not None
+                        and accepted_step >= 0.8
+                        and objective_change > max(1e-7 * (abs(previous_objective) + 1.0), 1.5 * last_regular_obj_drop)
+                    )
                     if (
                         accepted_step is not None
                         and accepted_step >= 0.5
-                        and objective_change > 1e-4 * (abs(previous_objective) + 1.0)
+                        and (objective_change > 1e-4 * (abs(previous_objective) + 1.0) or probe_beats_regular)
                     ):
-                        # 低阻尼探测步满步接受且带来显著目标压降（>1e-4），说明当前阻尼偏大，直接温和减半放松阻尼
+                        # 低阻尼探测步满步接受且带来显著目标压降（或明显优于普通阻尼步），说明当前阻尼偏大，主动放松阻尼
                         curvature_probe_interval = 2
                         damped_nonshrink_streak = 0
                         flat_valley_streak = 0
                         if accepted_step >= 0.8:
-                            force_lm_damping = float(force_lm_damping) * 0.5
+                            force_lm_damping = max(float(step_damping) * 2.0, float(force_lm_damping) * 0.1)
                             if force_lm_damping <= 1e-3:
                                 force_lm_damping = 0.0
                                 curvature_damping_active = False
@@ -11156,6 +11262,7 @@ class ACStateEstimator:
             else:
                 if curvature_damping_active:
                     curvature_probe_steps += 1
+                    last_regular_obj_drop = float(objective_change)
                     if max_correction > 5e-4 and max_correction >= last_step_max_correction:
                         damped_nonshrink_streak += 1
                         if damped_nonshrink_streak >= 3 and force_lm_damping < 2.0:
@@ -12584,10 +12691,111 @@ class ACStateEstimator:
                 x0 = result.x.copy()
             return any_progressed
 
+        flat_fallback_tried = bool(self.flat_start)
+        warm_cont_tried = False
+
+        def _try_warm_continuation() -> bool:
+            """若在当前活跃量测集上跑满 max_iter 仍未收敛但状态健康，以当前解清零阻尼温启动续跑一次。"""
+            nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
+            nonlocal x0, warm_cont_tried, unconverged_stall_rounds, unconverged_total_rounds
+            if (
+                result.converged
+                or warm_cont_tried
+                or int(getattr(result, "iterations", 0)) < min(20, int(self.max_iter))
+                or not _can_warm_start_from(result)
+            ):
+                return False
+            warm_cont_tried = True
+            cont_res = self.estimate(
+                base_plan_tables,
+                x0=result.x.copy(),
+                verbose=verbose,
+                _defer_observability=True,
+                _weight_override=masked_weights,
+                _value_override=masked_values,
+                _shared_aat_solver=shared_aat_solver,
+                _shared_aat_plan=shared_aat_plan,
+                _hint_lm_damping=0.0,
+            )
+            prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
+            cont_obj = float(cont_res.objective) if np.isfinite(cont_res.objective) else float("inf")
+            if not (cont_res.converged or (np.isfinite(cont_obj) and cont_obj < 0.95 * prev_obj)):
+                return False
+            result = cont_res
+            if _can_warm_start_from(result):
+                x0 = result.x.copy()
+            fac_p = getattr(self, "_last_estimate_cholmod_factor", None)
+            cur_factor = fac_p[1] if (isinstance(fac_p, tuple) and len(fac_p) == 2 and fac_p[0] == id(result)) else None
+            cur_leverage = None
+            _reset_anchor(result, cur_factor, None)
+            bad_items = []
+            normalized = None
+            full_normalized_valid = False
+            unconverged_stall_rounds = 0
+            unconverged_total_rounds = 0
+            return True
+
+        def _try_flat_start_fallback() -> bool:
+            """热启动叠加坏数据落入局部极小未收敛时，在当前活跃量测集上执行一次平启动兜底重算。"""
+            nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
+            nonlocal x0, flat_fallback_tried, unconverged_stall_rounds, unconverged_total_rounds
+            if result.converged or flat_fallback_tried:
+                return False
+            flat_fallback_tried = True
+            x_flat = self.initial_state(flat=True)
+            flat_res = self.estimate(
+                base_plan_tables,
+                x0=x_flat,
+                verbose=verbose,
+                _defer_observability=True,
+                _weight_override=masked_weights,
+                _value_override=masked_values,
+                _shared_aat_solver=shared_aat_solver,
+                _shared_aat_plan=shared_aat_plan,
+            )
+            prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
+            flat_obj = float(flat_res.objective) if np.isfinite(flat_res.objective) else float("inf")
+            if not (flat_res.converged or (np.isfinite(flat_obj) and flat_obj < 0.8 * prev_obj)):
+                return False
+            result = flat_res
+            if _can_warm_start_from(result):
+                x0 = result.x.copy()
+            fac_p = getattr(self, "_last_estimate_cholmod_factor", None)
+            cur_factor = fac_p[1] if (isinstance(fac_p, tuple) and len(fac_p) == 2 and fac_p[0] == id(result)) else None
+            cur_leverage = None
+            _reset_anchor(result, cur_factor, None)
+            bad_items = []
+            normalized = None
+            full_normalized_valid = False
+            unconverged_stall_rounds = 0
+            unconverged_total_rounds = 0
+            return True
+
+        def _prioritize_unconverged_candidates(cands: List[BadDataItem]) -> List[BadDataItem]:
+            """未收敛态下抑制近临界健康测点因 1-h_ii -> 0 放大的假阳性，优先按加权残差 sqrt(w)*|r| 剔除显性坏数据。"""
+            if result.converged or len(cands) <= 1:
+                return cands
+            scored = []
+            for item in cands:
+                rp = int(getattr(item, "row_pos", -1))
+                w_i = float(masked_weights[rp]) if 0 <= rp < n_base else float(getattr(item.measurement, "weight", 0.0))
+                r_i = (
+                    float(result.residual[rp])
+                    if (result.residual is not None and 0 <= rp < result.residual.size)
+                    else float(item.residual)
+                )
+                scored.append((abs(r_i) * float(np.sqrt(max(w_i, 0.0))), item))
+            strong = [pair for pair in scored if pair[0] > float(threshold)]
+            chosen = strong if strong else scored
+            chosen.sort(key=lambda pair: pair[0], reverse=True)
+            return [pair[1] for pair in chosen]
+
         while True:
             if len(removed) >= max_remove:
                 if rescue_rounds < 6 and _try_boundary_node_rescue():
                     rescue_rounds += 1
+                    continue
+                if _try_flat_start_fallback():
                     continue
                 break
             if (
@@ -12615,12 +12823,12 @@ class ACStateEstimator:
                     f"Bad-data removal round {round_idx}: "
                     f"measurements={int(np.count_nonzero(active_mask))}"
                 )
-            candidates = [
+            candidates = _prioritize_unconverged_candidates([
                 item
                 for item in bad_items
                 if (int(item.measurement.idx), str(item.measurement.name)) not in protected_keys
                 and not (0 <= int(getattr(item, "row_pos", -1)) < n_base and bool(base_is_pseudo[int(item.row_pos)]))
-            ]
+            ])
             if not candidates:
                 _ensure_exact_result()
                 if not full_normalized_valid:
@@ -12638,12 +12846,12 @@ class ACStateEstimator:
                     _reset_anchor(result, cur_factor, cur_leverage)
                     for item in bad_items:
                         item.row_pos = int(keep_rows_cur[int(item.row_pos)])
-                    candidates = [
+                    candidates = _prioritize_unconverged_candidates([
                         item
                         for item in bad_items
                         if (int(item.measurement.idx), str(item.measurement.name)) not in protected_keys
                         and not (0 <= int(getattr(item, "row_pos", -1)) < n_base and bool(base_is_pseudo[int(item.row_pos)]))
-                    ]
+                    ])
                     if not candidates:
                         if result.converged:
                             self._last_bad_data_cache = (id(final_res), float(threshold), list(bad_items), normalized)
@@ -13143,8 +13351,16 @@ class ACStateEstimator:
                 if rescue_rounds < 3 and _try_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
+                if _try_warm_continuation():
+                    continue
+                if _try_flat_start_fallback():
+                    continue
                 break
         _ensure_exact_result()
+        if not result.converged and _try_warm_continuation():
+            _ensure_exact_result()
+        if not result.converged and _try_flat_start_fallback():
+            _ensure_exact_result()
         if not full_normalized_valid:
             _refresh_exact_factor_for_current()
         final_res, final_norm = _finalize_masked_result(result, cur_factor, normalized)
