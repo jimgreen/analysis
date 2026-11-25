@@ -76,6 +76,7 @@ from model.meas_model import (
     BadDataItem,
     EstimateResult,
     MEAS_STATUS_INVALID,
+    MEAS_STATUS_NORMAL,
     MEAS_STATUS_PSEUDO,
     VOLTAGE_PSEUDO_MEAS_TYPE_CODES,
     MeasurementList,
@@ -1698,6 +1699,43 @@ class DCStateEstimator:
             DEVICE_TYPE_DCBreakConstraint: constraint_count,
         }
 
+    def _dead_or_inactive_device_info(self) -> Tuple[Dict[int, set], Dict[int, Dict[str, float]]]:
+        """按需返回原始 DC 模型中处于死岛或停运状态（未进入活岛求解计划）的设备名集合与电压基准。"""
+        ppc = self._dc_ppc_dict()
+        alive_by_code = {
+            DEVICE_TYPE_DCNode: ("bus_name", getattr(self, "_raw_node_names_alive", ())),
+            DEVICE_TYPE_DCBranch: ("branch_name", getattr(self, "_branch_names", ())),
+            DEVICE_TYPE_DCBreak: ("break_name", getattr(self, "_break_names", ())),
+            DEVICE_TYPE_DCZeroBranch: ("zero_branch_name", getattr(self, "_zero_branch_names", ())),
+            DEVICE_TYPE_DCGenerator: ("gen_name", getattr(self, "_generator_names", ())),
+            DEVICE_TYPE_DCLoad: ("load_name", getattr(self, "_load_names", ())),
+            DEVICE_TYPE_DCDCConverter: ("dcdc_name", getattr(self, "_dcdc_names", ())),
+        }
+        dead_names: Dict[int, set] = {}
+        dead_scales: Dict[int, Dict[str, float]] = {}
+        bus_arr = np.asarray(ppc.get("bus", np.zeros((0, len(DC_BUS_COLS)))), dtype=np.float64)
+        for code, (name_key, alive_arr) in alive_by_code.items():
+            all_names = np.asarray(ppc.get(name_key, ()), dtype=object)
+            if all_names.size == 0:
+                continue
+            alive_set = {str(x) for x in np.asarray(alive_arr, dtype=object).tolist()}
+            d_set = set()
+            scale_map: Dict[str, float] = {}
+            for r, raw_nm in enumerate(all_names.tolist()):
+                nm = str(raw_nm)
+                if not nm or nm in alive_set:
+                    continue
+                d_set.add(nm)
+                if code == DEVICE_TYPE_DCNode and r < bus_arr.shape[0]:
+                    vb = float(bus_arr[r, DC_BUS_COLS["vbase"]])
+                    if np.isfinite(vb) and vb > 0.0:
+                        scale_map[nm] = float(self.u_scale) * vb
+            if d_set:
+                dead_names[int(code)] = d_set
+            if scale_map:
+                dead_scales[int(code)] = scale_map
+        return dead_names, dead_scales
+
     def measurement_device_names(self, requested_codes=None) -> Dict[int, np.ndarray]:
         """Return DC measurement-device names in the same plan order as device_pos."""
         requested = None if requested_codes is None else {int(code) for code in requested_codes}
@@ -1932,6 +1970,17 @@ class DCStateEstimator:
             )
             invalid_rows = np.flatnonzero(active & ((device_pos < 0) | ~supported))
             if invalid_rows.size:
+                from secore.meas_prefilter import tag_dead_island_unavailable_rows
+
+                dead_names_by_type, dead_scales_by_type = self._dead_or_inactive_device_info()
+                tag_dead_island_unavailable_rows(
+                    table,
+                    invalid_rows,
+                    self.params,
+                    dead_device_names_by_type=dead_names_by_type,
+                    dead_device_scales_by_type=dead_scales_by_type,
+                    dead_power_scale=float(self.p_base),
+                )
                 table_valid[invalid_rows] = False
                 if table_status is not None:
                     table_status[invalid_rows] = MEAS_STATUS_INVALID
@@ -3624,11 +3673,8 @@ class DCStateEstimator:
         table.from_pos = from_pos
         table.to_pos = to_pos
 
-        candidate = valid & (weight > 0.0)
+        candidate = valid & (weight > 0.0) & (status == MEAS_STATUS_NORMAL)
         unavailable = candidate & (~available)
-        if np.any(unavailable):
-            valid[unavailable] = False
-            status[unavailable] = MEAS_STATUS_INVALID
         processable = candidate & available
         if np.any(processable):
             value[processable] = np.divide(
@@ -3637,6 +3683,24 @@ class DCStateEstimator:
                 out=value[processable].copy(),
                 where=np.abs(scale[processable]) > 1e-12,
             )
+        dead_names_by_type = None
+        dead_scales_by_type = None
+        if np.any(unavailable):
+            dead_names_by_type, dead_scales_by_type = self._dead_or_inactive_device_info()
+        from secore.meas_prefilter import prefilter_electric_measurements
+
+        _pf_inv, pf_reasons = prefilter_electric_measurements(
+            table,
+            self.params,
+            available_mask=available,
+            raw_values=value,
+            dead_device_names_by_type=dead_names_by_type,
+            dead_device_scales_by_type=dead_scales_by_type,
+            dead_power_scale=float(self.p_base),
+            side="dc",
+        )
+        self._prefilter_reasons = pf_reasons
+        processable = valid & (weight > 0.0) & available
         real_mask = processable & (status != MEAS_STATUS_PSEUDO)
         self.measurement_table = table
         active_key_array = self._active_key_array_from_arrays(
@@ -6175,6 +6239,7 @@ class DCStateEstimator:
         observability: Optional[ObservabilityResult] = None,
         _defer_observability: bool = False,
         _weight_override: Optional[np.ndarray] = None,
+        _value_override: Optional[np.ndarray] = None,
         _shared_aat_solver: Optional[CholmodAAtNormalEquationSolver] = None,
         _shared_aat_plan: Optional[CholmodAAtNormalEquationPlan] = None,
         _woodbury_removed_rows: Optional[Sequence[int]] = None,
@@ -6226,6 +6291,8 @@ class DCStateEstimator:
         )
         cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
         z, weight = self._measurement_vectors(measurement_plan_tables)
+        if _value_override is not None:
+            z = np.asarray(_value_override, dtype=np.float64)
         weight_masked = _weight_override is not None
         if weight_masked:
             weight = np.asarray(_weight_override, dtype=np.float64)
@@ -6973,6 +7040,33 @@ class DCStateEstimator:
             gain = full_normal_equation_from_lower(gain)
             if start is not None:
                 self._record_profile_time("solve.full_gain_from_lower", time.perf_counter() - start)
+        # 有界约束 KKT 驻点核验：扣除紧贴 voltage_floor 下界或 voltage_max 上界且指向墙外的有效约束分量后，
+        # 若全部核心电压归一化梯度均满足容差，确认已收敛至有界约束最优解
+        if (
+            (not converged)
+            and iteration >= 3
+            and np.isfinite(objective)
+            and max_correction <= 2e-2
+            and H is not None
+            and not _dc_state_out_of_bounds(x)
+        ):
+            if H.shape[0] == residual.size and weight.size == residual.size:
+                rhs_chk = np.asarray(H.T @ (weight * residual), dtype=np.float64)
+                if is_sparse_matrix(H):
+                    dg_chk = np.asarray(H.power(2).T @ weight, dtype=np.float64).ravel()
+                else:
+                    dg_chk = np.asarray(np.sum((H * H) * weight[:, None], axis=0), dtype=np.float64).ravel()
+                if rhs_chk.size == x.size and dg_chk.size == x.size and self.n_voltage > 0:
+                    vc_chk = np.arange(0, self.n_voltage, dtype=np.int64)
+                    v_pin_lo = vc_chk[(x[vc_chk] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[vc_chk] < 0.0)]
+                    v_pin_hi = vc_chk[(x[vc_chk] >= float(self.voltage_max) - 1e-4) & (rhs_chk[vc_chk] > 0.0)]
+                    if v_pin_lo.size:
+                        rhs_chk[v_pin_lo] = 0.0
+                    if v_pin_hi.size:
+                        rhs_chk[v_pin_hi] = 0.0
+                    sv_chk = np.abs(rhs_chk[vc_chk]) / np.maximum(dg_chk[vc_chk], 1.0)
+                    if float(np.max(sv_chk)) <= max(1e-4, 100.0 * self.tol):
+                        converged = True
         if observability is None:
             if converged and aat_solver is not None and aat_solver.last_cholmod_factor is not None:
                 observability = ObservabilityResult(
@@ -7163,20 +7257,24 @@ class DCStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
+        all_table = getattr(self.measurements, "table", None)
+        prefilter_reasons = getattr(all_table, "prefilter_reason", getattr(self, "_prefilter_reasons", None))
         if mode == "summary":
             self.se_result = build_seresult_summary_from_table(
                 result,
                 bad_items=bad_items,
-                all_measurement_table=getattr(self.measurements, "table", None),
+                all_measurement_table=all_table,
                 active_source_rows=getattr(self, "active_measurement_rows", None),
+                prefilter_reasons=prefilter_reasons,
             )
             return self.se_result
         self.se_result = build_seresult_full_from_table(
             result,
             bad_items=bad_items,
             normalized_residual=normalized_residual,
-            all_measurement_table=getattr(self.measurements, "table", None),
+            all_measurement_table=all_table,
             active_source_rows=getattr(self, "active_measurement_rows", None),
+            prefilter_reasons=prefilter_reasons,
         )
         return self.se_result
 
@@ -7303,6 +7401,7 @@ class DCStateEstimator:
         )
         active_mask = np.ones(n_base, dtype=bool)
         masked_weights = base_weights.copy()
+        masked_values: Optional[np.ndarray] = None
         weight_boosted = False
         removed: List[BadDataItem] = []
         protected_keys: set = set()
@@ -7477,6 +7576,7 @@ class DCStateEstimator:
                 verbose=verbose,
                 _defer_observability=need_slice_finalize,
                 _weight_override=masked_weights if need_slice_finalize else None,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -7688,7 +7788,7 @@ class DCStateEstimator:
         def _try_dc_boundary_node_rescue_once() -> bool:
             """当直流常规坏数据剔除结束仍未收敛且存在贴边盲节点时，对其自身电压伪量测局部抬升权重（×10，上限 10.0）重算。"""
             nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
-            nonlocal need_slice_finalize, weight_boosted
+            nonlocal need_slice_finalize, weight_boosted, masked_values
             nonlocal unconverged_stall_rounds, unconverged_total_rounds
             if (
                 result.converged
@@ -7718,9 +7818,14 @@ class DCStateEstimator:
             H_csc = result.H.tocsc()
             mt_arr = np.asarray(base_table.meas_type_code, dtype=np.int16)
             st_arr = measurement_table_status_code(base_table)
+            val_arr = np.asarray(base_table.value, dtype=np.float64)
+            v_lo_phys = float(self.voltage_min)
+            v_hi_phys = float(self.voltage_max)
             boosted = False
             for c in ext_cols:
-                for r in H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]:
+                col_boosted = False
+                col_rows = H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]
+                for r in col_rows:
                     r_i = int(r)
                     if (
                         active_mask[r_i]
@@ -7732,7 +7837,34 @@ class DCStateEstimator:
                         if new_w > cur_w + 1e-12:
                             masked_weights[r_i] = new_w
                             effective_base_weights[r_i] = new_w
+                            col_boosted = True
                             boosted = True
+                # 若贴墙节点无电压伪量测可提权，但存在把节点电压直接拉死在物理极限墙上（如 vp_spike 上/下界攻击）
+                # 的极端离群真实 V 测点，将其安全降权至极弱（1e-4，保持列覆盖且不突破 max_remove 配额）以解救发散节点
+                if not col_boosted and result.residual is not None:
+                    for r in col_rows:
+                        r_i = int(r)
+                        if (
+                            active_mask[r_i]
+                            and (not base_is_pseudo[r_i])
+                            and int(mt_arr[r_i]) in VOLTAGE_PSEUDO_MEAS_TYPE_CODES
+                            and masked_weights[r_i] > 1e-3
+                        ):
+                            w_r = float(masked_weights[r_i])
+                            z_r = float(result.z_est[r_i]) + float(result.residual[r_i]) if (result.z_est is not None and r_i < result.z_est.size) else 1.0
+                            phys_oob = (z_r < v_lo_phys + 0.02) or (z_r > v_hi_phys - 0.02)
+                            if phys_oob or (
+                                abs(float(result.residual[r_i])) * np.sqrt(w_r) > max(2.0 * float(threshold), 8.0)
+                            ):
+                                # 退化为极弱标称电压伪量测 (V=1.0 pu, w=1e-4)：既保持单度节点列覆盖满秩，
+                                # 又彻底解除物理越界/极端离群 V 测点把孤立节点电压死拉撞墙的问题
+                                masked_weights[r_i] = 1e-4
+                                effective_base_weights[r_i] = 1e-4
+                                if masked_values is None:
+                                    base_z_vec, _ = self._measurement_vectors(base_plan_tables)
+                                    masked_values = np.asarray(base_z_vec, dtype=np.float64).copy()
+                                masked_values[r_i] = 1.0
+                                boosted = True
             if not boosted:
                 return False
             weight_boosted = True
@@ -7743,6 +7875,7 @@ class DCStateEstimator:
                 verbose=verbose,
                 _defer_observability=True,
                 _weight_override=masked_weights,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -7774,21 +7907,20 @@ class DCStateEstimator:
 
         while True:
             if len(removed) >= max_remove:
-                if rescue_rounds < 3 and _try_dc_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break
             if (
                 (not result.converged)
-                and rescue_rounds < 3
-                and unconverged_total_rounds >= 6
-                and len(bad_items) < 32
+                and rescue_rounds < 6
+                and (unconverged_total_rounds >= 3 or unconverged_stall_rounds >= 2)
                 and _try_dc_boundary_node_rescue()
             ):
                 rescue_rounds += 1
                 continue
             if (not result.converged) and (unconverged_stall_rounds >= 8 or unconverged_total_rounds >= 20):
-                if rescue_rounds < 3 and _try_dc_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break
@@ -7829,12 +7961,12 @@ class DCStateEstimator:
                         if result.converged:
                             self._last_bad_data_cache = (id(final_res), float(threshold), list(bad_items), normalized)
                             return final_res, removed
-                        if rescue_rounds < 3 and _try_dc_boundary_node_rescue():
+                        if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                             rescue_rounds += 1
                             continue
                         break
                 else:
-                    if rescue_rounds < 3 and _try_dc_boundary_node_rescue():
+                    if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                         rescue_rounds += 1
                         continue
                     break
@@ -8107,6 +8239,7 @@ class DCStateEstimator:
                                 verbose=verbose,
                                 _defer_observability=True,
                                 _weight_override=masked_weights,
+                                _value_override=masked_values,
                                 _shared_aat_solver=shared_aat_solver,
                                 _shared_aat_plan=shared_aat_plan,
                                 _woodbury_removed_rows=wb_rows,
@@ -8222,6 +8355,7 @@ class DCStateEstimator:
                     verbose=verbose,
                     _defer_observability=True,
                     _weight_override=masked_weights,
+                    _value_override=masked_values,
                     _shared_aat_solver=shared_aat_solver,
                     _shared_aat_plan=shared_aat_plan,
                     _woodbury_removed_rows=wb_rows,
@@ -8283,7 +8417,7 @@ class DCStateEstimator:
                 if not full_normalized_valid:
                     bad_items = []
                     continue
-                if rescue_rounds < 3 and _try_dc_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break

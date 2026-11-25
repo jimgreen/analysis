@@ -141,6 +141,28 @@ class StateEstimationParameters:
     angle_min_deg: float = -270.0
     angle_max_deg: float = 270.0
     max_remove_per_round: Optional[int] = None
+    # 量测预过滤配置：所有上下限与容差均作为可配置输入参数，不在求解流程中写死
+    enable_measurement_prefilter: bool = True
+    prefilter_dead_island_zero_tol: float = 1e-3
+    prefilter_voltage_min_pu: Optional[float] = 0.1
+    prefilter_voltage_max_pu: Optional[float] = 1.9
+    prefilter_angle_min_deg: Optional[float] = -270.0
+    prefilter_angle_max_deg: Optional[float] = 270.0
+    prefilter_power_min_pu: Optional[float] = -1e4
+    prefilter_power_max_pu: Optional[float] = 1e4
+    prefilter_ac_current_min_pu: Optional[float] = -1e-6
+    prefilter_dc_current_min_pu: Optional[float] = -1e4
+    prefilter_current_max_pu: Optional[float] = 1e4
+    prefilter_pressure_min: Optional[float] = 0.0
+    prefilter_pressure_max: Optional[float] = 1e4
+    prefilter_flow_min: Optional[float] = -1e6
+    prefilter_flow_max: Optional[float] = 1e6
+    prefilter_temperature_min: Optional[float] = -50.0
+    prefilter_temperature_max: Optional[float] = 1000.0
+    prefilter_enthalpy_min: Optional[float] = 0.0
+    prefilter_enthalpy_max: Optional[float] = 6000.0
+    prefilter_heat_min: Optional[float] = -1e7
+    prefilter_heat_max: Optional[float] = 1e7
 
     @property
     def pseudo_measurement_weight(self) -> float:
@@ -165,7 +187,33 @@ class StateEstimationParameters:
         angle_min_deg: Optional[float] = None,
         angle_max_deg: Optional[float] = None,
         max_remove_per_round: Any = _UNSET,
+        enable_measurement_prefilter: Optional[bool] = None,
+        prefilter_dead_island_zero_tol: Optional[float] = None,
+        prefilter_voltage_min_pu: Any = _UNSET,
+        prefilter_voltage_max_pu: Any = _UNSET,
+        prefilter_angle_min_deg: Any = _UNSET,
+        prefilter_angle_max_deg: Any = _UNSET,
+        prefilter_power_min_pu: Any = _UNSET,
+        prefilter_power_max_pu: Any = _UNSET,
+        prefilter_ac_current_min_pu: Any = _UNSET,
+        prefilter_dc_current_min_pu: Any = _UNSET,
+        prefilter_current_max_pu: Any = _UNSET,
+        prefilter_pressure_min: Any = _UNSET,
+        prefilter_pressure_max: Any = _UNSET,
+        prefilter_flow_min: Any = _UNSET,
+        prefilter_flow_max: Any = _UNSET,
+        prefilter_temperature_min: Any = _UNSET,
+        prefilter_temperature_max: Any = _UNSET,
+        prefilter_enthalpy_min: Any = _UNSET,
+        prefilter_enthalpy_max: Any = _UNSET,
+        prefilter_heat_min: Any = _UNSET,
+        prefilter_heat_max: Any = _UNSET,
     ) -> "StateEstimationParameters":
+        def _opt_float(current: Optional[float], override: Any) -> Optional[float]:
+            if override is _UNSET:
+                return current
+            return None if override is None else float(override)
+
         resolved_max_remove = (
             self.max_remove
             if max_remove is _UNSET
@@ -207,6 +255,31 @@ class StateEstimationParameters:
             angle_min_deg=float(_override_value(self.angle_min_deg, angle_min_deg)),
             angle_max_deg=float(_override_value(self.angle_max_deg, angle_max_deg)),
             max_remove_per_round=resolved_per_round,
+            enable_measurement_prefilter=bool(
+                _override_value(self.enable_measurement_prefilter, enable_measurement_prefilter)
+            ),
+            prefilter_dead_island_zero_tol=float(
+                _override_value(self.prefilter_dead_island_zero_tol, prefilter_dead_island_zero_tol)
+            ),
+            prefilter_voltage_min_pu=_opt_float(self.prefilter_voltage_min_pu, prefilter_voltage_min_pu),
+            prefilter_voltage_max_pu=_opt_float(self.prefilter_voltage_max_pu, prefilter_voltage_max_pu),
+            prefilter_angle_min_deg=_opt_float(self.prefilter_angle_min_deg, prefilter_angle_min_deg),
+            prefilter_angle_max_deg=_opt_float(self.prefilter_angle_max_deg, prefilter_angle_max_deg),
+            prefilter_power_min_pu=_opt_float(self.prefilter_power_min_pu, prefilter_power_min_pu),
+            prefilter_power_max_pu=_opt_float(self.prefilter_power_max_pu, prefilter_power_max_pu),
+            prefilter_ac_current_min_pu=_opt_float(self.prefilter_ac_current_min_pu, prefilter_ac_current_min_pu),
+            prefilter_dc_current_min_pu=_opt_float(self.prefilter_dc_current_min_pu, prefilter_dc_current_min_pu),
+            prefilter_current_max_pu=_opt_float(self.prefilter_current_max_pu, prefilter_current_max_pu),
+            prefilter_pressure_min=_opt_float(self.prefilter_pressure_min, prefilter_pressure_min),
+            prefilter_pressure_max=_opt_float(self.prefilter_pressure_max, prefilter_pressure_max),
+            prefilter_flow_min=_opt_float(self.prefilter_flow_min, prefilter_flow_min),
+            prefilter_flow_max=_opt_float(self.prefilter_flow_max, prefilter_flow_max),
+            prefilter_temperature_min=_opt_float(self.prefilter_temperature_min, prefilter_temperature_min),
+            prefilter_temperature_max=_opt_float(self.prefilter_temperature_max, prefilter_temperature_max),
+            prefilter_enthalpy_min=_opt_float(self.prefilter_enthalpy_min, prefilter_enthalpy_min),
+            prefilter_enthalpy_max=_opt_float(self.prefilter_enthalpy_max, prefilter_enthalpy_max),
+            prefilter_heat_min=_opt_float(self.prefilter_heat_min, prefilter_heat_min),
+            prefilter_heat_max=_opt_float(self.prefilter_heat_max, prefilter_heat_max),
         )
 
 
@@ -240,6 +313,20 @@ def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters
         )
         else None
     )
+    def _parse_opt_float(key: str, default: Optional[float]) -> Optional[float]:
+        raw = values.get(key)
+        if raw is None:
+            return default
+        text = str(raw).strip()
+        if not text or text.lower() in {"none", "null", "off", "-"}:
+            return None
+        return float(text)
+
+    power_max = _parse_opt_float("prefilter_power_max_pu", 1e4)
+    current_max = _parse_opt_float("prefilter_current_max_pu", 1e4)
+    flow_max = _parse_opt_float("prefilter_flow_max", 1e6)
+    heat_max = _parse_opt_float("prefilter_heat_max", 1e7)
+
     return StateEstimationParameters(
         tol=float(_require(values, "tol")),
         max_iter=int(values.get("max_iter", "200")),
@@ -266,4 +353,41 @@ def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters
         angle_min_deg=float(values.get("angle_min_deg", "-270.0")),
         angle_max_deg=float(values.get("angle_max_deg", "270.0")),
         max_remove_per_round=parsed_max_remove_per_round,
+        enable_measurement_prefilter=_to_bool(values.get("enable_measurement_prefilter", "true")),
+        prefilter_dead_island_zero_tol=float(values.get("prefilter_dead_island_zero_tol", "1e-3")),
+        prefilter_voltage_min_pu=_parse_opt_float(
+            "prefilter_voltage_min_pu", float(values.get("voltage_min", "0.1"))
+        ),
+        prefilter_voltage_max_pu=_parse_opt_float(
+            "prefilter_voltage_max_pu", float(values.get("voltage_max", "1.9"))
+        ),
+        prefilter_angle_min_deg=_parse_opt_float(
+            "prefilter_angle_min_deg", float(values.get("angle_min_deg", "-270.0"))
+        ),
+        prefilter_angle_max_deg=_parse_opt_float(
+            "prefilter_angle_max_deg", float(values.get("angle_max_deg", "270.0"))
+        ),
+        prefilter_power_min_pu=_parse_opt_float(
+            "prefilter_power_min_pu", None if power_max is None else -abs(power_max)
+        ),
+        prefilter_power_max_pu=power_max,
+        prefilter_ac_current_min_pu=_parse_opt_float("prefilter_ac_current_min_pu", -1e-6),
+        prefilter_dc_current_min_pu=_parse_opt_float(
+            "prefilter_dc_current_min_pu", None if current_max is None else -abs(current_max)
+        ),
+        prefilter_current_max_pu=current_max,
+        prefilter_pressure_min=_parse_opt_float("prefilter_pressure_min", 0.0),
+        prefilter_pressure_max=_parse_opt_float("prefilter_pressure_max", 1e4),
+        prefilter_flow_min=_parse_opt_float(
+            "prefilter_flow_min", None if flow_max is None else -abs(flow_max)
+        ),
+        prefilter_flow_max=flow_max,
+        prefilter_temperature_min=_parse_opt_float("prefilter_temperature_min", -50.0),
+        prefilter_temperature_max=_parse_opt_float("prefilter_temperature_max", 1000.0),
+        prefilter_enthalpy_min=_parse_opt_float("prefilter_enthalpy_min", 0.0),
+        prefilter_enthalpy_max=_parse_opt_float("prefilter_enthalpy_max", 6000.0),
+        prefilter_heat_min=_parse_opt_float(
+            "prefilter_heat_min", None if heat_max is None else -abs(heat_max)
+        ),
+        prefilter_heat_max=heat_max,
     )

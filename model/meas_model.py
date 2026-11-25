@@ -106,7 +106,14 @@ def normalize_measurement_status(status=None, *, valid: bool = True) -> int:
 
 
 def measurement_status_is_active(status: int) -> bool:
-    return int(status) not in MEAS_STATUS_INACTIVE
+    """判断运行期量测状态是否允许参与估计（仅正常量测与内部伪量测有效，其余非 0 状态一律失效）。"""
+    code = int(status)
+    return code == MEAS_STATUS_NORMAL or code == MEAS_STATUS_PSEUDO
+
+
+def measurement_raw_status_is_normal(status: int) -> bool:
+    """判断外部原始量测状态是否正常（严格要求 status == 0）。"""
+    return int(status) == MEAS_STATUS_NORMAL
 
 
 def is_pseudo_measurement(measurement) -> bool:

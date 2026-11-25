@@ -6,6 +6,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from model.meas_model import (
+    MEAS_STATUS_NORMAL,
     MEAS_STATUS_PSEUDO,
     BadDataItem,
     EstimateResult,
@@ -1039,12 +1040,43 @@ def _bad_row_positions(bad_items: Optional[Sequence[BadDataItem]], row_count: in
     return positions
 
 
+def _resolve_table_prefilter_reasons(
+    all_measurement_table: MeasurementTable,
+    prefiltered_rows: np.ndarray,
+    prefilter_reasons: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """生成预过滤原因列表：优先使用预过滤引擎标注的具体原因，空串回退原有 zero weight / invalid。"""
+    source_reasons = (
+        prefilter_reasons
+        if prefilter_reasons is not None
+        else getattr(all_measurement_table, "prefilter_reason", None)
+    )
+    fallback = np.where(all_measurement_table.valid[prefiltered_rows], "zero weight", "invalid").tolist()
+    if source_reasons is None:
+        return fallback
+    reason_arr = np.asarray(source_reasons, dtype=object)
+    n_reasons = int(reason_arr.size)
+    if n_reasons == 0 or n_reasons > int(all_measurement_table.idx.size):
+        return fallback
+    # 可观测性补全仅在表尾追加内部伪量测，前 n_reasons 行与原始外部量测行号严格一一对应
+    rows_list = prefiltered_rows.tolist()
+    out: List[str] = []
+    for pos, default in zip(rows_list, fallback):
+        if 0 <= pos < n_reasons:
+            custom = reason_arr[pos]
+            out.append(str(custom) if custom else default)
+        else:
+            out.append(default)
+    return out
+
+
 def _seresult_statistics_from_table(
     result: EstimateResult,
     *,
     bad_items: Optional[Sequence[BadDataItem]],
     all_measurement_table: Optional[MeasurementTable],
     active_source_rows: Optional[Sequence[int]],
+    prefilter_reasons: Optional[Sequence[str]] = None,
 ) -> "SEResult.StatisticsTable":
     table = result.measurement_table
     status_code = measurement_table_status_code(table)
@@ -1057,11 +1089,13 @@ def _seresult_statistics_from_table(
             active_mask = np.ones(int(all_measurement_table.idx.size), dtype=bool)
         else:
             active_mask = _active_source_mask(all_measurement_table, active_source_rows)
+        all_status = measurement_table_status_code(all_measurement_table)
         prefiltered = (
             (~active_mask)
             & (
                 (~np.asarray(all_measurement_table.valid, dtype=bool))
                 | (np.asarray(all_measurement_table.weight, dtype=np.float64) <= 0.0)
+                | (all_status != MEAS_STATUS_NORMAL)
             )
         )
         prefiltered_count = int(np.count_nonzero(prefiltered))
@@ -1090,6 +1124,7 @@ def build_seresult_summary_from_table(
     bad_items: Optional[Sequence[BadDataItem]] = None,
     all_measurement_table: Optional[MeasurementTable] = None,
     active_source_rows: Optional[Sequence[int]] = None,
+    prefilter_reasons: Optional[Sequence[str]] = None,
 ) -> "SEResult":
     """Build a summary result directly from measurement arrays."""
     if result.measurement_table is None:
@@ -1100,6 +1135,7 @@ def build_seresult_summary_from_table(
         bad_items=bad_items,
         all_measurement_table=all_measurement_table,
         active_source_rows=active_source_rows,
+        prefilter_reasons=prefilter_reasons,
     )
     return se_result
 
@@ -1194,6 +1230,7 @@ def build_seresult_full_from_table(
     normalized_residual: Optional[Sequence[float]] = None,
     all_measurement_table: Optional[MeasurementTable] = None,
     active_source_rows: Optional[Sequence[int]] = None,
+    prefilter_reasons: Optional[Sequence[str]] = None,
 ) -> "SEResult":
     """Build a full SEResult from array-backed measurement tables with lazy row materialization."""
     table = result.measurement_table
@@ -1212,16 +1249,22 @@ def build_seresult_full_from_table(
             active_mask = np.ones(int(all_measurement_table.idx.size), dtype=bool)
         else:
             active_mask = _active_source_mask(all_measurement_table, active_source_rows)
+        all_status = measurement_table_status_code(all_measurement_table)
         prefiltered = np.flatnonzero(
             (~active_mask)
             & (
                 (~np.asarray(all_measurement_table.valid, dtype=bool))
                 | (np.asarray(all_measurement_table.weight, dtype=np.float64) <= 0.0)
+                | (all_status != MEAS_STATUS_NORMAL)
             )
         )
         prefiltered_count = int(prefiltered.size)
         if prefiltered_count:
-            reasons = np.where(all_measurement_table.valid[prefiltered], "zero weight", "invalid").tolist()
+            reasons = _resolve_table_prefilter_reasons(
+                all_measurement_table,
+                prefiltered,
+                prefilter_reasons=prefilter_reasons,
+            )
             se_result.prefiltered_measurements = SEResult.PrefilteredMeasurementTable._from_columnar(
                 _ColumnarMeasurementBatch(
                     all_measurement_table,

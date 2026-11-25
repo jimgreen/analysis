@@ -2796,7 +2796,9 @@ class HybridStateEstimator:
         self._multi_energy_has_angle_measurements = bool(np.any(self._multi_energy_angle_mask))
         voltage_cols = []
         if self.electric_state_count:
-            voltage_cols.extend(np.asarray(self.voltage_cols, dtype=np.int64).tolist())
+            raw_me_v = np.asarray(self.voltage_cols, dtype=np.int64)
+            if raw_me_v.size:
+                voltage_cols.extend(np.unique(raw_me_v[raw_me_v >= 0]).tolist())
         self._multi_energy_voltage_cols = np.asarray(voltage_cols, dtype=np.int64)
         self._multi_energy_fluid_potential_cols = np.concatenate(
             [
@@ -3694,6 +3696,7 @@ class HybridStateEstimator:
         fullstep_osc_streak = 0
         stagnation_streak = 0
         high_damp_stagnation_streak = 0
+        high_damp_slow_streak = 0
         low_progress_streak = 0
         curvature_damping_active = force_lm_damping > 0.0
         tried_undamped_escape = False
@@ -3744,18 +3747,22 @@ class HybridStateEstimator:
                 break
 
             last_used_damping = step_damping
-            # 有效下界约束投影：已紧贴 voltage_floor 且搜索方向继续指向墙外的电压分量，其投影步长与投影梯度均为 0
+            # 有效上下界约束投影：已紧贴 voltage_floor 下界或 voltage_max 上界且搜索方向继续指向墙外的电压分量，
+            # 其投影步长与投影梯度均为 0，防止单节点贴墙锁死误判未收敛
             eff_dx = dx
             eff_rhs = rhs
             if me_v_cols.size and dx.size:
                 v_at_floor = x[me_v_cols] <= (float(self.voltage_floor) + 1e-5)
-                if bool(np.any(v_at_floor)):
-                    pinned_dx = me_v_cols[v_at_floor & (dx[me_v_cols] < 0.0)]
+                v_at_ceil = x[me_v_cols] >= (float(self.voltage_max) - 1e-5)
+                if bool(np.any(v_at_floor)) or bool(np.any(v_at_ceil)):
+                    pinned_dx = me_v_cols[(v_at_floor & (dx[me_v_cols] < 0.0)) | (v_at_ceil & (dx[me_v_cols] > 0.0))]
                     if pinned_dx.size:
                         eff_dx = dx.copy()
                         eff_dx[pinned_dx] = 0.0
                     if rhs is not None and rhs.size == dx.size:
-                        pinned_rhs = me_v_cols[v_at_floor & (rhs[me_v_cols] < 0.0)]
+                        pinned_rhs = me_v_cols[
+                            (v_at_floor & (rhs[me_v_cols] < 0.0)) | (v_at_ceil & (rhs[me_v_cols] > 0.0))
+                        ]
                         if pinned_rhs.size:
                             eff_rhs = rhs.copy()
                             eff_rhs[pinned_rhs] = 0.0
@@ -3873,25 +3880,27 @@ class HybridStateEstimator:
 
             obj_change = abs(previous_objective - objective)
             # actual_scaled_dx 已在投影后按 ||candidate - x|| 精确计算，准确识别贴墙零位移驻点
-            # 自适应阻尼调节：识别香蕉谷交替回溯与满步慢发散，温和切入/放松曲率阻尼
+            # 自适应阻尼调节：识别香蕉谷交替回溯与满步慢发散，并在满步显著压降目标时果断放松阻尼避免蒸汽焓等线性斜坡焊死重阻尼
             if step_scale >= 0.5:
                 backtrack_streak = max(0, backtrack_streak - 1)
                 if (
-                    step_damping == 0.0
-                    and scaled_correction > max(self.tol, 1e-5)
+                    scaled_correction > max(self.tol, 1e-5)
                     and scaled_correction >= 0.95 * prev_scaled_correction
                     and obj_change <= 1e-4 * (abs(previous_objective) + 1.0)
                 ):
                     fullstep_osc_streak += 1
                     if fullstep_osc_streak >= 4:
-                        force_lm_damping = max(force_lm_damping, 0.1)
+                        force_lm_damping = min(100.0, max(force_lm_damping * 5.0, 0.1))
                         curvature_damping_active = True
                         fullstep_osc_streak = 0
                 else:
                     fullstep_osc_streak = 0
                 if force_lm_damping > 0.0:
                     if curvature_damping_active:
-                        if scaled_correction < 0.98 * prev_scaled_correction:
+                        if (
+                            scaled_correction < 0.98 * prev_scaled_correction
+                            or obj_change > 1e-3 * (abs(previous_objective) + 1.0)
+                        ):
                             force_lm_damping = force_lm_damping * 0.5
                             if force_lm_damping < 1e-4:
                                 force_lm_damping = 0.0
@@ -3904,25 +3913,28 @@ class HybridStateEstimator:
                 fullstep_osc_streak = 0
                 backtrack_streak += 2
                 if backtrack_streak >= 4 or step_scale < 1e-2:
-                    force_lm_damping = min(10.0, max(force_lm_damping * 10.0, 1e-2))
+                    force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
+                    curvature_damping_active = True
                     backtrack_streak = 0
             prev_scaled_correction = scaled_correction
 
-            # 带阻尼稳态停滞、平底谷与高阻尼非光滑脊线脱困检测
+            # 带阻尼稳态停滞、平底谷与高阻尼非光滑脊线脱困检测（与单域流体求解器保持一致）
             rel_obj_tol_high_damp = max(1e-12, 1e-5 * (abs(previous_objective) + 1.0))
+            rel_obj_tol_slow = max(1e-12, 5e-4 * (abs(previous_objective) + 1.0))
             rel_obj_tol_flat = max(1e-12, 1e-6 * (abs(previous_objective) + 1.0))
             if obj_change <= rel_obj_tol_flat:
                 low_progress_streak += 1
             else:
                 low_progress_streak = 0
             if tried_undamped_escape:
-                if obj_change <= max(1e-10, 1e-4 * (abs(previous_objective) + 1.0)):
+                if obj_change <= max(1e-10, 5e-4 * (abs(previous_objective) + 1.0)):
                     # 无阻尼脱困试探未能令目标函数实质下降，确认已到达非光滑局部极小驻点
                     stationary = True
                 else:
                     tried_undamped_escape = False
                     stagnation_streak = 0
                     high_damp_stagnation_streak = 0
+                    high_damp_slow_streak = 0
                     low_progress_streak = 0
             elif (
                 step_damping > 0.0
@@ -3943,16 +3955,29 @@ class HybridStateEstimator:
                         tried_undamped_escape = True
                         stagnation_streak = 0
                         high_damp_stagnation_streak = 0
+                        high_damp_slow_streak = 0
                     else:
                         stationary = True
             elif step_damping >= 1.0 and obj_change <= rel_obj_tol_high_damp:
                 stagnation_streak = 0
                 high_damp_stagnation_streak += 1
+                high_damp_slow_streak += 1
                 if high_damp_stagnation_streak >= 6:
                     force_lm_damping = 0.0
                     curvature_damping_active = False
                     tried_undamped_escape = True
                     high_damp_stagnation_streak = 0
+                    high_damp_slow_streak = 0
+            elif (step_damping >= 1.0 or (curvature_damping_active and step_damping >= 0.1)) and obj_change <= rel_obj_tol_slow:
+                stagnation_streak = 0
+                high_damp_stagnation_streak = 0
+                high_damp_slow_streak += 1
+                slow_limit = 12 if step_damping >= 1.0 else 16
+                if high_damp_slow_streak >= slow_limit:
+                    force_lm_damping = 0.0
+                    curvature_damping_active = False
+                    tried_undamped_escape = True
+                    high_damp_slow_streak = 0
             elif low_progress_streak >= 10:
                 # 连续 10 步目标函数 6 位以上无实质变化（如高盲区贴墙微幅弹跳），触发无阻尼脱困或确认驻点收敛
                 low_progress_streak = 0
@@ -3965,6 +3990,7 @@ class HybridStateEstimator:
             else:
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
+                high_damp_slow_streak = 0
 
             if stationary:
                 converged = True
@@ -4286,7 +4312,12 @@ class HybridStateEstimator:
         unconverged_streak = 0 if result.converged else 1
         unconverged_total_rounds = 0 if result.converged else 1
         failed_trial_solves = 0
+        me_rescue_rounds = 0
         v_cols_me = np.asarray(getattr(self, "_multi_energy_voltage_cols", np.asarray([], dtype=np.int64)), dtype=np.int64)
+        orig_me_weights = np.asarray(self._multi_energy_weight, dtype=np.float64).copy()
+        orig_me_z = np.asarray(self._multi_energy_z, dtype=np.float64).copy()
+        me_mt_arr = np.asarray(self._multi_energy_measurement_table.meas_type_code, dtype=np.int16)
+        me_is_pseudo = measurement_table_bad_data_protected_mask(self._multi_energy_measurement_table)
 
         def _warm_start_is_healthy(state_vec: Optional[np.ndarray]) -> bool:
             if state_vec is None or not state_vec.size or not np.all(np.isfinite(state_vec)):
@@ -4297,172 +4328,268 @@ class HybridStateEstimator:
                     return False
             return True
 
-        while len(removed) < remove_limit:
-            if need_identify:
-                bad_items, normalized = self.identify_bad_data(result, threshold)
-                cur_w = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
-                cur_act = np.ones(rows.size, dtype=bool)
-                col_degrees = (
-                    compute_active_column_degrees(result.H, cur_act, cur_w)
-                    if result.H is not None
-                    else None
-                )
-                local_to_item = {int(it.row_pos): it for it in bad_items}
-                need_identify = False
-            if not bad_items:
-                break
-
-            cand_locals: List[int] = []
-            for item in bad_items:
-                lpos = int(item.row_pos)
-                if 0 <= lpos < rows.size:
-                    grow = int(rows[lpos])
-                    if grow < ctrl_start and grow not in blocked_global_rows:
-                        cand_locals.append(lpos)
-            if not cand_locals:
-                break
-
-            remaining = remove_limit - len(removed)
-            batch_limit = max(1, min(per_round_limit, remaining))
-            if result.H is not None and len(cand_locals) >= 2 and batch_limit >= 2:
-                cand_norms = [float(normalized[p]) for p in cand_locals]
-                sel_idx = select_independent_bad_data_batch(
-                    result.H,
-                    cand_locals,
-                    cand_norms,
-                    threshold,
-                    min_batch_norm=max(float(threshold), 4.5),
-                    max_batch=batch_limit,
-                    min_hops=3,
-                )
-                selected_locals = [cand_locals[k] for k in sel_idx] if sel_idx else [cand_locals[0]]
-            else:
-                selected_locals = [cand_locals[0]]
-
-            # 列覆盖可观测性保护：禁止把任意状态列的全部支撑量测删空
-            if result.H is not None and col_degrees is not None:
-                safe_pos, _ = filter_batch_preserving_column_coverage(result.H, selected_locals, col_degrees)
-                safe_locals = [selected_locals[k] for k in safe_pos]
-                if not safe_locals:
-                    probe = cand_locals[: min(len(cand_locals), 20)]
-                    p_pos, _ = filter_batch_preserving_column_coverage(result.H, probe, col_degrees)
-                    if p_pos:
-                        safe_locals = [probe[p_pos[0]]]
-            else:
-                safe_locals = selected_locals
-            if not safe_locals:
-                break
-
-            # 结构满秩前置拦截：若删批后导致降秩则折半收缩或跳过临界行
-            trial_locals = list(safe_locals)
-            if result.H is not None:
-                cur_w = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
-                while trial_locals:
-                    t_mask = np.ones(rows.size, dtype=bool)
-                    t_w = cur_w.copy()
-                    t_mask[trial_locals] = False
-                    t_w[trial_locals] = 0.0
-                    if check_active_structural_full_rank(result.H, t_mask, t_w):
-                        break
-                    if len(trial_locals) == 1:
-                        blocked_global_rows.add(int(rows[trial_locals[0]]))
-                        trial_locals = []
-                        break
-                    trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
-            if not trial_locals:
-                if len(blocked_global_rows) >= 32:
-                    break
-                continue
-
-            # 带回滚与折半退避的重估：防止误删隐式临界测点导致发散或目标严重恶化
-            accepted_trial = False
-            while trial_locals:
-                drop_mask = np.ones(rows.size, dtype=bool)
-                drop_mask[trial_locals] = False
-                trial_rows = rows[drop_mask]
-                trial_obs = self._multi_energy_observability_analysis(
-                    result.x,
-                    measurement_rows=trial_rows,
-                )
-                if not trial_obs.observable:
-                    if len(trial_locals) == 1:
-                        blocked_global_rows.add(int(rows[trial_locals[0]]))
-                        break
-                    trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+        def _try_me_boundary_node_rescue() -> bool:
+            """多能耦合贴墙节点自救：对拉死电压至上/下界的极端离群真实 V 测点安全降权至 1e-4 并平启动重估。"""
+            nonlocal result, need_identify, unconverged_streak, unconverged_total_rounds, failed_trial_solves
+            if (
+                result.converged
+                or not v_cols_me.size
+                or result.x is None
+                or result.H is None
+                or result.residual is None
+                or not is_sparse_matrix(result.H)
+            ):
+                return False
+            vx = result.x[v_cols_me]
+            v_lo_p = float(self.voltage_min)
+            v_hi_p = float(self.voltage_max)
+            ext_v_cols = v_cols_me[(vx <= v_lo_p + 0.02) | (vx >= v_hi_p - 0.02)]
+            if not ext_v_cols.size:
+                return False
+            H_csc = result.H.tocsc()
+            downweighted = False
+            for c_val in ext_v_cols.tolist():
+                c_i = int(c_val)
+                if c_i < 0 or c_i >= H_csc.shape[1]:
                     continue
-                use_warm = _warm_start_is_healthy(result.x)
-                hint_damp = float(getattr(result, "_final_lm_damping", 0.0)) if use_warm else 0.0
-                trial_res = self._estimate_multi_energy(
-                    x0=result.x if use_warm else None,
-                    measurement_rows=trial_rows,
-                    verbose=verbose,
-                    final_diagnostics=True,
-                    observability=trial_obs,
-                    _hint_lm_damping=hint_damp,
-                )
-                # 热启动未收敛或极早异常退出时，自动以健康平启动重试一次以脱离坏初值陷阱
-                if use_warm and (not trial_res.converged):
-                    flat_res = self._estimate_multi_energy(
-                        x0=None,
+                for r_l in H_csc.indices[H_csc.indptr[c_i] : H_csc.indptr[c_i + 1]]:
+                    l_i = int(r_l)
+                    if l_i < 0 or l_i >= rows.size:
+                        continue
+                    g_i = int(rows[l_i])
+                    if g_i >= ctrl_start or me_is_pseudo[g_i]:
+                        continue
+                    if int(me_mt_arr[g_i]) not in VOLTAGE_PSEUDO_MEAS_TYPE_CODES:
+                        continue
+                    w_cur = float(self._multi_energy_weight[g_i])
+                    if w_cur <= 1e-3:
+                        continue
+                    z_cur = (
+                        float(result.z_est[l_i]) + float(result.residual[l_i])
+                        if (result.z_est is not None and l_i < result.z_est.size)
+                        else 1.0
+                    )
+                    phys_oob = (z_cur < v_lo_p + 0.02) or (z_cur > v_hi_p - 0.02)
+                    if phys_oob or (
+                        abs(float(result.residual[l_i])) * np.sqrt(w_cur) > max(2.0 * float(threshold), 8.0)
+                    ):
+                        # 退化为极弱标称电压伪量测 (V=1.0 pu, w=1e-4)，既保持列覆盖满秩又解除贴墙拉扯
+                        self._multi_energy_weight[g_i] = 1e-4
+                        self._multi_energy_z[g_i] = 1.0
+                        downweighted = True
+            if not downweighted:
+                return False
+            rescue_res = self._estimate_multi_energy(
+                x0=None,
+                measurement_rows=rows,
+                verbose=verbose,
+                final_diagnostics=True,
+                observability=current_observability,
+                _hint_lm_damping=0.0,
+            )
+            if rescue_res.converged or (
+                np.isfinite(rescue_res.objective)
+                and (not np.isfinite(result.objective) or rescue_res.objective < result.objective)
+            ):
+                result = rescue_res
+                need_identify = True
+                unconverged_streak = 0
+                unconverged_total_rounds = 0
+                failed_trial_solves = 0
+                return True
+            return False
+
+        try:
+            while len(removed) < remove_limit:
+                if need_identify:
+                    bad_items, normalized = self.identify_bad_data(result, threshold)
+                    cur_w = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
+                    cur_act = np.ones(rows.size, dtype=bool)
+                    col_degrees = (
+                        compute_active_column_degrees(result.H, cur_act, cur_w)
+                        if result.H is not None
+                        else None
+                    )
+                    local_to_item = {int(it.row_pos): it for it in bad_items}
+                    need_identify = False
+                if not bad_items:
+                    if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                        me_rescue_rounds += 1
+                        continue
+                    break
+
+                cand_locals: List[int] = []
+                for item in bad_items:
+                    lpos = int(item.row_pos)
+                    if 0 <= lpos < rows.size:
+                        grow = int(rows[lpos])
+                        if grow < ctrl_start and grow not in blocked_global_rows:
+                            cand_locals.append(lpos)
+                if not cand_locals:
+                    if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                        me_rescue_rounds += 1
+                        continue
+                    break
+
+                remaining = remove_limit - len(removed)
+                batch_limit = max(1, min(per_round_limit, remaining))
+                if result.H is not None and len(cand_locals) >= 2 and batch_limit >= 2:
+                    cand_norms = [float(normalized[p]) for p in cand_locals]
+                    sel_idx = select_independent_bad_data_batch(
+                        result.H,
+                        cand_locals,
+                        cand_norms,
+                        threshold,
+                        min_batch_norm=max(float(threshold), 4.5),
+                        max_batch=batch_limit,
+                        min_hops=3,
+                    )
+                    selected_locals = [cand_locals[k] for k in sel_idx] if sel_idx else [cand_locals[0]]
+                else:
+                    selected_locals = [cand_locals[0]]
+
+                # 列覆盖可观测性保护：禁止把任意状态列的全部支撑量测删空
+                if result.H is not None and col_degrees is not None:
+                    safe_pos, _ = filter_batch_preserving_column_coverage(result.H, selected_locals, col_degrees)
+                    safe_locals = [selected_locals[k] for k in safe_pos]
+                    if not safe_locals:
+                        probe = cand_locals[: min(len(cand_locals), 20)]
+                        p_pos, _ = filter_batch_preserving_column_coverage(result.H, probe, col_degrees)
+                        if p_pos:
+                            safe_locals = [probe[p_pos[0]]]
+                else:
+                    safe_locals = selected_locals
+                if not safe_locals:
+                    if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                        me_rescue_rounds += 1
+                        continue
+                    break
+
+                # 结构满秩前置拦截：若删批后导致降秩则折半收缩或跳过临界行
+                trial_locals = list(safe_locals)
+                if result.H is not None:
+                    cur_w = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
+                    while trial_locals:
+                        t_mask = np.ones(rows.size, dtype=bool)
+                        t_w = cur_w.copy()
+                        t_mask[trial_locals] = False
+                        t_w[trial_locals] = 0.0
+                        if check_active_structural_full_rank(result.H, t_mask, t_w):
+                            break
+                        if len(trial_locals) == 1:
+                            blocked_global_rows.add(int(rows[trial_locals[0]]))
+                            trial_locals = []
+                            break
+                        trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+                if not trial_locals:
+                    if len(blocked_global_rows) >= 32:
+                        if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                            me_rescue_rounds += 1
+                            blocked_global_rows.clear()
+                            continue
+                        break
+                    continue
+
+                # 带回滚与折半退避的重估：防止误删隐式临界测点导致发散或目标严重恶化
+                accepted_trial = False
+                while trial_locals:
+                    drop_mask = np.ones(rows.size, dtype=bool)
+                    drop_mask[trial_locals] = False
+                    trial_rows = rows[drop_mask]
+                    trial_obs = self._multi_energy_observability_analysis(
+                        result.x,
+                        measurement_rows=trial_rows,
+                    )
+                    if not trial_obs.observable:
+                        if len(trial_locals) == 1:
+                            blocked_global_rows.add(int(rows[trial_locals[0]]))
+                            break
+                        trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+                        continue
+                    use_warm = _warm_start_is_healthy(result.x)
+                    hint_damp = float(getattr(result, "_final_lm_damping", 0.0)) if use_warm else 0.0
+                    trial_res = self._estimate_multi_energy(
+                        x0=result.x if use_warm else None,
                         measurement_rows=trial_rows,
                         verbose=verbose,
                         final_diagnostics=True,
                         observability=trial_obs,
-                        _hint_lm_damping=0.0,
+                        _hint_lm_damping=hint_damp,
                     )
-                    if flat_res.converged or (
-                        np.isfinite(flat_res.objective)
-                        and (not np.isfinite(trial_res.objective) or flat_res.objective < trial_res.objective)
-                    ):
-                        trial_res = flat_res
-                trial_ok = (
-                    np.isfinite(trial_res.objective)
-                    and (
-                        trial_res.converged
-                        or (not result.converged and trial_res.objective < result.objective)
+                    # 热启动未收敛或极早异常退出时，自动以健康平启动重试一次以脱离坏初值陷阱
+                    if use_warm and (not trial_res.converged):
+                        flat_res = self._estimate_multi_energy(
+                            x0=None,
+                            measurement_rows=trial_rows,
+                            verbose=verbose,
+                            final_diagnostics=True,
+                            observability=trial_obs,
+                            _hint_lm_damping=0.0,
+                        )
+                        if flat_res.converged or (
+                            np.isfinite(flat_res.objective)
+                            and (not np.isfinite(trial_res.objective) or flat_res.objective < trial_res.objective)
+                        ):
+                            trial_res = flat_res
+                    trial_ok = (
+                        np.isfinite(trial_res.objective)
+                        and (
+                            trial_res.converged
+                            or (not result.converged and trial_res.objective < result.objective)
+                        )
+                        and (
+                            not result.converged
+                            or trial_res.objective <= result.objective * 1.05 + 1e-6
+                        )
                     )
-                    and (
-                        not result.converged
-                        or trial_res.objective <= result.objective * 1.05 + 1e-6
-                    )
-                )
-                if trial_ok:
-                    prev_obj_accepted = float(result.objective)
-                    for lp in trial_locals:
-                        removed.append(local_to_item[lp])
-                    rows = trial_rows
-                    result = trial_res
-                    current_observability = trial_obs
-                    if result.converged:
-                        unconverged_streak = 0
-                        unconverged_total_rounds = 0
-                    else:
-                        unconverged_total_rounds += 1
-                        if np.isfinite(prev_obj_accepted) and result.objective <= 0.85 * prev_obj_accepted:
-                            # 删坏后目标函数显著下降，说明正在精准剔除真坏数据，重置连续未收敛停滞计数
+                    if trial_ok:
+                        prev_obj_accepted = float(result.objective)
+                        for lp in trial_locals:
+                            removed.append(local_to_item[lp])
+                        rows = trial_rows
+                        result = trial_res
+                        current_observability = trial_obs
+                        if result.converged:
                             unconverged_streak = 0
+                            unconverged_total_rounds = 0
                         else:
-                            unconverged_streak += 1
-                    failed_trial_solves = 0
-                    need_identify = True
-                    accepted_trial = True
-                    break
-                if not trial_res.converged:
-                    failed_trial_solves += 1
-                    if failed_trial_solves >= 4:
-                        # 连续多次删坏重估均不收敛，立即熔断回滚至最优已收敛解，防止连跑数十次满步迭代
+                            unconverged_total_rounds += 1
+                            if np.isfinite(prev_obj_accepted) and result.objective <= 0.85 * prev_obj_accepted:
+                                # 删坏后目标函数显著下降，说明正在精准剔除真坏数据，重置连续未收敛停滞计数
+                                unconverged_streak = 0
+                            else:
+                                unconverged_streak += 1
+                        failed_trial_solves = 0
+                        need_identify = True
+                        accepted_trial = True
                         break
-                if len(trial_locals) == 1:
-                    blocked_global_rows.add(int(rows[trial_locals[0]]))
-                    break
-                trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
+                    if not trial_res.converged:
+                        failed_trial_solves += 1
+                        if failed_trial_solves >= 4:
+                            # 连续多次删坏重估均不收敛，立即熔断回滚至最优已收敛解，防止连跑数十次满步迭代
+                            break
+                    if len(trial_locals) == 1:
+                        blocked_global_rows.add(int(rows[trial_locals[0]]))
+                        break
+                    trial_locals = trial_locals[: max(1, len(trial_locals) // 2)]
 
-            if not accepted_trial:
-                if not result.converged or len(blocked_global_rows) >= 16 or failed_trial_solves >= 4:
+                if not accepted_trial:
+                    if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                        me_rescue_rounds += 1
+                        continue
+                    if not result.converged or len(blocked_global_rows) >= 16 or failed_trial_solves >= 4:
+                        break
+                    continue
+                if unconverged_streak >= 3 or unconverged_total_rounds >= 10:
+                    if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                        me_rescue_rounds += 1
+                        continue
                     break
-                continue
-            if unconverged_streak >= 3 or unconverged_total_rounds >= 10:
-                break
+            if (not result.converged) and me_rescue_rounds < 4 and _try_me_boundary_node_rescue():
+                me_rescue_rounds += 1
+        finally:
+            self._multi_energy_weight[:] = orig_me_weights
+            self._multi_energy_z[:] = orig_me_z
 
         return result, removed
 
@@ -5043,7 +5170,15 @@ class HybridStateEstimator:
         self.dc_state_start = self.ac_n_state
         self.hybrid_state_start = self.ac_n_state + self.dc_n_state
         self.state_sides = _HybridStateSideView(self.ac_n_state, self.dc_n_state, 0)
-        self.voltage_cols = np.asarray(getattr(delegate, "voltage_cols", []), dtype=np.int32)
+        raw_delegate_v_cols = np.asarray(
+            getattr(delegate, "voltage_cols", getattr(delegate, "voltage_col", [])),
+            dtype=np.int32,
+        )
+        self.voltage_cols = (
+            np.unique(raw_delegate_v_cols[raw_delegate_v_cols >= 0]).astype(np.int32, copy=False)
+            if raw_delegate_v_cols.size
+            else np.array([], dtype=np.int32)
+        )
         self.power_flow_state = np.array([], dtype=np.float64)
         self.flat_state = np.array([], dtype=np.float64)
         self._initial_state_cache_ready = False
@@ -5386,6 +5521,28 @@ class HybridStateEstimator:
         counts[DEVICE_TYPE_DCACConverter] = int(len(getattr(self, "dcac_converters", ())))
         return counts
 
+    def _dead_or_inactive_device_info(self) -> Tuple[Dict[int, set], Dict[int, Dict[str, float]]]:
+        """按需聚合 AC / DC 子估计器及换流器中处于死岛或停运状态的设备名集合与电压基准。"""
+        dead_names: Dict[int, set] = {}
+        dead_scales: Dict[int, Dict[str, float]] = {}
+        for sub in (getattr(self, "_ac_sub_estimator", None), getattr(self, "_dc_sub_estimator", None)):
+            if sub is None:
+                continue
+            fn = getattr(sub, "_dead_or_inactive_device_info", None)
+            if callable(fn):
+                sub_names, sub_scales = fn()
+                for code, name_set in sub_names.items():
+                    dead_names.setdefault(int(code), set()).update(name_set)
+                for code, scale_map in sub_scales.items():
+                    dead_scales.setdefault(int(code), {}).update(scale_map)
+        all_convs = getattr(getattr(self, "network", None), "dcac_converters", ()) or ()
+        if all_convs:
+            alive_names = {str(conv.name) for conv in getattr(self, "dcac_converters", ())}
+            dead_conv_names = {str(conv.name) for conv in all_convs if str(conv.name) not in alive_names}
+            if dead_conv_names:
+                dead_names.setdefault(int(DEVICE_TYPE_DCACConverter), set()).update(dead_conv_names)
+        return dead_names, dead_scales
+
     def _disable_unavailable_measurements(self) -> None:
         device_count_by_code = self._measurement_device_count_by_type_code()
         unsupported_switch_codes = {
@@ -5443,6 +5600,17 @@ class HybridStateEstimator:
 
                 if disabled_rows:
                     rows = np.concatenate(disabled_rows).astype(np.int64, copy=False)
+                    from secore.meas_prefilter import tag_dead_island_unavailable_rows
+
+                    dead_names_by_type, dead_scales_by_type = self._dead_or_inactive_device_info()
+                    tag_dead_island_unavailable_rows(
+                        table,
+                        rows,
+                        self.params,
+                        dead_device_names_by_type=dead_names_by_type,
+                        dead_device_scales_by_type=dead_scales_by_type,
+                        dead_power_scale=float(self._power_file_base()),
+                    )
                     table.valid[rows] = False
                     measurement_table_status_code(table)[rows] = MEAS_STATUS_INVALID
             return
@@ -6156,44 +6324,60 @@ class HybridStateEstimator:
             self._warn_missing_device_pos("convert_hybrid_measurements_no_table", DEVICE_TYPE_DCACConverter)
             return
 
-        active = np.asarray(table.valid, dtype=bool) & (np.asarray(table.weight, dtype=np.float64) > 0.0)
-        if not np.any(active):
-            return
-        scale = np.ones(table.value.size, dtype=np.float64)
-        code = np.asarray(table.device_type_code, dtype=np.int16)
-        meas_code = np.asarray(getattr(table, "meas_type_code", np.asarray([], dtype=np.int16)), dtype=np.int16)
-        if meas_code.size != table.value.size:
-            meas_code = np.zeros(table.value.size, dtype=np.int16)
-        device_pos = self._hybrid_measurement_device_pos_array(table)
-        self._ensure_hybrid_converter_scale_cache()
+        status = measurement_table_status_code(table)
+        active = (
+            np.asarray(table.valid, dtype=bool)
+            & (np.asarray(table.weight, dtype=np.float64) > 0.0)
+            & (status == MEAS_STATUS_NORMAL)
+        )
+        if np.any(active):
+            scale = np.ones(table.value.size, dtype=np.float64)
+            code = np.asarray(table.device_type_code, dtype=np.int16)
+            meas_code = np.asarray(getattr(table, "meas_type_code", np.asarray([], dtype=np.int16)), dtype=np.int16)
+            if meas_code.size != table.value.size:
+                meas_code = np.zeros(table.value.size, dtype=np.int16)
+            device_pos = self._hybrid_measurement_device_pos_array(table)
+            self._ensure_hybrid_converter_scale_cache()
 
-        dcac_rows = np.flatnonzero(active & (code == DEVICE_TYPE_DCACConverter) & (device_pos >= 0))
-        if dcac_rows.size:
-            dcac_pos = device_pos[dcac_rows].astype(np.intp, copy=False)
-            scale_vals = np.ones(dcac_rows.size, dtype=np.float64)
-            dcac_meas = meas_code[dcac_rows]
-            power_mask = (dcac_meas == MEAS_TYPE_P_DC) | (dcac_meas == MEAS_TYPE_P_AC) | (dcac_meas == MEAS_TYPE_Q_AC)
-            scale_vals[power_mask] = self._power_file_base()
-            mask = dcac_meas == MEAS_TYPE_V_DC
-            scale_vals[mask] = self._dcac_dc_v_file_scale_by_pos[dcac_pos[mask]]
-            mask = dcac_meas == MEAS_TYPE_I_DC
-            scale_vals[mask] = self._dcac_dc_i_file_scale_by_pos[dcac_pos[mask]]
-            mask = dcac_meas == MEAS_TYPE_V_AC
-            scale_vals[mask] = self._dcac_ac_v_file_scale_by_pos[dcac_pos[mask]]
-            mask = dcac_meas == MEAS_TYPE_I_AC
-            scale_vals[mask] = self._dcac_ac_i_file_scale_by_pos[dcac_pos[mask]]
-            scale[dcac_rows] = scale_vals
+            dcac_rows = np.flatnonzero(active & (code == DEVICE_TYPE_DCACConverter) & (device_pos >= 0))
+            if dcac_rows.size:
+                dcac_pos = device_pos[dcac_rows].astype(np.intp, copy=False)
+                scale_vals = np.ones(dcac_rows.size, dtype=np.float64)
+                dcac_meas = meas_code[dcac_rows]
+                power_mask = (dcac_meas == MEAS_TYPE_P_DC) | (dcac_meas == MEAS_TYPE_P_AC) | (dcac_meas == MEAS_TYPE_Q_AC)
+                scale_vals[power_mask] = self._power_file_base()
+                mask = dcac_meas == MEAS_TYPE_V_DC
+                scale_vals[mask] = self._dcac_dc_v_file_scale_by_pos[dcac_pos[mask]]
+                mask = dcac_meas == MEAS_TYPE_I_DC
+                scale_vals[mask] = self._dcac_dc_i_file_scale_by_pos[dcac_pos[mask]]
+                mask = dcac_meas == MEAS_TYPE_V_AC
+                scale_vals[mask] = self._dcac_ac_v_file_scale_by_pos[dcac_pos[mask]]
+                mask = dcac_meas == MEAS_TYPE_I_AC
+                scale_vals[mask] = self._dcac_ac_i_file_scale_by_pos[dcac_pos[mask]]
+                scale[dcac_rows] = scale_vals
 
-        table.value[active] = np.divide(
-            table.value[active],
-            scale[active],
-            out=table.value[active].copy(),
-            where=np.abs(scale[active]) > 1e-12,
+            table.value[active] = np.divide(
+                table.value[active],
+                scale[active],
+                out=table.value[active].copy(),
+                where=np.abs(scale[active]) > 1e-12,
+            )
+
+        from secore.meas_prefilter import prefilter_electric_measurements
+
+        prefilter_electric_measurements(
+            table,
+            self.params,
+            raw_values=table.value,
+            dead_power_scale=float(self._power_file_base()),
+            side="hybrid",
         )
         object_count = list.__len__(measurements) if isinstance(measurements, list) else 0
         if object_count == table.value.size and object_count > 0:
             for pos, meas in enumerate(list.__iter__(measurements)):
                 meas.value = float(table.value[pos])
+                meas.valid = bool(table.valid[pos])
+                meas.status = int(status[pos])
         else:
             source = getattr(measurements, "source", None)
             source_rows = getattr(measurements, "rows", None)
@@ -6201,6 +6385,8 @@ class HybridStateEstimator:
             if source_count > 0 and source_rows is not None:
                 for pos, source_row in enumerate(source_rows):
                     source[int(source_row)].value = float(table.value[pos])
+                    source[int(source_row)].valid = bool(table.valid[pos])
+                    source[int(source_row)].status = int(status[pos])
 
     def _sync_measurement_table_from_partition_tables(
         self,
@@ -6225,9 +6411,27 @@ class HybridStateEstimator:
             # A side partition may reject additional rows, but it must not
             # reactivate rows already rejected by Hybrid-level ownership or
             # device-position validation.
-            master_table.valid[rows] &= np.asarray(table.valid, dtype=bool)
+            prev_valid = np.asarray(master_table.valid[rows], dtype=bool)
+            part_valid = np.asarray(table.valid, dtype=bool)
+            master_table.valid[rows] = prev_valid & part_valid
             master_table.weight[rows] = table.weight
             master_table.value[rows] = table.value
+            master_status = measurement_table_status_code(master_table)
+            part_status = measurement_table_status_code(table)
+            newly_rejected = prev_valid & (~part_valid)
+            if np.any(newly_rejected):
+                master_status[rows[newly_rejected]] = part_status[newly_rejected]
+            part_reasons = getattr(table, "prefilter_reason", None)
+            if isinstance(part_reasons, np.ndarray) and int(part_reasons.size) == rows.size:
+                from secore.meas_prefilter import ensure_prefilter_reason_array
+
+                master_reasons = ensure_prefilter_reason_array(master_table)
+                fill_mask = (master_reasons[rows] == "") & (part_reasons != "")
+                if np.any(fill_mask):
+                    master_reasons[rows[fill_mask]] = part_reasons[fill_mask]
+        master_reasons_final = getattr(master_table, "prefilter_reason", None)
+        if master_reasons_final is not None:
+            self._prefilter_reasons = master_reasons_final
 
     def _sync_measurement_table_from_objects(self) -> None:
         table = getattr(self.measurements, "table", None)
@@ -10260,6 +10464,7 @@ class HybridStateEstimator:
         observability: Optional[ObservabilityResult] = None,
         _defer_observability: bool = False,
         _weight_override: Optional[np.ndarray] = None,
+        _value_override: Optional[np.ndarray] = None,
         _shared_aat_solver: Optional[CholmodAAtNormalEquationSolver] = None,
         _shared_aat_plan: Optional[CholmodAAtNormalEquationPlan] = None,
         _woodbury_removed_rows: Optional[Sequence[int]] = None,
@@ -10335,6 +10540,8 @@ class HybridStateEstimator:
         )
         cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
         z, weight = self._measurement_vectors(measurements)
+        if _value_override is not None:
+            z = np.asarray(_value_override, dtype=np.float64)
         weight_masked = _weight_override is not None
         if weight_masked:
             weight = np.asarray(_weight_override, dtype=np.float64)
@@ -10914,9 +11121,12 @@ class HybridStateEstimator:
                     if diag_g_st is not None and diag_g_st.size == rhs.size:
                         eff_rhs_st = rhs.copy()
                         if v_cols.size:
-                            v_pinned = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-5) & (eff_rhs_st[v_cols] < 0.0)]
-                            if v_pinned.size:
-                                eff_rhs_st[v_pinned] = 0.0
+                            v_pin_lo = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-5) & (eff_rhs_st[v_cols] < 0.0)]
+                            v_pin_hi = v_cols[(x[v_cols] >= float(self.voltage_max) - 1e-5) & (eff_rhs_st[v_cols] > 0.0)]
+                            if v_pin_lo.size:
+                                eff_rhs_st[v_pin_lo] = 0.0
+                            if v_pin_hi.size:
+                                eff_rhs_st[v_pin_hi] = 0.0
                         scaled_vec_st = np.abs(eff_rhs_st) / np.maximum(diag_g_st, 1.0)
                         va_g_st = 0.0
                         if v_cols.size:
@@ -10960,10 +11170,19 @@ class HybridStateEstimator:
                         and accepted_step >= 0.5
                         and objective_change > 1e-4 * (abs(previous_objective) + 1.0)
                     ):
-                        # 步长虽反弹但带来显著目标压降（>1e-4），保持高频探测加速
+                        # 低阻尼探测步满步接受且带来显著目标压降（>1e-4），说明当前阻尼偏大，直接温和减半放松阻尼
                         curvature_probe_interval = 2
                         damped_nonshrink_streak = 0
                         flat_valley_streak = 0
+                        if accepted_step >= 0.8:
+                            # 探测步 step_damping (= 0.05 * force_lm_damping) 已实测满步接受并大幅降目标，
+                            # 直接将阻尼降至 step_damping 的温和安全倍率（2x，即原阻尼的 0.1x），打破 8-周期阻尼锁死
+                            force_lm_damping = max(float(step_damping) * 2.0, float(force_lm_damping) * 0.1)
+                            if force_lm_damping <= 1e-3:
+                                force_lm_damping = 0.0
+                                curvature_damping_active = False
+                                backtrack_streak = 0
+                                fullstep_osc_streak = 0
                     else:
                         # 探测步反弹过冲且目标降幅微末，指数退避拉大间隔，防止周期踹偏平底谷稳态
                         curvature_probe_interval = min(16, curvature_probe_interval * 2)
@@ -11227,9 +11446,12 @@ class HybridStateEstimator:
                     dg_chk = np.asarray(np.sum((H * H) * weight[:, None], axis=0), dtype=np.float64).ravel()
                 if rhs_chk.size == x.size and dg_chk.size == x.size:
                     if v_cols.size:
-                        v_pin = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[v_cols] < 0.0)]
-                        if v_pin.size:
-                            rhs_chk[v_pin] = 0.0
+                        v_pin_lo = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[v_cols] < 0.0)]
+                        v_pin_hi = v_cols[(x[v_cols] >= float(self.voltage_max) - 1e-4) & (rhs_chk[v_cols] > 0.0)]
+                        if v_pin_lo.size:
+                            rhs_chk[v_pin_lo] = 0.0
+                        if v_pin_hi.size:
+                            rhs_chk[v_pin_hi] = 0.0
                     sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
                     va_g_chk = 0.0
                     if v_cols.size:
@@ -11570,18 +11792,22 @@ class HybridStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
+        all_table = getattr(self.measurements, "table", None)
+        prefilter_reasons = getattr(all_table, "prefilter_reason", getattr(self, "_prefilter_reasons", None))
         if mode == "summary":
             self.se_result = build_seresult_summary_from_table(
                 result,
                 bad_items=bad_items,
-                all_measurement_table=getattr(self.measurements, "table", None),
+                all_measurement_table=all_table,
+                prefilter_reasons=prefilter_reasons,
             )
             return self.se_result
         self.se_result = build_seresult_full_from_table(
             result,
             bad_items=bad_items,
             normalized_residual=normalized_residual,
-            all_measurement_table=getattr(self.measurements, "table", None),
+            all_measurement_table=all_table,
+            prefilter_reasons=prefilter_reasons,
         )
         return self.se_result
 
@@ -12167,6 +12393,7 @@ class HybridStateEstimator:
         effective_base_weights = base_weights.copy()
         active_mask = np.ones(n_base, dtype=bool)
         masked_weights = base_weights.copy()
+        masked_values: Optional[np.ndarray] = None
         weight_boosted = False
         removed: List[BadDataItem] = []
         protected_keys: set = set()
@@ -12367,6 +12594,7 @@ class HybridStateEstimator:
                 verbose=verbose,
                 _defer_observability=need_slice_finalize,
                 _weight_override=masked_weights if need_slice_finalize else None,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -12390,6 +12618,7 @@ class HybridStateEstimator:
                 verbose=verbose,
                 _defer_observability=need_slice_finalize,
                 _weight_override=masked_weights if need_slice_finalize else None,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -12627,7 +12856,7 @@ class HybridStateEstimator:
             2) 若无高杠杆坏数据失衡，仅对贴边盲节点自身的电压伪量测局部抬升权重（×10，上限 10.0）重算。
             """
             nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
-            nonlocal need_slice_finalize, weight_boosted, shared_aat_solver
+            nonlocal need_slice_finalize, weight_boosted, shared_aat_solver, masked_values
             nonlocal unconverged_stall_rounds, unconverged_total_rounds
             if (
                 result.converged
@@ -12729,6 +12958,7 @@ class HybridStateEstimator:
                             verbose=verbose,
                             _defer_observability=True,
                             _weight_override=masked_weights,
+                            _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
                         )
@@ -12789,6 +13019,7 @@ class HybridStateEstimator:
                             verbose=verbose,
                             _defer_observability=True,
                             _weight_override=masked_weights,
+                            _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
                         )
@@ -12832,9 +13063,13 @@ class HybridStateEstimator:
                         unconverged_total_rounds = 0
                         return True
 
+            v_lo_phys = float(self.voltage_min)
+            v_hi_phys = float(self.voltage_max)
             boosted = False
             for c in ext_cols:
-                for r in H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]:
+                col_boosted = False
+                col_rows = H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]
+                for r in col_rows:
                     r_i = int(r)
                     if (
                         active_mask[r_i]
@@ -12846,7 +13081,37 @@ class HybridStateEstimator:
                         if new_w > cur_w + 1e-12:
                             masked_weights[r_i] = new_w
                             effective_base_weights[r_i] = new_w
+                            col_boosted = True
                             boosted = True
+                # 若贴墙节点无电压伪量测可提权，但存在把节点电压直接拉死在物理极限墙上（如 vp_spike 上/下界攻击）
+                # 的极端离群真实 V 测点，将其安全降权至极弱（1e-4，保持列覆盖且不突破 max_remove 配额）以解救发散节点
+                if not col_boosted and result.residual is not None:
+                    for r in col_rows:
+                        r_i = int(r)
+                        if (
+                            active_mask[r_i]
+                            and (base_is_pseudo is None or (not base_is_pseudo[r_i]))
+                            and int(mt_arr[r_i]) in VOLTAGE_PSEUDO_MEAS_TYPE_CODES
+                            and masked_weights[r_i] > 1e-3
+                        ):
+                            w_r = float(masked_weights[r_i])
+                            z_r = (
+                                float(result.z_est[r_i]) + float(result.residual[r_i])
+                                if (result.z_est is not None and r_i < result.z_est.size)
+                                else 1.0
+                            )
+                            phys_oob = (z_r < v_lo_phys + 0.02) or (z_r > v_hi_phys - 0.02)
+                            if phys_oob or (
+                                abs(float(result.residual[r_i])) * np.sqrt(w_r) > max(2.0 * float(threshold), 8.0)
+                            ):
+                                # 退化为极弱标称电压伪量测 (V=1.0 pu, w=1e-4)：保持单度节点列覆盖满秩并解除贴墙拉扯
+                                masked_weights[r_i] = 1e-4
+                                effective_base_weights[r_i] = 1e-4
+                                if masked_values is None:
+                                    base_z_vec, _ = self._measurement_vectors(base_measurements)
+                                    masked_values = np.asarray(base_z_vec, dtype=np.float64).copy()
+                                masked_values[r_i] = 1.0
+                                boosted = True
             if not boosted:
                 return False
             weight_boosted = True
@@ -12857,6 +13122,7 @@ class HybridStateEstimator:
                 verbose=verbose,
                 _defer_observability=True,
                 _weight_override=masked_weights,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -12892,16 +13158,15 @@ class HybridStateEstimator:
 
         while True:
             if len(removed) >= max_remove:
-                if rescue_rounds < 3 and _try_hybrid_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break
             if (
                 (not result.converged)
                 and (not bool(getattr(result, "_coarse_stopped", False)))
-                and rescue_rounds < 3
-                and unconverged_total_rounds >= 6
-                and len(bad_items) < 32
+                and rescue_rounds < 6
+                and (unconverged_total_rounds >= 3 or unconverged_stall_rounds >= 2)
                 and _try_hybrid_boundary_node_rescue()
             ):
                 rescue_rounds += 1
@@ -12911,7 +13176,7 @@ class HybridStateEstimator:
                 and (not bool(getattr(result, "_coarse_stopped", False)))
                 and (unconverged_stall_rounds >= 8 or unconverged_total_rounds >= 20)
             ):
-                if rescue_rounds < 3 and _try_hybrid_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break
@@ -12957,12 +13222,12 @@ class HybridStateEstimator:
                         if result.converged:
                             self._last_bad_data_cache = (id(final_res), float(threshold), list(bad_items), normalized)
                             return final_res, removed
-                        if rescue_rounds < 3 and _try_hybrid_boundary_node_rescue():
+                        if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
                             rescue_rounds += 1
                             continue
                         break
                 else:
-                    if rescue_rounds < 3 and _try_hybrid_boundary_node_rescue():
+                    if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
                         rescue_rounds += 1
                         continue
                     break
@@ -13259,6 +13524,7 @@ class HybridStateEstimator:
                                 verbose=verbose,
                                 _defer_observability=True,
                                 _weight_override=masked_weights,
+                                _value_override=masked_values,
                                 _shared_aat_solver=shared_aat_solver,
                                 _shared_aat_plan=shared_aat_plan,
                                 _woodbury_removed_rows=wb_rows,
@@ -13371,6 +13637,7 @@ class HybridStateEstimator:
                     verbose=verbose,
                     _defer_observability=True,
                     _weight_override=masked_weights,
+                    _value_override=masked_values,
                     _shared_aat_solver=shared_aat_solver,
                     _shared_aat_plan=shared_aat_plan,
                     _woodbury_removed_rows=wb_rows,
@@ -13440,7 +13707,7 @@ class HybridStateEstimator:
                 if not full_normalized_valid:
                     bad_items = []
                     continue
-                if rescue_rounds < 3 and _try_hybrid_boundary_node_rescue():
+                if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
                 break

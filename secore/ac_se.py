@@ -1722,6 +1722,55 @@ class ACStateEstimator:
             DEVICE_TYPE_ACACConverter: size("_ac_acac_plan_i"),
         }
 
+    def _dead_or_inactive_device_info(self) -> Tuple[Dict[int, set], Dict[int, Dict[str, float]]]:
+        """按需返回原始 AC 模型中处于死岛或停运状态（未进入活岛求解计划）的设备名集合与电压基准。"""
+        ppc = self._ac_ppc_dict()
+        name_key_by_code = {
+            DEVICE_TYPE_ACNode: "bus_name",
+            DEVICE_TYPE_ACBranch: "branch_name",
+            DEVICE_TYPE_ACTransformer: "transformer_name",
+            DEVICE_TYPE_ACThreeWindingTransformer: "three_winding_transformer_name",
+            DEVICE_TYPE_ACLoad: "load_name",
+            DEVICE_TYPE_ACGenerator: "gen_name",
+            DEVICE_TYPE_ACZeroBranch: "zero_branch_name",
+            DEVICE_TYPE_ACBreak: "break_name",
+            DEVICE_TYPE_ACACConverter: "acac_name",
+        }
+        plan_rows_by_code = getattr(self, "_ac_measurement_plan_rows_by_type_code", {}) or {}
+        dead_names: Dict[int, set] = {}
+        dead_scales: Dict[int, Dict[str, float]] = {}
+        bus_arr = np.asarray(ppc.get("bus", np.zeros((0, len(BUS_COLS)))), dtype=np.float64)
+        for code, name_key in name_key_by_code.items():
+            all_names = np.asarray(ppc.get(name_key, ()), dtype=object)
+            n_total = int(all_names.size)
+            if n_total == 0:
+                continue
+            alive_rows = np.asarray(plan_rows_by_code.get(int(code), ()), dtype=np.int64)
+            alive_mask = np.zeros(n_total, dtype=bool)
+            if alive_rows.size:
+                in_range = (alive_rows >= 0) & (alive_rows < n_total)
+                if np.any(in_range):
+                    alive_mask[alive_rows[in_range].astype(np.intp, copy=False)] = True
+            dead_rows = np.flatnonzero(~alive_mask)
+            if dead_rows.size == 0:
+                continue
+            d_set = set()
+            scale_map: Dict[str, float] = {}
+            for r in dead_rows.tolist():
+                nm = str(all_names[r])
+                if not nm:
+                    continue
+                d_set.add(nm)
+                if code == DEVICE_TYPE_ACNode and r < bus_arr.shape[0]:
+                    vb = float(bus_arr[r, BUS_COLS["vbase"]])
+                    if math.isfinite(vb) and vb > 0.0:
+                        scale_map[nm] = float(self.u_scale) * vb
+            if d_set:
+                dead_names[int(code)] = d_set
+            if scale_map:
+                dead_scales[int(code)] = scale_map
+        return dead_names, dead_scales
+
     def measurement_device_names(self, requested_codes=None) -> Dict[int, np.ndarray]:
         """Return AC measurement-device names in the same plan order as device_pos."""
         requested = None if requested_codes is None else {int(code) for code in requested_codes}
@@ -3738,15 +3787,32 @@ class ACStateEstimator:
             status_array[ac_current_mask] = MEAS_STATUS_INVALID
             invalidated_mask[ac_current_mask] = True
 
-        candidate_mask = valid_array & (weight_array > 0.0) & (~angle_mask)
+        candidate_mask = valid_array & (weight_array > 0.0) & (~angle_mask) & (status_array == MEAS_STATUS_NORMAL)
         flagged_unavailable = candidate_mask & unavailable_mask
-        if flagged_unavailable.any():
-            valid_array[flagged_unavailable] = False
-            status_array[flagged_unavailable] = MEAS_STATUS_INVALID
-            invalidated_mask[flagged_unavailable] = True
         processable_mask = candidate_mask & (~unavailable_mask)
         if processable_mask.any():
             value_array[processable_mask] = value_array[processable_mask] / scale_array[processable_mask]
+
+        dead_names_by_type = None
+        dead_scales_by_type = None
+        if flagged_unavailable.any():
+            dead_names_by_type, dead_scales_by_type = self._dead_or_inactive_device_info()
+        from secore.meas_prefilter import prefilter_electric_measurements
+
+        pf_invalidated, pf_reasons = prefilter_electric_measurements(
+            table,
+            self.params,
+            available_mask=available,
+            raw_values=value_array,
+            dead_device_names_by_type=dead_names_by_type,
+            dead_device_scales_by_type=dead_scales_by_type,
+            dead_power_scale=float(self.p_base),
+            side="ac",
+        )
+        if pf_invalidated.any():
+            invalidated_mask |= pf_invalidated
+        self._prefilter_reasons = pf_reasons
+        processable_mask = valid_array & (weight_array > 0.0) & (~angle_mask) & (~unavailable_mask)
 
         is_pseudo_array = status_array == MEAS_STATUS_PSEUDO
         real_mask = processable_mask & (~is_pseudo_array)
@@ -10367,6 +10433,7 @@ class ACStateEstimator:
         observability: Optional[ObservabilityResult] = None,
         _defer_observability: bool = False,
         _weight_override: Optional[np.ndarray] = None,
+        _value_override: Optional[np.ndarray] = None,
         _shared_aat_solver: Optional[CholmodAAtNormalEquationSolver] = None,
         _shared_aat_plan: Optional[CholmodAAtNormalEquationPlan] = None,
         _woodbury_removed_rows: Optional[Sequence[int]] = None,
@@ -10415,6 +10482,8 @@ class ACStateEstimator:
         )
         cached_initial_H = observability_cache.get("H") if observability_cache is not None else None
         z, weight = self._measurement_vectors(measurement_plan_tables)
+        if _value_override is not None:
+            z = np.asarray(_value_override, dtype=np.float64)
         weight_masked = _weight_override is not None
         if weight_masked:
             weight = np.asarray(_weight_override, dtype=np.float64)
@@ -11062,10 +11131,17 @@ class ACStateEstimator:
                         and accepted_step >= 0.5
                         and objective_change > 1e-4 * (abs(previous_objective) + 1.0)
                     ):
-                        # 步长虽反弹但带来显著目标压降（>1e-4），保持高频探测加速
+                        # 低阻尼探测步满步接受且带来显著目标压降（>1e-4），说明当前阻尼偏大，直接温和减半放松阻尼
                         curvature_probe_interval = 2
                         damped_nonshrink_streak = 0
                         flat_valley_streak = 0
+                        if accepted_step >= 0.8:
+                            force_lm_damping = float(force_lm_damping) * 0.5
+                            if force_lm_damping <= 1e-3:
+                                force_lm_damping = 0.0
+                                curvature_damping_active = False
+                                backtrack_streak = 0
+                                fullstep_osc_streak = 0
                     else:
                         # 探测步反弹过冲且目标降幅微末，指数退避拉大间隔，防止周期踹偏平底谷稳态
                         curvature_probe_interval = min(16, curvature_probe_interval * 2)
@@ -11267,7 +11343,7 @@ class ACStateEstimator:
                 and H is not None
                 and use_aat_normal_solver
                 and aat_solver is not None
-                and aat_solver.last_cholmod_factor is not None
+                and (aat_solver.last_cholmod_factor is not None or bool(getattr(aat_solver, "_last_factor_scaled", False)))
             ):
                 # 前期仍存在大批显性大坏数据时，主体已稳定即可安全提前结束注定被废弃的尾部磨步
                 strong_bad_cnt = int(
@@ -11277,7 +11353,7 @@ class ACStateEstimator:
                 )
                 if strong_bad_cnt >= 10:
                     coarse_stopped = True
-                    final_quantities_current = True
+                    final_quantities_current = aat_solver.last_cholmod_factor is not None
                     break
 
         if not converged and flat_restart_enabled:
@@ -11433,9 +11509,12 @@ class ACStateEstimator:
                     vc_chk = np.arange(self.n_angle, self.base_switch_re, dtype=np.int64)
                     ac_chk = np.arange(self.n_angle, dtype=np.int64)
                     if vc_chk.size:
-                        v_pin = vc_chk[(x[vc_chk] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[vc_chk] < 0.0)]
-                        if v_pin.size:
-                            rhs_chk[v_pin] = 0.0
+                        v_pin_lo = vc_chk[(x[vc_chk] <= float(self.voltage_floor) + 1e-4) & (rhs_chk[vc_chk] < 0.0)]
+                        v_pin_hi = vc_chk[(x[vc_chk] >= float(self.voltage_max) - 1e-4) & (rhs_chk[vc_chk] > 0.0)]
+                        if v_pin_lo.size:
+                            rhs_chk[v_pin_lo] = 0.0
+                        if v_pin_hi.size:
+                            rhs_chk[v_pin_hi] = 0.0
                     sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
                     va_g_chk = 0.0
                     if vc_chk.size:
@@ -11639,20 +11718,24 @@ class ACStateEstimator:
                 bad_items = computed_bad_items
             if normalized_residual is None:
                 normalized_residual = computed_normalized
+        all_table = getattr(self.measurements, "table", None)
+        prefilter_reasons = getattr(all_table, "prefilter_reason", getattr(self, "_prefilter_reasons", None))
         if mode == "summary":
             self.se_result = build_seresult_summary_from_table(
                 result,
                 bad_items=bad_items,
-                all_measurement_table=getattr(self.measurements, "table", None),
+                all_measurement_table=all_table,
                 active_source_rows=getattr(self, "active_measurement_rows", None),
+                prefilter_reasons=prefilter_reasons,
             )
             return self.se_result
         self.se_result = build_seresult_full_from_table(
             result,
             bad_items=bad_items,
             normalized_residual=normalized_residual,
-            all_measurement_table=getattr(self.measurements, "table", None),
+            all_measurement_table=all_table,
             active_source_rows=getattr(self, "active_measurement_rows", None),
+            prefilter_reasons=prefilter_reasons,
         )
         return self.se_result
 
@@ -11779,6 +11862,7 @@ class ACStateEstimator:
         )
         active_mask = np.ones(n_base, dtype=bool)
         masked_weights = base_weights.copy()
+        masked_values: Optional[np.ndarray] = None
         weight_boosted = False
         removed: List[BadDataItem] = []
         protected_keys: set = set()
@@ -11792,8 +11876,9 @@ class ACStateEstimator:
             )
             else None
         )
-        # 先按正常精度收敛完成状态估计，再基于收敛解辨识并按单步/总数上限排除坏数据
-        coarse_thr = None
+        # 对超大规模网络（n_state >= 2000）在首轮启用粗估早停：前期存在大批显性大残差点且主体已稳定时
+        # 提前切入批量删坏，避免首轮注定被废弃的尾部磨步拖垮总耗时
+        coarse_thr = float(threshold) if (self.n_state >= 2000 and max_remove > 0) else None
         init_aat_solver = (
             CholmodAAtNormalEquationSolver(assume_fixed_pattern=True, ordering_method="auto", multi_solve=True)
             if (self._aat_normal_solver_enabled() and max_remove > 0)
@@ -11964,6 +12049,7 @@ class ACStateEstimator:
                 verbose=verbose,
                 _defer_observability=need_slice_finalize,
                 _weight_override=masked_weights if need_slice_finalize else None,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -11987,6 +12073,7 @@ class ACStateEstimator:
                 verbose=verbose,
                 _defer_observability=need_slice_finalize,
                 _weight_override=masked_weights if need_slice_finalize else None,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -12212,7 +12299,7 @@ class ACStateEstimator:
             2) 若无高杠杆坏数据失衡，仅对贴边盲节点自身的电压伪量测局部抬升权重（×10，上限 10.0）重算。
             """
             nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
-            nonlocal need_slice_finalize, weight_boosted, shared_aat_solver
+            nonlocal need_slice_finalize, weight_boosted, shared_aat_solver, masked_values
             nonlocal unconverged_stall_rounds, unconverged_total_rounds
             if (
                 result.converged
@@ -12312,6 +12399,7 @@ class ACStateEstimator:
                             verbose=verbose,
                             _defer_observability=True,
                             _weight_override=masked_weights,
+                            _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
                         )
@@ -12368,6 +12456,7 @@ class ACStateEstimator:
                             verbose=verbose,
                             _defer_observability=True,
                             _weight_override=masked_weights,
+                            _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
                         )
@@ -12407,9 +12496,13 @@ class ACStateEstimator:
                         unconverged_total_rounds = 0
                         return True
 
+            v_lo_phys = float(self.voltage_min)
+            v_hi_phys = float(self.voltage_max)
             boosted = False
             for c in ext_cols:
-                for r in H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]:
+                col_boosted = False
+                col_rows = H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]
+                for r in col_rows:
                     r_i = int(r)
                     if (
                         active_mask[r_i]
@@ -12421,12 +12514,12 @@ class ACStateEstimator:
                         if new_w > cur_w + 1e-12:
                             masked_weights[r_i] = new_w
                             effective_base_weights[r_i] = new_w
+                            col_boosted = True
                             boosted = True
-            # 若配额用满后贴墙节点无电压伪量测可提权，但存在把节点电压直接拉死在物理极限墙上的极端离群真实 V 测点，
-            # 将该离群真实 V 测点安全降权至极弱（1e-4，保持列覆盖且不突破 max_remove 配额）以解救发散节点
-            if not boosted and result.residual is not None:
-                for c in ext_cols:
-                    for r in H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]:
+                # 若贴墙节点无电压伪量测可提权，但存在把节点电压直接拉死在物理极限墙上（如零电压 0.0 pu 或过压尖峰攻击）
+                # 的极端离群真实 V 测点，将其退化为极弱标称电压伪量测 (V=1.0 pu, w=1e-4) 以保持列覆盖并解救发散节点
+                if not col_boosted and result.residual is not None:
+                    for r in col_rows:
                         r_i = int(r)
                         if (
                             active_mask[r_i]
@@ -12435,9 +12528,21 @@ class ACStateEstimator:
                             and masked_weights[r_i] > 1e-3
                         ):
                             w_r = float(masked_weights[r_i])
-                            if abs(float(result.residual[r_i])) * np.sqrt(w_r) > max(2.0 * float(threshold), 8.0):
+                            z_r = (
+                                float(result.z_est[r_i]) + float(result.residual[r_i])
+                                if (result.z_est is not None and r_i < result.z_est.size)
+                                else 1.0
+                            )
+                            phys_oob = (z_r < v_lo_phys + 0.02) or (z_r > v_hi_phys - 0.02)
+                            if phys_oob or (
+                                abs(float(result.residual[r_i])) * np.sqrt(w_r) > max(2.0 * float(threshold), 8.0)
+                            ):
                                 masked_weights[r_i] = 1e-4
                                 effective_base_weights[r_i] = 1e-4
+                                if masked_values is None:
+                                    base_z_vec, _ = self._measurement_vectors(base_plan_tables)
+                                    masked_values = np.asarray(base_z_vec, dtype=np.float64).copy()
+                                masked_values[r_i] = 1.0
                                 boosted = True
             if not boosted:
                 return False
@@ -12449,6 +12554,7 @@ class ACStateEstimator:
                 verbose=verbose,
                 _defer_observability=True,
                 _weight_override=masked_weights,
+                _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
             )
@@ -12840,6 +12946,7 @@ class ACStateEstimator:
                                 verbose=verbose,
                                 _defer_observability=True,
                                 _weight_override=masked_weights,
+                                _value_override=masked_values,
                                 _shared_aat_solver=shared_aat_solver,
                                 _shared_aat_plan=shared_aat_plan,
                                 _woodbury_removed_rows=wb_rows,
@@ -12963,6 +13070,7 @@ class ACStateEstimator:
                     verbose=verbose,
                     _defer_observability=True,
                     _weight_override=masked_weights,
+                    _value_override=masked_values,
                     _shared_aat_solver=shared_aat_solver,
                     _shared_aat_plan=shared_aat_plan,
                     _woodbury_removed_rows=wb_rows,

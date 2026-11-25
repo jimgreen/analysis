@@ -491,7 +491,7 @@ def _build_meas_ppc_from_rows_dict(rows_dict: Dict, source: Path) -> Dict:
                 if len(fields) > status_col
                 else MEAS_STATUS_NORMAL if valid_values[row_pos] else MEAS_STATUS_INVALID
             )
-            if not measurement_status_is_active(status):
+            if status != MEAS_STATUS_NORMAL:
                 valid_values[row_pos] = False
             status_values[row_pos] = status
     else:
@@ -722,6 +722,10 @@ def _try_parse_meas_ppc_bulk_bytes(
         )
 
     if native_unique_names is not None:
+        if status_pos >= 0:
+            non_normal = status_values != MEAS_STATUS_NORMAL
+            if np.any(non_normal):
+                valid_values &= ~non_normal
         uniq_bytes_list = native_unique_names.split(b"\n") if native_unique_names else []
         name_to_id = dict(zip(uniq_bytes_list, range(len(uniq_bytes_list))))
         device_names_list = native_unique_names.decode("utf8").split("\n") if native_unique_names else []
@@ -803,7 +807,7 @@ def _try_parse_meas_ppc_bulk_bytes(
                 sc0 = _STATUS_BYTES_FAST_MAP.get(st0)
                 if sc0 is not None and st_toks.count(st0) == c_rows:
                     status_values[row_off:row_end] = sc0
-                    if sc0 in (MEAS_STATUS_INVALID, MEAS_STATUS_REMOVED):
+                    if sc0 != MEAS_STATUS_NORMAL:
                         valid_values[row_off:row_end] = False
                 else:
                     st_local_map = {}
@@ -816,7 +820,7 @@ def _try_parse_meas_ppc_bulk_bytes(
                         st_local_map[tok] = code
                     sc_arr = np.fromiter(map(st_local_map.__getitem__, st_toks), dtype=np.int16, count=c_rows)
                     status_values[row_off:row_end] = sc_arr
-                    inactive = (sc_arr == MEAS_STATUS_INVALID) | (sc_arr == MEAS_STATUS_REMOVED)
+                    inactive = sc_arr != MEAS_STATUS_NORMAL
                     if np.any(inactive):
                         valid_values[row_off:row_end] &= ~inactive
             else:
@@ -1208,7 +1212,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                 value_values.append(fields[value_pos])
                 if has_status and len(fields) > status_pos:
                     status = _normalize_status_bytes(fields[status_pos], valid)
-                    if not status_is_active(status):
+                    if status != MEAS_STATUS_NORMAL:
                         valid = False
                 else:
                     status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
@@ -1398,7 +1402,7 @@ def _build_meas_ppc_from_measurement_file(
                 value_append(to_float(fields[value_col]))
                 if status_col >= 0 and len(fields) > status_col:
                     status = _normalize_status_text(fields[status_col], valid)
-                    if not status_is_active(status):
+                    if status != MEAS_STATUS_NORMAL:
                         valid = False
                 else:
                     status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
@@ -1639,5 +1643,5 @@ def meas_ppc_active_mask(ppc: Dict) -> np.ndarray:
     return (
         valid
         & (weight > 0.0)
-        & ~np.isin(status, np.asarray([MEAS_STATUS_INVALID, MEAS_STATUS_REMOVED], dtype=np.int16))
+        & ((status == MEAS_STATUS_NORMAL) | (status == MEAS_STATUS_PSEUDO))
     )

@@ -1844,6 +1844,8 @@ class CholmodAAtNormalEquationSolver:
         self._pardiso_disabled = False
         self._active_backend = None
         self._last_normal_operand = None
+        self._last_factor_scaled = False
+        self._last_unscaled_diag = None
         self.assume_fixed_pattern = bool(assume_fixed_pattern)
         self.ordering_method = str(ordering_method or "auto")
         self.multi_solve = bool(multi_solve)
@@ -1983,10 +1985,35 @@ class CholmodAAtNormalEquationSolver:
         if not is_sparse_matrix(A):
             raise TypeError("CholmodAAtNormalEquationSolver requires a sparse weighted transpose matrix")
         A_csc = A if getattr(A, "format", None) == "csc" else A.tocsc()
+        # 高异构权重（法方程对角元跨度 > 1e4）加阻尼时，自动切换尺度不变 Jacobi 列均衡 Marquardt 相对阻尼，
+        # 避免绝对阻尼 β·I 对高权枢纽节点形同虚设、对低权开关支路过度压制导致 200 步慢爬。
+        col_scale = None
+        rhs_solve = rhs
+        A_solve = A_csc
+        self._last_factor_scaled = False
+        self._last_unscaled_diag = None
+        if float(damping) >= 0.05 and int(A_csc.shape[0]) > 0 and A_csc.nnz > 0:
+            diag_g = np.bincount(
+                A_csc.indices,
+                weights=A_csc.data * A_csc.data,
+                minlength=int(A_csc.shape[0]),
+            )
+            nz_diag = diag_g[diag_g > 1e-12]
+            diag_ratio = (float(nz_diag.max()) / float(nz_diag.min())) if nz_diag.size >= 2 else 1.0
+            # 仅在真正极端异构权重（对角元跨度 > 5e7）或重阻尼慢爬（跨度 > 5e5 且 damping >= 0.5）时
+            # 切入 Jacobi 列均衡 Marquardt，并交由 CHOLMOD 稳定执行，避免与 PARDISO 未缩放句柄并发占内存或跨尺度污染
+            if diag_ratio > 5e7 or (diag_ratio > 5e5 and float(damping) >= 0.5):
+                col_scale = 1.0 / np.sqrt(np.maximum(diag_g, 1e-12))
+                A_sc = A_csc.copy()
+                A_sc.data = A_csc.data * col_scale[A_csc.indices]
+                A_solve = A_sc
+                rhs_solve = np.asarray(rhs, dtype=np.float64) * col_scale
+                self._last_factor_scaled = True
+                self._last_unscaled_diag = diag_g
         pref = get_linear_solver_preference()
-        if self._should_use_pardiso(int(A_csc.shape[0]), int(A_csc.nnz)):
+        if col_scale is None and self._should_use_pardiso(int(A_solve.shape[0]), int(A_solve.nnz)):
             try:
-                return self._solve_sparse_pardiso(A_csc, rhs, damping=damping)
+                return self._solve_sparse_pardiso(A_solve, rhs_solve, damping=damping)
             except (TypeError, AttributeError):
                 self._reset_pardiso()
                 self._pardiso_disabled = True
@@ -2004,8 +2031,11 @@ class CholmodAAtNormalEquationSolver:
             and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None)
         ):
             try:
-                sol, diag = self._solve_sparse_cholmod_aat(A_csc, rhs, damping=damping)
+                sol, diag = self._solve_sparse_cholmod_aat(A_solve, rhs_solve, damping=damping)
                 self._active_backend = "cholmod"
+                if col_scale is not None:
+                    sol = np.asarray(sol, dtype=np.float64) * col_scale
+                    self._last_normal_operand = A_csc
                 return sol, diag
             except (TypeError, AttributeError):
                 # 仅在接口不兼容时禁用 CHOLMOD；数值奇异/病态仅本次回退，避免后续健康矩阵永久退化到慢速 SuperLU
@@ -2022,15 +2052,20 @@ class CholmodAAtNormalEquationSolver:
         if not allow_slow_fallback:
             self._active_backend = None
             return np.full(np.asarray(rhs, dtype=np.float64).shape, np.nan, dtype=np.float64), None
-        gain = A_csc @ A_csc.T
+        gain = A_solve @ A_solve.T
         if float(damping) > 0.0:
             gain = gain + SP_EYE(gain.shape[0], format="csc", dtype=np.float64) * float(damping)
         self._active_backend = "fallback"
-        return self._fallback_solver.solve(gain.tocsc(), rhs, return_factor_diag=return_factor_diag)
+        sol, diag = self._fallback_solver.solve(gain.tocsc(), rhs_solve, return_factor_diag=return_factor_diag)
+        if col_scale is not None:
+            sol = np.asarray(sol, dtype=np.float64) * col_scale
+        return sol, diag
 
     @property
     def last_cholmod_factor(self):
         """返回最近一次成功分解的稀疏正定因子对象（PARDISO 或 CHOLMOD，供坏数据杠杆计算与 Woodbury 复用）。"""
+        if self._last_factor_scaled:
+            return None
         if self._active_backend == "pardiso" and self._pardiso_factor is not None:
             return self._pardiso_factor
         return self._cholmod_factor
@@ -2042,6 +2077,8 @@ class CholmodAAtNormalEquationSolver:
 
     def unregularized_diagonal(self) -> Optional[np.ndarray]:
         """O(n) 返回最近一次 PARDISO 分解对应的无阻尼对角元 diag(A·A^T)，失败返回 None。"""
+        if self._last_factor_scaled and self._last_unscaled_diag is not None:
+            return self._last_unscaled_diag
         if self._active_backend == "pardiso" and self._pardiso_factor is not None:
             return self._pardiso_factor.unregularized_diagonal()
         return None

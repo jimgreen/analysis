@@ -303,12 +303,43 @@ class FluidStateEstimator:
             mt_ok = np.isin(mt_code, supported_mt_codes)
             raw_valid = np.asarray(raw_table.valid, dtype=bool)
             raw_weight = np.asarray(raw_table.weight, dtype=np.float64)
-            active_mask = dt_ok & (device_pos >= 0) & mt_ok & raw_valid & (raw_weight > 0.0)
+            raw_value = np.asarray(raw_table.value, dtype=np.float64)
+            raw_status = measurement_table_status_code(raw_table)
+
+            # 按需识别停运/关闭/死岛流体设备（仅扫描属于本网但未进入活网表的行）
+            inactive_by_type = getattr(net, "inactive_device_names_by_type", None) or {}
+            is_dead_or_inactive = np.zeros(n_all, dtype=bool)
+            if inactive_by_type:
+                dead_candidates = np.flatnonzero(dt_ok & (device_pos < 0) & valid_dn)
+                if dead_candidates.size:
+                    inactive_by_code = {
+                        int(DEVICE_TYPE_CODES[dtype]): name_set
+                        for dtype, name_set in inactive_by_type.items()
+                        if dtype in DEVICE_TYPE_CODES and name_set
+                    }
+                    if inactive_by_code:
+                        for r in dead_candidates.tolist():
+                            dset = inactive_by_code.get(int(dt_code[r]))
+                            if dset and dev_names_list[int(dn_id[r])] in dset:
+                                is_dead_or_inactive[r] = True
+
+            from secore.meas_prefilter import evaluate_fluid_measurement_prefilter
+
+            pf_keep, pf_reasons = evaluate_fluid_measurement_prefilter(
+                values=raw_value,
+                weights=raw_weight,
+                raw_valid=raw_valid,
+                raw_status=raw_status,
+                meas_type_code=mt_code,
+                params=self.params,
+                is_dead_or_inactive=is_dead_or_inactive,
+            )
+            active_mask = dt_ok & (device_pos >= 0) & mt_ok & pf_keep
 
             raw_table.device_type_code = dt_code
             raw_table.device_pos = device_pos
             raw_table.valid = active_mask.copy()
-            raw_status = measurement_table_status_code(raw_table)
+            setattr(raw_table, "prefilter_reason", pf_reasons)
 
             act_rows = np.flatnonzero(active_mask)
             active_table = MeasurementTable(
@@ -319,7 +350,7 @@ class FluidStateEstimator:
                 meas_type=np.empty(0, dtype=object),
                 weight=raw_weight[act_rows],
                 valid=np.ones(act_rows.size, dtype=bool),
-                value=np.asarray(raw_table.value, dtype=np.float64)[act_rows],
+                value=raw_value[act_rows],
                 device_type_code=dt_code[act_rows],
                 angle_mask=np.zeros(act_rows.size, dtype=bool),
                 status_code=raw_status[act_rows].copy(),
@@ -338,10 +369,14 @@ class FluidStateEstimator:
                 for r in bad_rows.tolist():
                     if not bool(dt_ok[r]):
                         reason = "foreign network measurement"
+                    elif bool(is_dead_or_inactive[r]):
+                        reason = str(pf_reasons[r]) or "dead_island"
                     elif int(device_pos[r]) < 0:
                         reason = "unknown device"
                     elif not bool(mt_ok[r]):
                         reason = "unsupported measurement type"
+                    elif str(pf_reasons[r]):
+                        reason = str(pf_reasons[r])
                     elif not bool(raw_valid[r]):
                         reason = "invalid"
                     else:
@@ -356,6 +391,9 @@ class FluidStateEstimator:
             self._rebuild_measurement_groups()
             return
 
+        from secore.meas_prefilter import check_single_fluid_measurement_prefilter
+
+        inactive_by_type = getattr(net, "inactive_device_names_by_type", None) or {}
         active = []
         prefiltered = []
         for measurement in self.measurements:
@@ -367,17 +405,37 @@ class FluidStateEstimator:
             measurement.device_type_code = int(DEVICE_TYPE_CODES.get(str(measurement.device_type), 0))
             measurement.meas_type_code = int(MEAS_TYPE_CODES.get(measurement.meas_type, 0))
             measurement.device_pos = self._device_position(measurement)
+            is_dead = (
+                measurement.device_pos < 0
+                and str(measurement.device_name) in inactive_by_type.get(str(measurement.device_type), ())
+            )
             reason = ""
             if not str(measurement.device_type).startswith(prefix):
                 reason = "foreign network measurement"
+            elif is_dead:
+                reason = check_single_fluid_measurement_prefilter(
+                    value=float(measurement.value),
+                    weight=float(measurement.weight),
+                    valid=bool(measurement.valid),
+                    status=int(getattr(measurement, "status", 0)),
+                    meas_type=measurement.meas_type,
+                    params=self.params,
+                    is_dead_or_inactive=True,
+                ) or "dead_island"
             elif measurement.device_pos < 0:
                 reason = "unknown device"
             elif measurement.meas_type not in SUPPORTED_MEASUREMENT_TYPES:
                 reason = "unsupported measurement type"
-            elif not bool(measurement.valid):
-                reason = "invalid"
-            elif float(measurement.weight) <= 0.0:
-                reason = "zero weight"
+            else:
+                reason = check_single_fluid_measurement_prefilter(
+                    value=float(measurement.value),
+                    weight=float(measurement.weight),
+                    valid=bool(measurement.valid),
+                    status=int(getattr(measurement, "status", 0)),
+                    meas_type=measurement.meas_type,
+                    params=self.params,
+                    is_dead_or_inactive=False,
+                )
             if reason:
                 measurement.valid = False
                 prefiltered.append((measurement, reason))
@@ -2607,19 +2665,18 @@ class FluidStateEstimator:
 
             obj_change = abs(prev_objective - cached_objective)
             actual_rel_dx = accepted_step * rel_correction
-            # 自适应阻尼调节：满步成功时温和放松，连续回溯/微步或无阻尼满步慢发散时抬升阻尼抑制震荡
+            # 自适应阻尼调节：满步成功时温和放松，连续回溯/微步或满步慢发散（含已加阻尼仍不收缩）时阶梯抬升阻尼抑制震荡
             if accepted_step >= 0.5:
                 backtrack_streak = max(0, backtrack_streak - 1)
                 if (
-                    step_damping == 0.0
-                    and max_correction > max(self.tol, 1e-5)
+                    max_correction > max(self.tol, 1e-5)
                     and max_correction >= 0.95 * prev_max_correction
                     and obj_change <= 1e-4 * (abs(prev_objective) + 1.0)
                 ):
                     fullstep_osc_streak += 1
                     if fullstep_osc_streak >= 4:
-                        # 无阻尼高斯-牛顿出现局部残差曲率谱半径 >= 1 的满步慢发散，自动切入温和曲率阻尼
-                        lm_damping = max(lm_damping, 0.1)
+                        # 高斯-牛顿或轻阻尼下仍出现局部残差曲率谱半径 >= 1 的满步慢发散，阶梯抬升曲率阻尼镇压发散
+                        lm_damping = min(100.0, max(lm_damping * 5.0, 0.1))
                         curvature_damping_active = True
                         fullstep_osc_streak = 0
                 else:

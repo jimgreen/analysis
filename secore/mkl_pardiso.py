@@ -720,8 +720,9 @@ class MKLPardisoFactor:
         """配置 Intel oneMKL PARDISO 参数数组。"""
         self._iparm.fill(0)
         self._iparm[0] = 1
-        # 大矩阵优先并行 OpenMP METIS (3)，小中矩阵串行 METIS (2) 更低开销
-        self._iparm[1] = 3 if (self._parallel_metis and self._n >= 8000) else 2
+        # 统一使用稳定串行 METIS (2) 执行一次性 phase=11 符号重排，规避 Intel oneMKL 2026 并行 METIS (3)
+        # 在 Windows 多轮大矩阵 phase=22 重分解下引发的原生段错误（access violation）；phase=22/33 仍全核并行
+        self._iparm[1] = 2
         self._iparm[9] = 8
         self._iparm[17] = -1
         self._iparm[18] = 0

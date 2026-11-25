@@ -416,6 +416,10 @@ class FluidNetwork:
         self.sources.extend(
             item for item in self.storages if id(item) not in known_sources
         )
+        all_nodes_before = list(self.nodes)
+        all_sources_before = list(self.sources)
+        all_loads_before = list(self.loads)
+        all_exchangers_before = list(self.heat_exchangers)
         live_nodes = [node for node in self.nodes if int(node.run_stat) == 1]
         if not live_nodes:
             raise RuntimeError(f"{self.prefix} network has no live nodes")
@@ -521,6 +525,38 @@ class FluidNetwork:
             and int(edge.i_node) in self.node_pos_by_idx
             and int(edge.j_node) in self.node_pos_by_idx
         ]
+        # 记录停运/关闭/关联停运节点的非活跃流体设备名，供量测预过滤识别死岛/停运异常
+        inactive_by_type: Dict[str, set] = {}
+        live_node_names = {str(n.name) for n in live_nodes}
+        dead_nodes = {str(n.name) for n in all_nodes_before if str(n.name) not in live_node_names}
+        if dead_nodes:
+            inactive_by_type[f"{self.prefix}Node"] = dead_nodes
+        live_src_ids = {id(item) for item in self.sources}
+        for item in all_sources_before:
+            if id(item) not in live_src_ids:
+                dtype = f"{self.prefix}Storage" if isinstance(item, FluidStorage) else f"{self.prefix}Source"
+                inactive_by_type.setdefault(dtype, set()).add(str(item.name))
+        live_load_ids = {id(item) for item in self.loads}
+        for item in all_loads_before:
+            if id(item) not in live_load_ids:
+                inactive_by_type.setdefault(f"{self.prefix}Load", set()).add(str(item.name))
+        live_exch_ids = {id(item) for item in self.heat_exchangers}
+        for item in all_exchangers_before:
+            if id(item) not in live_exch_ids:
+                inactive_by_type.setdefault("HeatExchanger", set()).add(str(item.name))
+        live_edge_ids = {id(edge) for edge in self.edges}
+        ctrl_type = f"{self.prefix}Pump" if self.thermal else (f"{self.prefix}Regulator" if self.steam else f"{self.prefix}Compressor")
+        for edge in all_edges:
+            if id(edge) not in live_edge_ids:
+                kind = str(getattr(edge, "kind", "PIPE")).upper()
+                if kind == "PIPE":
+                    dtype = f"{self.prefix}Pipe"
+                elif kind == "VALVE":
+                    dtype = f"{self.prefix}Valve"
+                else:
+                    dtype = ctrl_type
+                inactive_by_type.setdefault(dtype, set()).add(str(edge.name))
+        self.inactive_device_names_by_type = inactive_by_type
         self.edge_name = np.asarray([edge.name for edge in self.edges], dtype=object)
         self.edge_kind = np.asarray([edge.kind for edge in self.edges], dtype=object)
         self.edge_control_type = np.asarray(
