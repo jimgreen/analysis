@@ -46,6 +46,7 @@ from model.meas_model import (
 from model.meas_type import DEVICE_TYPE_CODES, DEVICE_TYPE_NAMES, MEAS_TYPE_CODES, MEAS_TYPE_NAMES
 from secore.se_math import (
     AndersonAccelerator,
+    NielsenTrustRegionController,
     nielsen_lm_damping_update,
     CholmodAAtNormalEquationPlan,
     CholmodAAtNormalEquationSolver,
@@ -2549,7 +2550,8 @@ class FluidStateEstimator:
         curvature_damping_active = False
         singular_fail_count = 0
         singular_min_damping = 0.0
-        aa_accel = AndersonAccelerator(m=4)
+        aa_accel = AndersonAccelerator(m=5)
+        tr_ctrl = NielsenTrustRegionController()
         prev_max_correction = np.inf
         tried_undamped_escape = False
         pre_escape_max_correction = np.inf
@@ -2734,7 +2736,10 @@ class FluidStateEstimator:
                 rhs_kkt = rhs.copy() if pinned_pot.size > 0 else rhs
                 if pinned_pot.size > 0:
                     rhs_kkt[pinned_pot] = 0.0
-                kkt_inf = float(np.max(np.abs(rhs_kkt) / np.maximum(diag_g, 1e-12)))
+                # 流体状态含高压/高焓等大尺度物理量，按 max(|x_i|, 1.0) 归一化得到无量纲相对 KKT 残差
+                kkt_inf = float(
+                    np.max(np.abs(rhs_kkt) / (np.maximum(diag_g, 1e-12) * np.maximum(np.abs(x), 1.0)))
+                )
             else:
                 kkt_inf = np.inf
             if step_damping == 0.0 and (
@@ -2842,6 +2847,7 @@ class FluidStateEstimator:
 
             obj_change = abs(prev_objective - cached_objective)
             actual_rel_dx = accepted_step * rel_correction
+            gn_actual_drop = prev_objective - cached_objective
             # 支柱 2：连续满步慢线性收敛时尝试 Type-II Anderson 加速（严格目标单调保护）
             if accepted_step >= 0.95 and max_correction > 10.0 * self.tol:
                 aa_ratio = (
@@ -2854,7 +2860,7 @@ class FluidStateEstimator:
                     x,
                     step_ratio=aa_ratio,
                     damping=step_damping,
-                    allow_propose=(rel_correction < 0.5),
+                    allow_propose=(rel_correction < 0.5 and step_damping < 10.0),
                 )
                 if x_aa is not None and (
                     self.n_potential == 0 or bool(np.all(x_aa[: self.n_potential] >= minimum))
@@ -2863,12 +2869,13 @@ class FluidStateEstimator:
                     aa_r = z - aa_z
                     aa_obj = float(np.dot(weight, aa_r * aa_r))
                     if np.isfinite(aa_obj) and aa_obj < cached_objective - max(1e-12, 1e-10 * (abs(cached_objective) + 1.0)):
+                        aa_jump = float(np.max(np.abs(x_aa - x) / np.maximum(np.abs(x), 1.0))) if x_aa.size else 0.0
                         x = x_aa
                         cached_z_est = aa_z
                         cached_residual = aa_r
                         cached_objective = aa_obj
                         obj_change = abs(prev_objective - cached_objective)
-                        aa_accel.on_accepted()
+                        aa_accel.on_accepted(step_norm=aa_jump)
                     else:
                         aa_accel.on_rejected()
                 elif x_aa is not None:
@@ -2876,11 +2883,35 @@ class FluidStateEstimator:
             else:
                 aa_accel.reset()
 
-            # 支柱 1：基于精确 LM 增益比 ρ 的 Nielsen (1999) 连续光滑阻尼更新律（全步长统一决策）
+            # 支柱 1：带退避倍率 ν 与反极限环下界记忆的 Nielsen (1999) 连续阻尼更新律（严格用本步 step_damping 与纯单步降幅）
+            rho_lm = 1.0
+            if step_damping > 0.0:
+                lm_damping, rho_lm = tr_ctrl.update(
+                    step_damping,
+                    rhs,
+                    dx,
+                    gn_actual_drop,
+                    accepted_step,
+                    current_obj=cached_objective,
+                    half_obj=False,
+                    diag_reg=diag_g,
+                    min_damping=singular_min_damping,
+                    max_damping=100.0,
+                    zero_cutoff=1e-4 if curvature_damping_active else 1e-6,
+                    dx_growing=(max_correction > 1.2 * prev_max_correction),
+                    cliff_step=1e-2,
+                    cliff_bump=10.0,
+                )
+                if lm_damping <= 0.0:
+                    curvature_damping_active = False
+                    backtrack_streak = 0
             if accepted_step >= 0.5:
                 backtrack_streak = max(0, backtrack_streak - 1)
+                # 仅在无阻尼或非良态二次收敛（rho 偏离 1）时检测满步振荡，避免把阻尼缩减导致的合理步长放大误判为振荡
+                good_quad_step = (step_damping > 0.0) and np.isfinite(rho_lm) and (0.80 <= rho_lm <= 1.20)
                 if (
-                    max_correction > max(self.tol, 1e-5)
+                    (not good_quad_step)
+                    and max_correction > max(self.tol, 1e-5)
                     and (
                         max_correction >= 0.95 * prev_max_correction
                         or obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
@@ -2891,6 +2922,7 @@ class FluidStateEstimator:
                     if fullstep_osc_streak >= 4:
                         lm_damping = min(100.0, max(lm_damping * 5.0, 0.1))
                         curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(lm_damping, cached_objective)
                         fullstep_osc_streak = 0
                 else:
                     fullstep_osc_streak = 0
@@ -2903,29 +2935,14 @@ class FluidStateEstimator:
                     if fullstep_osc_streak >= 4:
                         lm_damping = min(100.0, max(lm_damping * 5.0, 0.1))
                         curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(lm_damping, cached_objective)
                         fullstep_osc_streak = 0
                 else:
                     fullstep_osc_streak = 0
                 backtrack_streak += 1
                 if lm_damping <= 0.0 and (backtrack_streak >= 2 or accepted_step < 1e-2):
                     lm_damping = min(100.0, max(1e-3, singular_min_damping))
-                    backtrack_streak = 0
-            if lm_damping > 0.0:
-                lm_damping, _rho_lm = nielsen_lm_damping_update(
-                    lm_damping,
-                    rhs,
-                    dx,
-                    prev_objective - cached_objective,
-                    accepted_step,
-                    half_obj=False,
-                    diag_reg=diag_g,
-                    min_damping=singular_min_damping,
-                    max_damping=100.0,
-                    zero_cutoff=1e-4 if curvature_damping_active else 1e-6,
-                    dx_growing=(max_correction > 1.2 * prev_max_correction),
-                )
-                if lm_damping <= 0.0:
-                    curvature_damping_active = False
+                    tr_ctrl.notify_damping_activated(lm_damping, cached_objective)
                     backtrack_streak = 0
             prev_max_correction = max_correction
 
@@ -2971,6 +2988,7 @@ class FluidStateEstimator:
                     if step_damping > 0.0:
                         lm_damping = 0.0
                         curvature_damping_active = False
+                        tr_ctrl.reset()
                         tried_undamped_escape = True
                         pre_escape_max_correction = max_correction
                         stagnation_streak = 0
@@ -2986,17 +3004,26 @@ class FluidStateEstimator:
                 if high_damp_stagnation_streak >= 6:
                     lm_damping = 0.0
                     curvature_damping_active = False
+                    tr_ctrl.reset()
                     tried_undamped_escape = True
                     pre_escape_max_correction = max_correction
                     high_damp_stagnation_streak = 0
                     high_damp_slow_streak = 0
-            elif step_damping >= 1.0 and obj_change <= rel_obj_tol_slow:
+            elif (
+                step_damping >= 1.0
+                and obj_change <= (
+                    max(1e-12, 5e-3 * (abs(prev_objective) + 1.0))
+                    if step_damping >= 10.0
+                    else rel_obj_tol_slow
+                )
+            ):
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak += 1
                 if high_damp_slow_streak >= 12:
                     lm_damping = 0.0
                     curvature_damping_active = False
+                    tr_ctrl.reset()
                     tried_undamped_escape = True
                     pre_escape_max_correction = max_correction
                     high_damp_slow_streak = 0
@@ -3009,6 +3036,7 @@ class FluidStateEstimator:
                 if step_damping > 0.0:
                     lm_damping = 0.0
                     curvature_damping_active = False
+                    tr_ctrl.reset()
                     tried_undamped_escape = True
                     pre_escape_max_correction = max_correction
                 else:

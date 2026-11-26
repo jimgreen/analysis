@@ -6545,6 +6545,45 @@ def test_pseudo_measurement_participates_in_bad_data_removal(tmp_path):
     assert pseudo_idx in removed_idxs
 
 
+def test_nielsen_trust_region_controller_anti_limit_cycle_and_anderson_rolling_window():
+    """验证 NielsenTrustRegionController 反极限环下界记忆与自动解锁，及 AA 小步滚动窗口。"""
+    from secore.se_math import AndersonAccelerator, NielsenTrustRegionController
+
+    ctrl = NielsenTrustRegionController()
+    rhs = np.array([1.0, 1.0], dtype=np.float64)
+    dx = np.array([1.0, 1.0], dtype=np.float64)
+    # 两次“缩减 -> 回溯反弹”后，控制器必须锁定 bounce_floor，阻止第三次跌穿临界阻尼
+    lam, _ = ctrl.update(0.4, rhs, dx, actual_drop=1.2, step_scale=1.0, current_obj=100.0, half_obj=True)
+    assert lam < 0.4
+    lam, _ = ctrl.update(lam, rhs, dx, actual_drop=0.05, step_scale=0.25, current_obj=99.9, half_obj=True)
+    assert lam > 0.2
+    lam2, _ = ctrl.update(lam, rhs, dx, actual_drop=1.5, step_scale=1.0, current_obj=99.0, half_obj=True)
+    assert lam2 < lam
+    lam3, _ = ctrl.update(lam2, rhs, dx, actual_drop=0.05, step_scale=0.25, current_obj=98.9, half_obj=True)
+    assert ctrl.bounce_floor > 0.0
+    # 目标尚未大幅下降时，即便 rho≈1 也不允许跌破 bounce_floor
+    lam_hold, _ = ctrl.update(lam3, rhs, dx, actual_drop=2.0, step_scale=1.0, current_obj=97.0, half_obj=True)
+    assert lam_hold >= ctrl.bounce_floor - 1e-12
+    # 目标下降 >=10%（离开高曲率区）且模型匹配良态（rho≈1）后，自动释放下界恢复二阶缩减
+    lam_free, _ = ctrl.update(lam_hold, rhs, dx, actual_drop=1.0 + lam_hold, step_scale=1.0, current_obj=80.0, half_obj=True)
+    assert ctrl.bounce_floor == 0.0
+    assert lam_free < lam_hold
+
+    # 验证 AndersonAccelerator 光滑小步采纳时保留切空间，大步采纳时重置
+    aa = AndersonAccelerator(m=5)
+    for k in range(4):
+        xp = np.array([1.0 / (k + 1), 0.5 / (k + 1)], dtype=np.float64)
+        xn = xp * 0.9
+        aa.update_and_propose(xp, xn, step_ratio=0.9, damping=0.0, allow_propose=False)
+    assert len(aa._df_hist) == 3
+    aa.on_accepted(step_norm=0.01)
+    assert len(aa._df_hist) == 3
+    assert aa._last_x is None
+    aa.on_accepted(step_norm=0.1)
+    assert len(aa._df_hist) == 0
+
+
+
 
 
 

@@ -124,6 +124,7 @@ from model.meas_model import (
 )
 from secore.se_math import (
     AndersonAccelerator,
+    NielsenTrustRegionController,
     nielsen_lm_damping_update,
     projected_box_kkt_residual,
     CHOLMOD_ANALYZE_AAT,
@@ -10283,7 +10284,8 @@ class ACStateEstimator:
         backtrack_streak = 0
         curvature_damping_active = False
         fullstep_osc_streak = 0
-        aa_accel = AndersonAccelerator(m=4)
+        aa_accel = AndersonAccelerator(m=5)
+        tr_ctrl = NielsenTrustRegionController()
         curv_stagnation_streak = 0
         curv_stagnation_best_g = np.inf
         flat_valley_streak = 0
@@ -10989,6 +10991,7 @@ class ACStateEstimator:
             prev_rms_correction = float(np.sqrt(float(np.dot(dx, dx)) / dx.size)) if dx.size else 0.0
             objective_change = abs(previous_objective - objective)
             stagnation_tol = max(1e-14, 1e-10 * (abs(previous_objective) + 1.0))
+            gn_actual_drop = previous_objective - objective
             if (
                 accepted_step is not None
                 and accepted_step >= 0.95
@@ -11013,13 +11016,14 @@ class ACStateEstimator:
                     self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
                     aa_obj = self._weighted_objective(weight, cand_residual)
                     if np.isfinite(aa_obj) and aa_obj < objective - max(1e-12, 1e-10 * (abs(objective) + 1.0)):
+                        aa_jump = float(np.max(np.abs(x_aa - x))) if x_aa.size else 0.0
                         x = x_aa
                         z_est, cand_z_est = cand_z_est, z_est
                         residual, cand_residual = cand_residual, residual
                         objective = aa_obj
                         objective_change = abs(previous_objective - objective)
                         prev_step_accepted = False
-                        aa_accel.on_accepted()
+                        aa_accel.on_accepted(step_norm=aa_jump)
                     else:
                         aa_accel.on_rejected()
                 elif x_aa is not None:
@@ -11027,19 +11031,20 @@ class ACStateEstimator:
             else:
                 aa_accel.reset()
 
-            # 支柱 1：基于精确 LM 信赖域增益比 ρ 的 Nielsen (1999) 连续阻尼更新律
+            # 支柱 1：带退避倍率 ν 与反极限环下界记忆的 Nielsen (1999) 连续阻尼更新律（严格使用纯 GN/LM 单步降幅）
             if curvature_damping_active and step_damping > 0.0:
                 diag_reg_lm = (
                     aat_solver.unregularized_diagonal()
                     if (not used_box_pin_step and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)))
                     else None
                 )
-                new_d, _rho_lm = nielsen_lm_damping_update(
+                new_d, _rho_lm = tr_ctrl.update(
                     step_damping,
                     rhs,
                     dx,
-                    previous_objective - objective,
+                    gn_actual_drop,
                     accepted_step if accepted_step is not None else 0.0,
+                    current_obj=objective,
                     half_obj=True,
                     diag_reg=diag_reg_lm,
                     min_damping=0.0,
@@ -11063,6 +11068,7 @@ class ACStateEstimator:
                         break
                     force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
                     curvature_damping_active = True
+                    tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                     micro_step_streak = 0
                     backtrack_streak = 0
                     prev_step_accepted = False
@@ -11075,6 +11081,7 @@ class ACStateEstimator:
                         hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                         force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                         curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                         prev_step_accepted = False
                     backtrack_streak = 0
             elif accepted_step is not None and accepted_step >= 0.5:
@@ -11095,6 +11102,7 @@ class ACStateEstimator:
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                             force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                             curvature_damping_active = True
+                            tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                             backtrack_streak = 0
                             fullstep_osc_streak = 0
                             prev_step_accepted = False

@@ -5971,13 +5971,172 @@ class AndersonAccelerator:
             return None
         return x_aa
 
-    def on_accepted(self) -> None:
-        """外推点被采纳后重置旧切空间，避免跨越大距离后使用过时线性化。"""
-        self.reset()
+    def on_accepted(self, step_norm: Optional[float] = None) -> None:
+        """大跨度外推采纳后重置旧切空间；局部线性化半径内（<=0.02）小步外推保留滚动窗口以形成多维 Krylov 加速。"""
+        if step_norm is None or (not np.isfinite(float(step_norm))) or float(step_norm) > 0.02:
+            self.reset()
+        else:
+            # 仅清空上一锚点对，防止外推跳转向量被误算作不动点差分，同时保留已累积的高维切空间
+            self._last_x = None
+            self._last_f = None
 
     def on_rejected(self) -> None:
         """外推点未降低目标函数时清空窗口并重新积累，防止连续无效试探。"""
         self.reset()
+
+
+class NielsenTrustRegionController:
+    """带 Nielsen (1999) 退避倍率 ν 与反极限环安全下界记忆的信赖域阻尼控制器。
+
+    解决无状态阻尼更新律在强非凸/大残差临界阻尼附近出现的“1/3 猛降 → 撞壁回溯/归零弹回 → 再猛降”周期极限环：
+    1. 完整实现 Nielsen 退避倍率 ``nu``（每次回溯 ``lam *= nu; nu = min(16, 2*nu)``，良态满步重置 ``nu=2``）；
+    2. 对流体等非光滑悬崖极微步（``alpha < cliff_step``）支持单步跃迁（``cliff_bump``）；
+    3. 当探测到 2 次“降阻尼/归零 → 回溯或严重失配弹回”反弹时，锁定临界阻尼安全下界 ``bounce_floor``，
+       让系统稳停在最优曲率阻尼台阶并使 Anderson 加速窗口稳定生效；
+    4. 一旦目标函数相对反弹点显著下降（默认 >= 10%），说明已离开高曲率区，自动释放 ``bounce_floor`` 恢复二阶收敛。
+    """
+
+    def __init__(self) -> None:
+        self.nu: float = 2.0
+        self.bounce_floor: float = 0.0
+        self.bounce_ref_obj: float = np.inf
+        self.bounce_count: int = 0
+        self._was_reduced: bool = False
+        self._just_zeroed: bool = False
+        self._last_safe_nonzero: float = 0.0
+        self._good_streak: int = 0
+
+    def reset(self) -> None:
+        self.nu = 2.0
+        self.bounce_floor = 0.0
+        self.bounce_ref_obj = np.inf
+        self.bounce_count = 0
+        self._was_reduced = False
+        self._just_zeroed = False
+        self._last_safe_nonzero = 0.0
+        self._good_streak = 0
+
+    def notify_damping_activated(self, new_lam: float, current_obj: float = np.inf) -> None:
+        """外部由无阻尼态重新激活阻尼时调用，检测“归零即撞壁弹回”极限环。"""
+        lam_v = max(0.0, float(new_lam))
+        if self._just_zeroed and lam_v > 0.0:
+            self.bounce_count += 1
+            if self.bounce_count >= 2:
+                self.bounce_floor = max(self.bounce_floor, max(self._last_safe_nonzero, 1e-3))
+                if np.isfinite(current_obj):
+                    self.bounce_ref_obj = min(self.bounce_ref_obj, float(current_obj))
+        self._just_zeroed = False
+        self._was_reduced = False
+        if lam_v > 0.0:
+            self._last_safe_nonzero = max(self._last_safe_nonzero, lam_v)
+
+    def update(
+        self,
+        damping: float,
+        rhs: Optional[np.ndarray],
+        dx: Optional[np.ndarray],
+        actual_drop: float,
+        step_scale: float = 1.0,
+        *,
+        current_obj: float = np.inf,
+        half_obj: bool = True,
+        diag_reg: Optional[np.ndarray] = None,
+        min_damping: float = 0.0,
+        max_damping: float = 100.0,
+        zero_cutoff: float = 1e-4,
+        dx_growing: bool = False,
+        cliff_step: float = 0.0,
+        cliff_bump: float = 10.0,
+    ) -> Tuple[float, float]:
+        lam = max(0.0, float(damping))
+        alpha = float(step_scale)
+        d_min = max(0.0, float(min_damping))
+        d_max = max(d_min, float(max_damping))
+
+        # 目标函数相对上次反弹点下降 >= 10% 或连续 8 步完美二次匹配，自动释放下界记忆恢复二阶收敛
+        if self.bounce_floor > 0.0 and (
+            (
+                np.isfinite(current_obj)
+                and np.isfinite(self.bounce_ref_obj)
+                and float(current_obj) <= 0.90 * self.bounce_ref_obj
+            )
+            or self._good_streak >= 8
+        ):
+            self.bounce_floor = 0.0
+            self.bounce_count = 0
+            self.bounce_ref_obj = np.inf
+            self.nu = 2.0
+            self._good_streak = 0
+
+        eff_min = min(d_max, max(d_min, self.bounce_floor))
+        base_new, rho = nielsen_lm_damping_update(
+            lam,
+            rhs,
+            dx,
+            actual_drop,
+            alpha,
+            half_obj=half_obj,
+            diag_reg=diag_reg,
+            min_damping=eff_min,
+            max_damping=d_max,
+            zero_cutoff=zero_cutoff,
+            dx_growing=dx_growing,
+        )
+        if lam <= 0.0:
+            return 0.0, float(rho)
+
+        rho_eff = (rho if rho <= 1.0 else max(0.0, 2.0 - rho)) if np.isfinite(rho) else 0.0
+        is_backtrack = (alpha < 0.5) or (np.isfinite(rho) and rho <= 0.0)
+        is_poor_model = (alpha >= 0.8) and (rho_eff < 0.45)
+
+        if is_backtrack or is_poor_model:
+            self._good_streak = 0
+            if self._was_reduced:
+                # 严格仅对“缩减阻尼后立即碰壁弹回”的真实极限环计数并记录安全下界（上限 <= 0.25 * d_max）
+                self.bounce_count += 1
+                if self.bounce_count >= 2:
+                    floor_cap = max(d_min, 0.25 * d_max)
+                    self.bounce_floor = min(floor_cap, max(self.bounce_floor, 1.25 * lam))
+                    if np.isfinite(current_obj):
+                        self.bounce_ref_obj = min(self.bounce_ref_obj, float(current_obj))
+            if is_backtrack:
+                if cliff_step > 0.0 and alpha < float(cliff_step):
+                    bump = max(self.nu, float(cliff_bump))
+                else:
+                    bump = self.nu
+                new_lam = min(d_max, max(eff_min, lam * bump, max(1e-3, eff_min)))
+                self.nu = min(4.0, self.nu * 2.0)
+            else:
+                bump = max(1.5, 0.5 * self.nu) if rho_eff >= 0.25 else max(2.0, self.nu)
+                new_lam = min(d_max, max(eff_min, lam * bump))
+            self._was_reduced = False
+            self._just_zeroed = False
+            self._last_safe_nonzero = new_lam
+            return float(new_lam), float(rho)
+
+        # 良态步：重置退避倍率，受 eff_min 保护不跌穿已探明临界阻尼下界
+        if alpha >= 0.8:
+            self.nu = 2.0
+            if self.bounce_floor > 0.0 and (0.85 <= rho <= 1.15) and not dx_growing:
+                self._good_streak += 1
+            else:
+                self._good_streak = 0
+        else:
+            self._good_streak = 0
+        new_lam = float(base_new)
+        if eff_min > 0.0 and new_lam < eff_min:
+            new_lam = eff_min
+        if new_lam <= 0.0:
+            self._just_zeroed = True
+            self._last_safe_nonzero = max(lam, float(zero_cutoff))
+            self._was_reduced = True
+        else:
+            self._just_zeroed = False
+            if new_lam < lam - 1e-15:
+                self._was_reduced = True
+            elif new_lam >= 0.99 * lam:
+                self._last_safe_nonzero = new_lam
+        return float(new_lam), float(rho)
 
 
 def nielsen_lm_damping_update(

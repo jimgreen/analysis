@@ -182,6 +182,7 @@ from secore.se_array_plan import (
 )
 from secore.se_math import (
     AndersonAccelerator,
+    NielsenTrustRegionController,
     nielsen_lm_damping_update,
     projected_box_kkt_residual,
     CHOLMOD_ANALYZE_AAT,
@@ -9222,7 +9223,7 @@ class HybridStateEstimator:
         return count
 
     def _add_targeted_observability_pseudo_measurements(self) -> int:
-        """Patch remaining hybrid rank deficiencies without applying a pseudo-count cap."""
+        """Patch remaining hybrid rank deficiencies via weak-direction targeted pseudo measurements."""
         delegate = self._delegate()
         if delegate is not None:
             return int(getattr(delegate, "targeted_observability_pseudo_count", 0))
@@ -9234,51 +9235,94 @@ class HybridStateEstimator:
         if observability.observable:
             self._initial_observability_cache = observability
             return 0
-        angle_col = np.asarray(getattr(self, "ac_theta_state_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
-        active_angle_cols = angle_col[angle_col >= 0]
-        if active_angle_cols.size:
-            cache = self._observability_matrix_cache_for(observability, self.active_measurements, self.initial_state())
-            H = cache.get("H") if cache is not None else self.jacobian_sparse(self.initial_state(), self.active_measurements)
-            unanchored = unanchored_angle_state_indices(H, active_angle_cols)
-            if unanchored and int(getattr(observability, "deficiency", 0) or 0) <= len(unanchored):
-                return 0
-        candidates = self._observability_pseudo_candidate_measurements()
-        if not candidates:
-            self._initial_observability_cache = observability
-            return 0
-        existing_keys = set(self._active_measurement_keys())
-        next_idx = self._next_measurement_idx()
-        selected = []
-        for candidate in candidates:
-            device_type_code = int(getattr(candidate, "device_type_code", 0))
-            meas_type_code = int(getattr(candidate, "meas_type_code", 0))
-            device_pos = int(getattr(candidate, "device_pos", -1))
-            if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
-                continue
-            key = self._packed_measurement_key(device_type_code, device_pos, meas_type_code)
-            if key < 0 or key in existing_keys:
-                continue
-            if self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code):
-                continue
-            candidate.idx = next_idx
-            next_idx += 1
-            candidate.device_type_code = device_type_code
-            candidate.meas_type_code = meas_type_code
-            candidate.device_pos = device_pos
-            mark_measurement_pseudo(candidate)
-            selected.append(candidate)
-            existing_keys.add(key)
-        if not selected:
-            self._initial_observability_cache = observability
-            return 0
-        measurement_count_before = len(self.measurements)
-        self._append_pseudo_measurement_objects(selected)
-        appended = self.measurements[measurement_count_before:]
-        if not self._incremental_update_active_measurement_state_layout(appended):
-            self._refresh_active_measurement_state_layout()
-        self._observability_matrix_cache = None
-        self._initial_observability_cache = self.observability_analysis()
-        return len(selected)
+
+        total_added = 0
+        # 优先按零空间弱方向分批精准定向补盲（消除辐射叶节点等局部缺秩而不引入数百条多余伪量测）
+        for _round in range(12):
+            self._observability_pseudo_candidate_cache = None
+            candidates = self._observability_pseudo_candidate_measurements()
+            if not candidates:
+                break
+            deficiency = max(1, int(getattr(observability, "deficiency", 1) or 1))
+            batch_limit = max(4, min(64, 2 * deficiency))
+            picked = self._select_weak_direction_pseudo_candidates(observability, candidates, batch_limit)
+            if not picked:
+                break
+            existing_keys = set(self._active_measurement_keys())
+            next_idx = self._next_measurement_idx()
+            selected = []
+            for candidate in picked:
+                device_type_code = int(getattr(candidate, "device_type_code", 0))
+                meas_type_code = int(getattr(candidate, "meas_type_code", 0))
+                device_pos = int(getattr(candidate, "device_pos", -1))
+                if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
+                    continue
+                key = self._packed_measurement_key(device_type_code, device_pos, meas_type_code)
+                if key < 0 or key in existing_keys:
+                    continue
+                if self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code):
+                    continue
+                candidate.idx = next_idx
+                next_idx += 1
+                candidate.device_type_code = device_type_code
+                candidate.meas_type_code = meas_type_code
+                candidate.device_pos = device_pos
+                mark_measurement_pseudo(candidate)
+                selected.append(candidate)
+                existing_keys.add(key)
+            if not selected:
+                break
+            measurement_count_before = len(self.measurements)
+            self._append_pseudo_measurement_objects(selected)
+            appended = self.measurements[measurement_count_before:]
+            if not self._incremental_update_active_measurement_state_layout(appended):
+                self._refresh_active_measurement_state_layout()
+            total_added += len(selected)
+            self._observability_matrix_cache = None
+            self._observability_pseudo_candidate_cache = None
+            observability = self.observability_analysis()
+            if observability.observable:
+                self._initial_observability_cache = observability
+                return total_added
+
+        # 若多轮定向补盲后仍未满秩且尚有剩余候选，全量补齐兜底
+        if not observability.observable:
+            self._observability_pseudo_candidate_cache = None
+            candidates = self._observability_pseudo_candidate_measurements()
+            existing_keys = set(self._active_measurement_keys())
+            next_idx = self._next_measurement_idx()
+            selected = []
+            for candidate in candidates:
+                device_type_code = int(getattr(candidate, "device_type_code", 0))
+                meas_type_code = int(getattr(candidate, "meas_type_code", 0))
+                device_pos = int(getattr(candidate, "device_pos", -1))
+                if device_type_code <= 0 or meas_type_code <= 0 or device_pos < 0:
+                    continue
+                key = self._packed_measurement_key(device_type_code, device_pos, meas_type_code)
+                if key < 0 or key in existing_keys:
+                    continue
+                if self._voltage_pseudo_is_covered_by_code(device_type_code, device_pos, meas_type_code):
+                    continue
+                candidate.idx = next_idx
+                next_idx += 1
+                candidate.device_type_code = device_type_code
+                candidate.meas_type_code = meas_type_code
+                candidate.device_pos = device_pos
+                mark_measurement_pseudo(candidate)
+                selected.append(candidate)
+                existing_keys.add(key)
+            if selected:
+                measurement_count_before = len(self.measurements)
+                self._append_pseudo_measurement_objects(selected)
+                appended = self.measurements[measurement_count_before:]
+                if not self._incremental_update_active_measurement_state_layout(appended):
+                    self._refresh_active_measurement_state_layout()
+                total_added += len(selected)
+                self._observability_matrix_cache = None
+                self._observability_pseudo_candidate_cache = None
+                observability = self.observability_analysis()
+        self._initial_observability_cache = observability
+        return total_added
 
     def _add_weak_direction_observability_pseudo_measurements(
         self,
@@ -10554,7 +10598,8 @@ class HybridStateEstimator:
         backtrack_streak = 0
         curvature_damping_active = False
         fullstep_osc_streak = 0
-        aa_accel = AndersonAccelerator(m=4)
+        aa_accel = AndersonAccelerator(m=5)
+        tr_ctrl = NielsenTrustRegionController()
         curv_stagnation_streak = 0
         curv_stagnation_best_g = np.inf
         flat_valley_streak = 0
@@ -11224,6 +11269,7 @@ class HybridStateEstimator:
             prev_rms_correction = float(np.sqrt(float(np.dot(dx, dx)) / dx.size)) if dx.size else 0.0
             objective_change = abs(previous_objective - objective)
             stagnation_tol = max(1e-14, 1e-10 * (abs(previous_objective) + 1.0))
+            gn_actual_drop = previous_objective - objective
             if (
                 accepted_step is not None
                 and accepted_step >= 0.95
@@ -11248,6 +11294,7 @@ class HybridStateEstimator:
                     self._measurement_residual(z, cand_z_est, measurements, out=cand_residual)
                     aa_obj = self._weighted_objective(weight, cand_residual)
                     if np.isfinite(aa_obj) and aa_obj < objective - max(1e-12, 1e-10 * (abs(objective) + 1.0)):
+                        aa_jump = float(np.max(np.abs(x_aa - x))) if x_aa.size else 0.0
                         x = x_aa
                         z_est, cand_z_est = cand_z_est, z_est
                         residual, cand_residual = cand_residual, residual
@@ -11258,7 +11305,7 @@ class HybridStateEstimator:
                         else:
                             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
                         prev_step_accepted = False
-                        aa_accel.on_accepted()
+                        aa_accel.on_accepted(step_norm=aa_jump)
                     else:
                         aa_accel.on_rejected()
                 elif x_aa is not None:
@@ -11266,19 +11313,20 @@ class HybridStateEstimator:
             else:
                 aa_accel.reset()
 
-            # 支柱 1：基于精确 LM 信赖域增益比 ρ 的 Nielsen (1999) 连续阻尼更新律
+            # 支柱 1：带退避倍率 ν 与反极限环下界记忆的 Nielsen (1999) 连续阻尼更新律（严格使用纯 GN/LM 单步降幅）
             if curvature_damping_active and step_damping > 0.0:
                 diag_reg_lm = (
                     aat_solver.unregularized_diagonal()
                     if (not used_box_pin_step and solved_via_aat and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)))
                     else None
                 )
-                new_d, _rho_lm = nielsen_lm_damping_update(
+                new_d, _rho_lm = tr_ctrl.update(
                     step_damping,
                     rhs,
                     dx,
-                    previous_objective - objective,
+                    gn_actual_drop,
                     accepted_step if accepted_step is not None else 0.0,
+                    current_obj=objective,
                     half_obj=True,
                     diag_reg=diag_reg_lm,
                     min_damping=0.0,
@@ -11302,6 +11350,7 @@ class HybridStateEstimator:
                         break
                     force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
                     curvature_damping_active = True
+                    tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                     micro_step_streak = 0
                     backtrack_streak = 0
                     prev_step_accepted = False
@@ -11313,6 +11362,7 @@ class HybridStateEstimator:
                     if slow_micro_streak >= 10 and solved_via_aat and aat_solver is not None:
                         force_lm_damping = min(10.0, max(float(force_lm_damping) * 5.0, 1.0))
                         curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                         slow_micro_streak = 0
                         prev_step_accepted = False
                 else:
@@ -11323,6 +11373,7 @@ class HybridStateEstimator:
                         hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                         force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                         curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                         prev_step_accepted = False
                     backtrack_streak = 0
             elif accepted_step is not None and accepted_step >= 0.5:
@@ -11343,6 +11394,7 @@ class HybridStateEstimator:
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                             force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                             curvature_damping_active = True
+                            tr_ctrl.notify_damping_activated(force_lm_damping, objective)
                             backtrack_streak = 0
                             fullstep_osc_streak = 0
                             prev_step_accepted = False
