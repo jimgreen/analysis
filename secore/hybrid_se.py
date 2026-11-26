@@ -809,6 +809,8 @@ class _MultiEnergySECouplingPlan:
     control_col: int = -1
     prior_measurement_row: int = -1
     prior_state_col: int = -1
+    controlled_prior_measurement_row: int = -1
+    controlled_prior_state_col: int = -1
     electric_heat: bool = False
     gas_heat: bool = False
     hydrogen_electric: bool = False
@@ -2384,6 +2386,46 @@ class HybridStateEstimator:
                             status=MEAS_STATUS_PSEUDO,
                         )
                     )
+                controlled_prior_measurement_row = -1
+                controlled_prior_state_col = -1
+                if controlled_measurement_rows:
+                    # 清空受控端量测行雅可比时，若受控端对应子域独立单位状态列（如 AC_LOAD_P），
+                    # 必须追加弱权重观测先验锚定该列，防止盲区下该状态列沦为全零不可观测列。
+                    ctrl_row = endpoint_jacobians[item.controlled.provider].getrow(
+                        item.controlled.row
+                    )
+                    if (
+                        ctrl_row.nnz == 1
+                        and abs(float(ctrl_row.data[0]) - 1.0) <= 1.0e-12
+                    ):
+                        ctrl_slice = (
+                            self.electric_state_slice
+                            if item.controlled.provider == "electric"
+                            else self.fluid_state_slices[item.controlled.provider]
+                        )
+                        cand_ctrl_col = ctrl_slice.start + int(ctrl_row.indices[0])
+                        if cand_ctrl_col != control_col:
+                            controlled_prior_state_col = cand_ctrl_col
+                            controlled_prior_measurement_row = measurement_offset + len(
+                                control_measurements
+                            )
+                            ctrl_prior_val = self._multi_energy_measured_state_prior_value(
+                                controlled_prior_state_col,
+                                float(item.controlled_setpoint),
+                            )
+                            control_measurements.append(
+                                Measurement(
+                                    controlled_prior_measurement_row + 1,
+                                    f"coupling_ctrl_obs_prior_{coupling.table_name}_{coupling.idx}",
+                                    str(coupling.table_name),
+                                    str(coupling.name),
+                                    "OBSERVABILITY_STATE_PRIOR",
+                                    min(self.multi_energy_coupling_prior_weight, 1.0e-6),
+                                    True,
+                                    float(ctrl_prior_val),
+                                    status=MEAS_STATUS_PSEUDO,
+                                )
+                            )
                 prepared.append(
                     SimpleNamespace(
                         coupling=coupling,
@@ -2394,6 +2436,8 @@ class HybridStateEstimator:
                         normalization=float(normalization),
                         control_col=control_col,
                         prior_measurement_row=prior_measurement_row,
+                        controlled_prior_measurement_row=controlled_prior_measurement_row,
+                        controlled_prior_state_col=controlled_prior_state_col,
                         electric_heat=True,
                         gas_heat=False,
                         hydrogen_electric=False,
@@ -2489,6 +2533,44 @@ class HybridStateEstimator:
                             status=MEAS_STATUS_PSEUDO,
                         )
                     )
+                controlled_prior_measurement_row = -1
+                controlled_prior_state_col = -1
+                if controlled_measurement_rows:
+                    ctrl_row = endpoint_jacobians[item.controlled.provider].getrow(
+                        item.controlled.row
+                    )
+                    if (
+                        ctrl_row.nnz == 1
+                        and abs(float(ctrl_row.data[0]) - 1.0) <= 1.0e-12
+                    ):
+                        ctrl_slice = (
+                            self.electric_state_slice
+                            if item.controlled.provider == "electric"
+                            else self.fluid_state_slices[item.controlled.provider]
+                        )
+                        cand_ctrl_col = ctrl_slice.start + int(ctrl_row.indices[0])
+                        if cand_ctrl_col != control_col:
+                            controlled_prior_state_col = cand_ctrl_col
+                            controlled_prior_measurement_row = measurement_offset + len(
+                                control_measurements
+                            )
+                            ctrl_prior_val = self._multi_energy_measured_state_prior_value(
+                                controlled_prior_state_col,
+                                float(item.controlled_setpoint),
+                            )
+                            control_measurements.append(
+                                Measurement(
+                                    controlled_prior_measurement_row + 1,
+                                    f"coupling_ctrl_obs_prior_{coupling.table_name}_{coupling.idx}",
+                                    str(coupling.table_name),
+                                    str(coupling.name),
+                                    "OBSERVABILITY_STATE_PRIOR",
+                                    min(self.multi_energy_coupling_prior_weight, 1.0e-6),
+                                    True,
+                                    float(ctrl_prior_val),
+                                    status=MEAS_STATUS_PSEUDO,
+                                )
+                            )
                 prepared.append(
                     SimpleNamespace(
                         coupling=coupling,
@@ -2499,6 +2581,8 @@ class HybridStateEstimator:
                         normalization=float(normalization),
                         control_col=control_col,
                         prior_measurement_row=prior_measurement_row,
+                        controlled_prior_measurement_row=controlled_prior_measurement_row,
+                        controlled_prior_state_col=controlled_prior_state_col,
                         electric_heat=False,
                         gas_heat=True,
                         hydrogen_electric=False,
@@ -2733,6 +2817,12 @@ class HybridStateEstimator:
                     control_col=item.control_col,
                     prior_measurement_row=item.prior_measurement_row,
                     prior_state_col=getattr(item, "prior_state_col", -1),
+                    controlled_prior_measurement_row=getattr(
+                        item, "controlled_prior_measurement_row", -1
+                    ),
+                    controlled_prior_state_col=getattr(
+                        item, "controlled_prior_state_col", -1
+                    ),
                     electric_heat=item.electric_heat,
                     gas_heat=item.gas_heat,
                     hydrogen_electric=item.hydrogen_electric,
@@ -2915,6 +3005,10 @@ class HybridStateEstimator:
                 dependent_value = float(state[plan.control_col])
                 if plan.prior_measurement_row >= 0:
                     values[plan.prior_measurement_row] = dependent_value
+                if plan.controlled_prior_measurement_row >= 0 and plan.controlled_prior_state_col >= 0:
+                    values[plan.controlled_prior_measurement_row] = float(
+                        state[plan.controlled_prior_state_col]
+                    )
                 source_flow = float(
                     endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
                 )
@@ -2959,6 +3053,10 @@ class HybridStateEstimator:
                 dependent_value = float(state[plan.control_col])
                 if plan.prior_measurement_row >= 0:
                     values[plan.prior_measurement_row] = dependent_value
+                if plan.controlled_prior_measurement_row >= 0 and plan.controlled_prior_state_col >= 0:
+                    values[plan.controlled_prior_measurement_row] = float(
+                        state[plan.controlled_prior_state_col]
+                    )
                 heat_flow = float(
                     endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
                 )
@@ -3203,6 +3301,10 @@ class HybridStateEstimator:
                         else plan.control_col
                     )
                     data.append(1.0)
+                if plan.controlled_prior_measurement_row >= 0 and plan.controlled_prior_state_col >= 0:
+                    rows.append(plan.controlled_prior_measurement_row - added_row_offset)
+                    cols.append(plan.controlled_prior_state_col)
+                    data.append(1.0)
                 source_flow = float(
                     endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
                 )
@@ -3244,6 +3346,10 @@ class HybridStateEstimator:
                 if plan.prior_measurement_row >= 0:
                     rows.append(plan.prior_measurement_row - added_row_offset)
                     cols.append(plan.control_col)
+                    data.append(1.0)
+                if plan.controlled_prior_measurement_row >= 0 and plan.controlled_prior_state_col >= 0:
+                    rows.append(plan.controlled_prior_measurement_row - added_row_offset)
+                    cols.append(plan.controlled_prior_state_col)
                     data.append(1.0)
                 heat_flow = float(
                     endpoint_values[plan.heat_flow.provider][plan.heat_flow.row]
@@ -11315,9 +11421,10 @@ class HybridStateEstimator:
 
             # 支柱 1：带退避倍率 ν 与反极限环下界记忆的 Nielsen (1999) 连续阻尼更新律（严格使用纯 GN/LM 单步降幅）
             if curvature_damping_active and step_damping > 0.0:
+                step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else (aat_solver if solved_via_aat else None)
                 diag_reg_lm = (
-                    aat_solver.unregularized_diagonal()
-                    if (not used_box_pin_step and solved_via_aat and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)))
+                    step_solver_lm.unregularized_diagonal()
+                    if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
                     else None
                 )
                 new_d, _rho_lm = tr_ctrl.update(
@@ -11563,10 +11670,18 @@ class HybridStateEstimator:
                 ):
                     final_quantities_current = True
                 break
+            coarse_v_healthy = True
+            if v_cols.size > 0:
+                xv_c = x[v_cols]
+                coarse_v_healthy = (
+                    float(np.min(xv_c)) > float(self.voltage_floor) + 0.05
+                    and float(np.max(xv_c)) < float(self.voltage_max) - 0.05
+                )
             if (
                 accepted
                 and coarse_lb_sq is not None
                 and coarse_non_pseudo_mask is not None
+                and coarse_v_healthy
                 and iteration >= 2
                 and not used_woodbury_step
                 and prev_rms_correction < 2e-2
@@ -12759,46 +12874,55 @@ class HybridStateEstimator:
             )
             if warmup is not None:
                 x_hub, r_hub, z_hub = warmup
-                x0 = x_hub.copy()
-                warm_res = self.estimate(
-                    measurements=base_measurements,
-                    x0=x_hub,
-                    verbose=verbose,
-                    observability=initial_obs,
-                    _shared_aat_solver=init_aat_solver,
-                    _coarse_bad_data_threshold=coarse_thr,
+                v_hub_min = float(np.min(x_hub[v_cols_arr])) if v_cols_arr.size else 1.0
+                v_hub_max = float(np.max(x_hub[v_cols_arr])) if v_cols_arr.size else 1.0
+                hub_healthy = (
+                    bool(np.all(np.isfinite(x_hub)))
+                    and v_hub_min >= float(self.voltage_min) + 0.10
+                    and v_hub_max <= float(self.voltage_max) - 0.10
                 )
-                if warm_res.converged or (
-                    np.isfinite(warm_res.objective)
-                    and (not np.isfinite(result.objective) or warm_res.objective < result.objective)
-                ):
-                    result = warm_res
-                if not result.converged and not bool(getattr(result, "_coarse_stopped", False)):
-                    wres_h = np.sqrt(np.maximum(base_weights, 0.0)) * np.abs(r_hub)
-                    cand_h = np.flatnonzero(
-                        (~base_is_pseudo) & (base_weights > 0.0) & (wres_h > max(float(threshold), 4.0))
+                if hub_healthy:
+                    warm_res = self.estimate(
+                        measurements=base_measurements,
+                        x0=x_hub,
+                        verbose=verbose,
+                        observability=initial_obs,
+                        _shared_aat_solver=init_aat_solver,
+                        _coarse_bad_data_threshold=coarse_thr,
                     )
-                    if cand_h.size:
-                        order_h = cand_h[np.argsort(-wres_h[cand_h], kind="stable")]
-                        huber_warmup_items = []
-                        for rp in order_h.tolist():
-                            rp_i = int(rp)
-                            meas = (
-                                measurement_from_table_row(base_table, rp_i)
-                                if base_table is not None
-                                else base_measurements[rp_i]
-                            )
-                            measured_val = float(base_table.value[rp_i]) if base_table is not None else float(meas.value)
-                            huber_warmup_items.append(
-                                BadDataItem(
-                                    measurement=meas,
-                                    residual=float(r_hub[rp_i]),
-                                    normalized_residual=float(wres_h[rp_i]),
-                                    estimated_value=float(z_hub[rp_i]),
-                                    measured_value=measured_val,
-                                    row_pos=rp_i,
+                    if warm_res.converged or (
+                        np.isfinite(warm_res.objective)
+                        and (not np.isfinite(result.objective) or warm_res.objective < result.objective)
+                    ):
+                        result = warm_res
+                        if warm_res.converged:
+                            x0 = warm_res.x.copy()
+                    if not result.converged and not bool(getattr(result, "_coarse_stopped", False)):
+                        wres_h = np.sqrt(np.maximum(base_weights, 0.0)) * np.abs(r_hub)
+                        cand_h = np.flatnonzero(
+                            (~base_is_pseudo) & (base_weights > 0.0) & (wres_h > max(float(threshold), 4.0))
+                        )
+                        if cand_h.size:
+                            order_h = cand_h[np.argsort(-wres_h[cand_h], kind="stable")]
+                            huber_warmup_items = []
+                            for rp in order_h.tolist():
+                                rp_i = int(rp)
+                                meas = (
+                                    measurement_from_table_row(base_table, rp_i)
+                                    if base_table is not None
+                                    else base_measurements[rp_i]
                                 )
-                            )
+                                measured_val = float(base_table.value[rp_i]) if base_table is not None else float(meas.value)
+                                huber_warmup_items.append(
+                                    BadDataItem(
+                                        measurement=meas,
+                                        residual=float(r_hub[rp_i]),
+                                        normalized_residual=float(wres_h[rp_i]),
+                                        estimated_value=float(z_hub[rp_i]),
+                                        measured_value=measured_val,
+                                        row_pos=rp_i,
+                                    )
+                                )
         shared_runtime = getattr(self, "_last_estimate_aat_runtime", None)
         shared_aat_solver = shared_runtime[0] if isinstance(shared_runtime, tuple) and len(shared_runtime) == 2 else None
         shared_aat_plan = shared_runtime[1] if isinstance(shared_runtime, tuple) and len(shared_runtime) == 2 else None

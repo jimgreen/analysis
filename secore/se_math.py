@@ -6005,6 +6005,7 @@ class NielsenTrustRegionController:
         self._just_zeroed: bool = False
         self._last_safe_nonzero: float = 0.0
         self._good_streak: int = 0
+        self._zero_bounce_count: int = 0
 
     def reset(self) -> None:
         self.nu = 2.0
@@ -6015,11 +6016,13 @@ class NielsenTrustRegionController:
         self._just_zeroed = False
         self._last_safe_nonzero = 0.0
         self._good_streak = 0
+        self._zero_bounce_count = 0
 
     def notify_damping_activated(self, new_lam: float, current_obj: float = np.inf) -> None:
         """外部由无阻尼态重新激活阻尼时调用，检测“归零即撞壁弹回”极限环。"""
         lam_v = max(0.0, float(new_lam))
         if self._just_zeroed and lam_v > 0.0:
+            self._zero_bounce_count += 1
             self.bounce_count += 1
             if self.bounce_count >= 2:
                 self.bounce_floor = max(self.bounce_floor, max(self._last_safe_nonzero, 1e-3))
@@ -6069,6 +6072,9 @@ class NielsenTrustRegionController:
             self._good_streak = 0
 
         eff_min = min(d_max, max(d_min, self.bounce_floor))
+        eff_zero_cut = float(zero_cutoff)
+        if self._zero_bounce_count > 0 and eff_zero_cut > 0.0:
+            eff_zero_cut = max(1e-8, eff_zero_cut * (0.01 ** min(self._zero_bounce_count, 3)))
         base_new, rho = nielsen_lm_damping_update(
             lam,
             rhs,
@@ -6079,7 +6085,7 @@ class NielsenTrustRegionController:
             diag_reg=diag_reg,
             min_damping=eff_min,
             max_damping=d_max,
-            zero_cutoff=zero_cutoff,
+            zero_cutoff=eff_zero_cut,
             dx_growing=dx_growing,
         )
         if lam <= 0.0:

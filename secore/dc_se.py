@@ -6352,6 +6352,7 @@ class DCStateEstimator:
         )
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
+        lm_guard_streak = 0
 
         for iteration in range(1, self.max_iter + 1):
             if _dc_state_out_of_bounds(x):
@@ -6376,6 +6377,7 @@ class DCStateEstimator:
             used_frozen_step = False
             used_woodbury_step = False
             used_box_pin_step = False
+            used_lm_guard_step = False
             pinned_cols = np.empty(0, dtype=np.intp)
             step_damping = 0.0
             cur_rhs_inf = np.inf
@@ -6649,6 +6651,7 @@ class DCStateEstimator:
                             if lm_ok:
                                 dx_pin = dx_lm
                                 step_damping = beta_try
+                                used_lm_guard_step = True
                                 if not _dc_dx_needs_lm_guard(dx_pin, strict_step=False):
                                     break
                     if not pin_ok:
@@ -6700,6 +6703,7 @@ class DCStateEstimator:
                                 if dx_lm.size == dx.size and np.all(np.isfinite(dx_lm)):
                                     dx = dx_lm
                                     step_damping = beta_try
+                                    used_lm_guard_step = True
                                     if not _dc_dx_needs_lm_guard(dx, strict_step=False):
                                         break
                     else:
@@ -6944,9 +6948,10 @@ class DCStateEstimator:
 
             # 支柱 1：带退避倍率 ν 与反极限环下界记忆的 Nielsen (1999) 连续阻尼更新律（严格使用纯 GN/LM 单步降幅）
             if curvature_damping_active and step_damping > 0.0:
+                step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else aat_solver
                 diag_reg_lm = (
-                    aat_solver.unregularized_diagonal()
-                    if (not used_box_pin_step and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)))
+                    step_solver_lm.unregularized_diagonal()
+                    if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
                     else None
                 )
                 new_d, _rho_lm = tr_ctrl.update(
@@ -6969,6 +6974,17 @@ class DCStateEstimator:
                     backtrack_streak = 0
                 if abs(new_d - step_damping) > max(1e-12, 0.05 * max(new_d, step_damping)):
                     prev_step_accepted = False
+            elif used_lm_guard_step and step_damping > 0.0:
+                # 连续 3 步无阻尼方向触发 LM 护栏拦截时，正式移交信赖域控制器管控，避免每轮白做无阻尼分解与绕过停滞检测
+                lm_guard_streak += 1
+                if lm_guard_streak >= 3:
+                    force_lm_damping = min(10.0, max(float(step_damping), 1e-2))
+                    curvature_damping_active = True
+                    tr_ctrl.notify_damping_activated(force_lm_damping, objective)
+                    lm_guard_streak = 0
+                    prev_step_accepted = False
+            else:
+                lm_guard_streak = 0
             if accepted_step is not None and accepted_step < 1e-3 and max_correction > 1e-2:
                 micro_step_streak += 1
                 if (accepted_step < 1e-4 and objective_change <= stagnation_tol) or micro_step_streak >= 3:
@@ -7709,37 +7725,46 @@ class DCStateEstimator:
             )
             if warmup is not None:
                 x_hub, r_hub, z_hub = warmup
-                x0 = x_hub.copy()
-                warm_res = self.estimate(
-                    base_plan_tables,
-                    x0=x_hub,
-                    verbose=verbose,
-                    observability=initial_obs,
-                    _shared_aat_solver=init_aat_solver,
+                v_hub_min = float(np.min(x_hub[v_cols_arr])) if v_cols_arr.size else 1.0
+                v_hub_max = float(np.max(x_hub[v_cols_arr])) if v_cols_arr.size else 1.0
+                hub_healthy = (
+                    bool(np.all(np.isfinite(x_hub)))
+                    and v_hub_min >= float(self.voltage_min) + 0.10
+                    and v_hub_max <= float(self.voltage_max) - 0.10
                 )
-                if warm_res.converged or (
-                    np.isfinite(warm_res.objective)
-                    and (not np.isfinite(result.objective) or warm_res.objective < result.objective)
-                ):
-                    result = warm_res
-                if not result.converged:
-                    wres_h = np.sqrt(np.maximum(base_weights, 0.0)) * np.abs(r_hub)
-                    cand_h = np.flatnonzero(
-                        (~base_is_pseudo) & (base_weights > 0.0) & (wres_h > max(float(threshold), 4.0))
+                if hub_healthy:
+                    warm_res = self.estimate(
+                        base_plan_tables,
+                        x0=x_hub,
+                        verbose=verbose,
+                        observability=initial_obs,
+                        _shared_aat_solver=init_aat_solver,
                     )
-                    if cand_h.size:
-                        order_h = cand_h[np.argsort(-wres_h[cand_h], kind="stable")]
-                        huber_warmup_items = [
-                            BadDataItem(
-                                measurement=measurement_from_table_row(base_table, int(rp)),
-                                residual=float(r_hub[int(rp)]),
-                                normalized_residual=float(wres_h[int(rp)]),
-                                estimated_value=float(z_hub[int(rp)]),
-                                measured_value=float(base_table.value[int(rp)]),
-                                row_pos=int(rp),
-                            )
-                            for rp in order_h.tolist()
-                        ]
+                    if warm_res.converged or (
+                        np.isfinite(warm_res.objective)
+                        and (not np.isfinite(result.objective) or warm_res.objective < result.objective)
+                    ):
+                        result = warm_res
+                        if warm_res.converged:
+                            x0 = warm_res.x.copy()
+                    if not result.converged:
+                        wres_h = np.sqrt(np.maximum(base_weights, 0.0)) * np.abs(r_hub)
+                        cand_h = np.flatnonzero(
+                            (~base_is_pseudo) & (base_weights > 0.0) & (wres_h > max(float(threshold), 4.0))
+                        )
+                        if cand_h.size:
+                            order_h = cand_h[np.argsort(-wres_h[cand_h], kind="stable")]
+                            huber_warmup_items = [
+                                BadDataItem(
+                                    measurement=measurement_from_table_row(base_table, int(rp)),
+                                    residual=float(r_hub[int(rp)]),
+                                    normalized_residual=float(wres_h[int(rp)]),
+                                    estimated_value=float(z_hub[int(rp)]),
+                                    measured_value=float(base_table.value[int(rp)]),
+                                    row_pos=int(rp),
+                                )
+                                for rp in order_h.tolist()
+                            ]
         shared_runtime = getattr(self, "_last_estimate_aat_runtime", None)
         shared_aat_solver = shared_runtime[0] if isinstance(shared_runtime, tuple) and len(shared_runtime) == 2 else None
         shared_aat_plan = shared_runtime[1] if isinstance(shared_runtime, tuple) and len(shared_runtime) == 2 else None

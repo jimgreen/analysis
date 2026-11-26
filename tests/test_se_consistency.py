@@ -6618,39 +6618,126 @@ def test_nielsen_spectral_scaled_zero_cutoff_for_high_susceptance():
     assert new_tiny == 0.0
 
 
+def test_box_pinned_jacobi_scaled_diag_reg_preserves_trust_region_rho():
+    """验证 Box-Pinning 触发 Jacobi 列均衡时，缓存求解器正确提供 diag_reg 使信赖域增益比 rho ≈ 1.0 而非错算为 2.0。"""
+    from scipy.sparse import csc_matrix
+    from secore.se_math import (
+        nielsen_lm_damping_update,
+        solve_box_pinned_normal_equations,
+    )
+
+    # 构造 4 维对角占优、跨度 > 1e8 的 A_csc（触发 Jacobi 列均衡），其中第 0 列固定
+    diag_vals = np.array([1.0, 1.0, 1.0e4, 1.0e5], dtype=np.float64)
+    A = csc_matrix(np.diag(diag_vals))
+    rhs = np.array([-5.0, 2.0, 3.0e6, 4.0e7], dtype=np.float64)
+    pinned = np.array([0], dtype=np.intp)
+    cache: dict = {}
+    lam = 10.0
+
+    dx, ok = solve_box_pinned_normal_equations(A, None, rhs, pinned, damping=lam, solver_cache=cache)
+    assert ok
+    assert dx[0] == 0.0
+    pin_solver = cache.get("solver")
+    assert pin_solver is not None
+    assert bool(getattr(pin_solver, "_last_factor_scaled", False))
+    diag_reg = pin_solver.unregularized_diagonal()
+    assert diag_reg is not None and diag_reg.size == rhs.size
+
+    # 对线性二次模型 J = 0.5 ||r||^2，精确实际降幅 = g^T dx - 0.5 * dx^T G dx
+    G = (A @ A.T).toarray()
+    actual_drop = float(np.dot(rhs, dx) - 0.5 * float(dx @ (G @ dx)))
+
+    # 正确传入 diag_reg 时，rho 必须精确等于 1.0 且阻尼平稳缩减
+    new_d_ok, rho_ok = nielsen_lm_damping_update(
+        lam, rhs, dx, actual_drop, 1.0, half_obj=True, diag_reg=diag_reg
+    )
+    assert abs(rho_ok - 1.0) < 1e-6
+    assert new_d_ok < lam
+
+    # 对照：若漏传 diag_reg=None（旧 BUG），rho 会飙升至 ~2.0 并错误翻倍阻尼
+    new_d_bug, rho_bug = nielsen_lm_damping_update(
+        lam, rhs, dx, actual_drop, 1.0, half_obj=True, diag_reg=None
+    )
+    assert rho_bug > 1.85
+    assert new_d_bug >= lam
 
 
+def test_tr_zero_bounce_adaptive_cutoff_and_fast_floor_release():
+    """验证归零反弹后自动缩细有效归零阈值以消除 1e-3 跳崖死循环，并在近完美二次区 5 步释放 bounce_floor。"""
+    from secore.se_math import NielsenTrustRegionController
+
+    ctrl = NielsenTrustRegionController()
+    rhs = np.ones(8, dtype=np.float64)
+    dx = np.full(8, 1e-3, dtype=np.float64)
+    dg = np.full(8, 1e4, dtype=np.float64)
+
+    # 1. 先在 1.2e-3 正常归零，再模拟立即撞壁重开阻尼
+    lam0 = 1.2e-3
+    drop0 = 0.5 * (float(np.dot(rhs, dx)) + lam0 * float(np.dot(dx * dx, dg)))
+    nd0, rho0 = ctrl.update(lam0, rhs, dx, drop0, 1.0, half_obj=True, diag_reg=dg, zero_cutoff=1e-3)
+    assert abs(rho0 - 1.0) < 1e-6 and nd0 == 0.0
+    ctrl.notify_damping_activated(1e-2, current_obj=100.0)
+
+    # 再次降至 1.2e-3 时，不再一刀跳崖归零，而是平滑缩减至 ~4e-4
+    nd1, _ = ctrl.update(lam0, rhs, dx, drop0, 1.0, half_obj=True, diag_reg=dg, zero_cutoff=1e-3)
+    assert 0.0 < nd1 < lam0
+
+    # 2. 手动设置 bounce_floor，连续 8 步完美二次匹配即应自动释放下界并恢复阻尼缩减
+    ctrl.bounce_floor = 2e-3
+    ctrl.bounce_ref_obj = 100.0
+    ctrl._good_streak = 0
+    for _step_i in range(9):
+        lam_c = 2e-3
+        drop_c = 0.5 * (float(np.dot(rhs, dx)) + lam_c * float(np.dot(dx * dx, dg)))
+        nd_c, _ = ctrl.update(
+            lam_c,
+            rhs,
+            dx,
+            drop_c,
+            1.0,
+            current_obj=99.9,
+            half_obj=True,
+            diag_reg=dg,
+            zero_cutoff=1e-3,
+            dx_growing=False,
+        )
+    assert ctrl.bounce_floor == 0.0
+    assert nd_c < 2e-3
 
 
+def test_huber_unhealthy_warmup_preserves_flat_fallback_x0(tmp_path, monkeypatch):
+    """验证 Huber 预热返回贴墙崩溃态时，不污染兜底平启动初值 x0 且不阻断后续正常收敛。"""
+    import secore.dc_se as dc_se_mod
 
+    dc_dir = tmp_path / "dc_huber_guard"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(12, dc_dir, seed=2031)
+    est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS, flat_start=True)
 
+    # 模拟首轮不收敛以触发 Huber 预热，并让预热返回含贴墙电压 0.11 的崩溃态
+    orig_est = est.estimate
+    seen_x0_vmin = []
+    call_no = [0]
 
+    def _wrapped_est(*args, **kwargs):
+        call_no[0] += 1
+        x0_in = kwargs.get("x0")
+        if x0_in is not None and est.n_voltage > 0:
+            seen_x0_vmin.append(float(np.min(x0_in[: est.n_voltage])))
+        res = orig_est(*args, **kwargs)
+        if call_no[0] == 1:
+            res.converged = False
+        return res
 
+    def _poison_huber(*args, **kwargs):
+        x_bad = est.initial_state(flat=True).copy()
+        x_bad[0] = float(est.voltage_min) + 0.01  # 模拟贴墙崩溃电压 0.11
+        n_m = len(est.active_measurements)
+        return x_bad, np.full(n_m, 50.0, dtype=np.float64), np.zeros(n_m, dtype=np.float64)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    monkeypatch.setattr(est, "estimate", _wrapped_est)
+    monkeypatch.setattr(dc_se_mod, "run_huber_irls_warmup", _poison_huber)
+    res, _rem = est.estimate_with_bad_data_removal(threshold=4.0, max_remove=5)
+    # 崩溃态 x_hub 不应传入任何一次 estimate(x0=...)，避免污染健康平启动兜底
+    assert all(vmin >= float(est.voltage_min) + 0.10 for vmin in seen_x0_vmin)
+    assert float(np.min(res.x[: est.n_voltage])) > 0.5
