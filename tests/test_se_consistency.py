@@ -979,8 +979,8 @@ def test_se_initial_fast_bad_data_screening_exact_equivalence():
     assert st_clean == "fast_clean"
     assert rows_clean is not None and rows_clean.size == 0
 
-    # 4. 验证含轻微噪声（未触发下界但需全量认证）安全回退 need_full
-    res_mild = rng.normal(0.0, 1e-4, size=m_s)
+    # 4. 验证含中等噪声（>256 行触发 ub>3.0 但无下界命中，需全量认证）安全回退 need_full
+    res_mild = np.clip(rng.normal(0.0, 2.5e-2, size=m_s), -0.08, 0.08)
     st_mild, rows_mild, norms_mild = screen_initial_bad_data_fast(
         res_mild, H_sp, w, np.zeros(m_s, dtype=bool), fac, threshold=3.0
     )
@@ -991,7 +991,7 @@ def test_se_initial_fast_bad_data_screening_exact_equivalence():
     from secore.se_math import _strict_upper_bound_bad_data_cert
 
     res_sparse = np.full(m_s, 1e-10, dtype=np.float64)
-    res_sparse[:20] = 5e-5
+    res_sparse[:20] = 2e-2
     st_cert, rows_cert, ub_cert = _strict_upper_bound_bad_data_cert(
         res_sparse, H_sp, w, np.zeros(m_s, dtype=bool), fac, threshold=3.0
     )
@@ -1090,8 +1090,8 @@ def test_se_large_blind_weak_limit_and_midround_lower_bound_screen():
         assert b in set(hit_rows.tolist())
     assert np.allclose(hit_norms, norm_exact[hit_rows], rtol=1e-10, atol=1e-10)
 
-    # 清除全部大坏数据后，仅余轻微随机噪声（触发 >256 行 ub>3.0 但无下界命中）时必须严格回退 need_full
-    res_clean_noisy = rng.normal(0.0, 1e-4, size=m_s)
+    # 清除全部大坏数据后，仅余中等随机噪声（触发 >256 行 ub>3.0 但无下界命中）时必须严格回退 need_full
+    res_clean_noisy = np.clip(rng.normal(0.0, 2.5e-2, size=m_s), -0.08, 0.08)
     st2, _, hit_rows2, _ = screen_bad_data_after_removal(
         None,
         H_sp,
@@ -2777,7 +2777,8 @@ def test_internal_constraint_measurements_protected_from_bad_data_removal():
         status_code=st,
     )
     mask = measurement_table_bad_data_protected_mask(tbl)
-    expected = np.array([False, True, True, True, True, True, False, True, True, True], dtype=bool)
+    # 伪量测（索引 1）允许参与坏数据辨识与排除，硬物理等式约束（索引 2..5, 7..9）继续受不可删保护
+    expected = np.array([False, False, True, True, True, True, False, True, True, True], dtype=bool)
     assert np.array_equal(mask, expected)
 
 
@@ -6371,6 +6372,180 @@ def test_ac_dc_hybrid_curvature_damping_hint_smooth_release(tmp_path):
     assert hyb_res.converged
     assert hyb_res.iterations < 50
     assert float(getattr(hyb_res, "_final_lm_damping", 0.0)) < 0.5
+
+
+def test_anderson_accelerator_extrapolates_slow_linear_fixed_point():
+    """验证 Type-II Anderson 加速器对谱半径 0.99 的慢线性不动点迭代可在数步内直接外推至真解，且阻尼变化自动重置窗口。"""
+    from secore.se_math import AndersonAccelerator
+
+    # 构造不动点映射 G(x) = A x + b，主特征值 0.99（普通迭代需约 1400 步收敛至 1e-6）
+    A = np.diag([0.99, 0.90, 0.70])
+    x_star = np.array([2.5, -1.2, 0.8], dtype=np.float64)
+    b = (np.eye(3) - A) @ x_star
+
+    x = np.zeros(3, dtype=np.float64)
+    accel = AndersonAccelerator(m=4, min_slow_streak=3)
+    prev_dx = np.inf
+    hit = False
+    for _ in range(18):
+        x_next = A @ x + b
+        cur_dx = float(np.max(np.abs(x_next - x)))
+        ratio = cur_dx / prev_dx if np.isfinite(prev_dx) and prev_dx > 0.0 else 0.0
+        x_aa = accel.update_and_propose(x, x_next, step_ratio=ratio, damping=0.0, allow_propose=True)
+        prev_dx = cur_dx
+        if x_aa is not None:
+            x = x_aa
+            accel.on_accepted()
+            if float(np.max(np.abs(x - x_star))) < 1e-6:
+                hit = True
+                break
+        else:
+            x = x_next
+    assert hit, f"Anderson acceleration failed to reach fixed point: err={np.max(np.abs(x - x_star))}"
+    # 验证阻尼变化时自动清空切空间窗口
+    accel.update_and_propose(x_star, x_star + 1e-3, step_ratio=0.95, damping=0.1)
+    assert accel.update_and_propose(x_star + 1e-3, x_star + 2e-3, step_ratio=0.95, damping=0.5) is None
+
+
+def test_nielsen_lm_damping_and_projected_box_kkt_unit():
+    """验证 Nielsen (1999) 连续增益比阻尼更新律在好/中/差三种模型匹配度下的行为，及 Projected KKT 扣墙逻辑。"""
+    from secore.se_math import nielsen_lm_damping_update, projected_box_kkt_residual
+
+    rhs = np.array([2.0, -1.0], dtype=np.float64)
+    dx = np.array([0.5, -0.25], dtype=np.float64)
+    lam = 0.2
+    # half_obj=True 时 pred = 0.5 * (g^T dx + lam * ||dx||^2) = 0.5 * (1.25 + 0.2 * 0.3125) = 0.65625
+    pred_exact = 0.5 * (float(np.dot(rhs, dx)) + lam * float(np.dot(dx, dx)))
+    # 1) rho == 1.0 (模型极准): 按 1/3 缩减阻尼
+    lam_good, rho_good = nielsen_lm_damping_update(lam, rhs, dx, pred_exact, 1.0, half_obj=True)
+    assert np.isclose(rho_good, 1.0, rtol=1e-10)
+    assert np.isclose(lam_good, lam / 3.0, rtol=1e-10)
+    # 2) rho == 0.5 (中等弯道): 因子 == 1.0，精确稳停在当前阻尼台阶
+    lam_mid, rho_mid = nielsen_lm_damping_update(lam, rhs, dx, 0.5 * pred_exact, 1.0, half_obj=True)
+    assert np.isclose(rho_mid, 0.5, rtol=1e-10)
+    assert np.isclose(lam_mid, lam, rtol=1e-10)
+    # 3) rho == 0.1 (严重高估): 提前温和抬升阻尼，避免撞回溯
+    lam_bad, rho_bad = nielsen_lm_damping_update(lam, rhs, dx, 0.1 * pred_exact, 1.0, half_obj=True)
+    assert np.isclose(rho_bad, 0.1, rtol=1e-10)
+    assert lam_bad > lam * 1.4
+
+    # 验证 Projected KKT 扣除紧贴下界且梯度指向墙外的活跃约束分量
+    x = np.array([0.5, 1.0, 1.0], dtype=np.float64)
+    g = np.array([-100.0, 1e-5, 2.0], dtype=np.float64)
+    diag = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+    core_kkt, all_kkt = projected_box_kkt_residual(
+        x, g, diag, np.array([0, 1]), 0.5, 1.5, core_cols=np.array([0, 1])
+    )
+    assert core_kkt <= 1e-5
+    assert np.isclose(all_kkt, 0.2, rtol=1e-12)
+
+
+def test_critical_leverage_dimensionless_and_adaptive_bad_threshold_unit():
+    """验证无量纲临界冗余度保护（高权不漏判、低权不误判）与自适应坏数据阈值。"""
+    from secore.se_math import (
+        compute_adaptive_bad_threshold,
+        compute_normalized_residuals_for_bad_data,
+        is_critical_leverage_row,
+    )
+
+    # 1. 高权临界量测（w=1e5, R=1e-5, H_ii=R*(1-1e-6)）必须识别为临界；
+    #    低权冗余伪量测（w=0.01, R=100, H_ii=10, S_ii=0.9）绝不可误判为临界
+    weights = np.array([1e5, 0.01, 1e4], dtype=np.float64)
+    R_diag = 1.0 / weights
+    cur_lev = np.array([R_diag[0] * (1.0 - 1e-6), 10.0, 0.2 * R_diag[2]], dtype=np.float64)
+    assert is_critical_leverage_row(cur_lev, weights, 0) is True
+    assert is_critical_leverage_row(cur_lev, weights, 1) is False
+    assert is_critical_leverage_row(cur_lev, weights, 2) is False
+
+    # 2. 准临界高权量测（S_ii = 1e-6, 原始残差仅 0.016 sigma）在 1e-4 临界保护下必须归零，不再放大成 16 sigma
+    res = np.array([5.2e-5, 2.0, 0.05], dtype=np.float64)
+    norm, crit = compute_normalized_residuals_for_bad_data(res, weights, cur_lev)
+    assert crit.tolist() == [True, False, False]
+    assert norm[0] == 0.0
+    assert norm[2] > 5.0
+
+    # 3. 中小网（<=200）严格保持用户 base_threshold；万级大网按 FWER 守恒自动上调
+    thr_small, row_small = compute_adaptive_bad_threshold(4.0, 120)
+    assert thr_small == 4.0 and row_small is None
+    thr_custom, _ = compute_adaptive_bad_threshold(3.0, 150)
+    assert thr_custom == 3.0
+    thr_large, _ = compute_adaptive_bad_threshold(4.0, 25000)
+    assert 4.9 < thr_large < 5.3
+
+    # 4. 异构权值（w_ratio=1e5）分桶校准：膨胀高权桶阈值上调压制误删，正常桶保持不变，真坏数据仍清晰检出
+    rng = np.random.default_rng(1234)
+    n_low, n_high = 500, 500
+    w_het = np.concatenate([np.full(n_low, 1.0), np.full(n_high, 1e5)])
+    rn_low = np.abs(rng.normal(0.0, 1.0, size=n_low))
+    rn_high = np.abs(rng.normal(0.0, 3.0, size=n_high))  # 高权桶整体方差低估 9 倍（std=3x）
+    rn_high[0] = 60.0  # 真实大幅坏数据
+    rn_all = np.concatenate([rn_low, rn_high])
+    tau_s, per_row = compute_adaptive_bad_threshold(4.0, n_low + n_high, normalized=rn_all, weights=w_het)
+    assert per_row is not None
+    assert np.allclose(per_row[:n_low], tau_s)
+    assert float(per_row[n_low]) > 2.2 * tau_s
+    # 误标率从几十条压至极低，且真实 60 sigma 坏数据必被检出
+    high_hits = np.flatnonzero(rn_high > per_row[n_low:])
+    assert 0 in high_hits.tolist()
+    assert high_hits.size <= 3
+
+
+def test_pseudo_measurement_participates_in_bad_data_removal(tmp_path):
+    """验证冗余错误伪量测（MEAS_STATUS_PSEUDO）可参与坏数据辨识并被排除。"""
+    from model.meas_model import MEAS_STATUS_PSEUDO
+
+    ac_dir = tmp_path / "ac_pseudo_bdr"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(12, ac_dir, seed=2041)
+
+    # 在正常量测基础上追加一条冗余支路 P_FROM 量测，加载后在活跃量测表中将其标为 PSEUDO 并注入大偏差
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    target_row = None
+    max_idx = 0
+    for ln in lines:
+        if ln.startswith("#"):
+            parts = ln.split()
+            if len(parts) >= 8 and parts[1].isdigit():
+                max_idx = max(max_idx, int(parts[1]))
+                if parts[3] == "ACBranch" and parts[5] == "P_FROM":
+                    target_row = parts
+    assert target_row is not None
+    pseudo_idx = max_idx + 1
+    bad_val = float(target_row[-1]) + 150.0
+    bad_pseudo_line = (
+        f"# {pseudo_idx} bad_pseudo_p {target_row[3]} {target_row[4]} "
+        f"{target_row[5]} 100.0 1 {bad_val:.6f}"
+    )
+    out_lines = []
+    inserted = False
+    for ln in lines:
+        if (not inserted) and ln.strip().startswith("</Measurement"):
+            out_lines.append(bad_pseudo_line)
+            inserted = True
+        out_lines.append(ln)
+    assert inserted
+    ac_m_bad = ac_dir / "pseudo_bad.meas"
+    ac_m_bad.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+
+    est = ACStateEstimator(
+        ac_e,
+        ac_m_bad,
+        parameters=SE_PARAMS.with_overrides(bad_threshold=4.0, max_remove=5),
+        flat_start=True,
+    )
+    est.prepare()
+    active_tbl = est._common_measurement_plan_table(est._active_measurement_plan_tables_ref()).table
+    pseudo_hits = np.flatnonzero(np.asarray(active_tbl.idx, dtype=np.int64) == pseudo_idx)
+    assert pseudo_hits.size == 1
+    active_tbl.status_code[int(pseudo_hits[0])] = MEAS_STATUS_PSEUDO
+
+    res, removed = est.estimate_with_bad_data_removal()
+    assert res.converged
+    removed_idxs = {int(it.measurement.idx) for it in removed}
+    assert pseudo_idx in removed_idxs
+
+
+
 
 
 

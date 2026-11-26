@@ -45,11 +45,14 @@ from model.meas_model import (
 )
 from model.meas_type import DEVICE_TYPE_CODES, DEVICE_TYPE_NAMES, MEAS_TYPE_CODES, MEAS_TYPE_NAMES
 from secore.se_math import (
+    AndersonAccelerator,
+    nielsen_lm_damping_update,
     CholmodAAtNormalEquationPlan,
     CholmodAAtNormalEquationSolver,
     NormalEquationSolver,
     check_active_structural_full_rank,
     compute_active_column_degrees,
+    compute_adaptive_bad_threshold,
     compute_normalized_residuals_for_bad_data,
     filter_batch_preserving_column_coverage,
     measurement_leverage_for_bad_data,
@@ -2543,8 +2546,10 @@ class FluidStateEstimator:
         high_damp_slow_streak = 0
         low_progress_streak = 0
         fullstep_osc_streak = 0
-        smooth_fullstep_streak = 0
         curvature_damping_active = False
+        singular_fail_count = 0
+        singular_min_damping = 0.0
+        aa_accel = AndersonAccelerator(m=4)
         prev_max_correction = np.inf
         tried_undamped_escape = False
         pre_escape_max_correction = np.inf
@@ -2693,6 +2698,11 @@ class FluidStateEstimator:
             except (MatrixRankWarning, RuntimeError, ValueError):
                 dx = None
             if dx is None or (dx.size and not np.all(np.isfinite(dx))):
+                if step_damping == 0.0:
+                    singular_fail_count += 1
+                    if singular_fail_count >= 2:
+                        # 多次无阻尼分解奇异说明当前结构秩亏，锁定微幅安全底线防止反复归零撞奇异
+                        singular_min_damping = max(singular_min_damping, 1e-6)
                 # 数值病态或近零流量奇异时分级启用 Marquardt 相对阻尼扶正方向
                 for beta_try in (1e-4, 1e-2, 1e-1, 1.0, 10.0):
                     if beta_try <= step_damping:
@@ -2747,6 +2757,7 @@ class FluidStateEstimator:
             step = 1.0
             accepted_step = 0.0
             prev_objective = objective
+            x_before_step = x
             # J = sum(w * r^2) 的梯度为 -2 * H^T W r = -2 * rhs
             ls_slope = -2.0 * float(np.dot(rhs, dx)) if (rhs is not None and rhs.size == dx.size) else 0.0
             obj_tol = max(1e-14, 1e-11 * (abs(objective) + 1.0))
@@ -2831,7 +2842,41 @@ class FluidStateEstimator:
 
             obj_change = abs(prev_objective - cached_objective)
             actual_rel_dx = accepted_step * rel_correction
-            # 自适应阻尼调节：满步成功时温和放松，连续回溯/微步或满步慢发散（含已加阻尼仍不收缩）时阶梯抬升阻尼抑制震荡
+            # 支柱 2：连续满步慢线性收敛时尝试 Type-II Anderson 加速（严格目标单调保护）
+            if accepted_step >= 0.95 and max_correction > 10.0 * self.tol:
+                aa_ratio = (
+                    (max_correction / prev_max_correction)
+                    if (np.isfinite(prev_max_correction) and prev_max_correction > 0.0)
+                    else 0.0
+                )
+                x_aa = aa_accel.update_and_propose(
+                    x_before_step,
+                    x,
+                    step_ratio=aa_ratio,
+                    damping=step_damping,
+                    allow_propose=(rel_correction < 0.5),
+                )
+                if x_aa is not None and (
+                    self.n_potential == 0 or bool(np.all(x_aa[: self.n_potential] >= minimum))
+                ):
+                    aa_z = self.evaluate(x_aa)
+                    aa_r = z - aa_z
+                    aa_obj = float(np.dot(weight, aa_r * aa_r))
+                    if np.isfinite(aa_obj) and aa_obj < cached_objective - max(1e-12, 1e-10 * (abs(cached_objective) + 1.0)):
+                        x = x_aa
+                        cached_z_est = aa_z
+                        cached_residual = aa_r
+                        cached_objective = aa_obj
+                        obj_change = abs(prev_objective - cached_objective)
+                        aa_accel.on_accepted()
+                    else:
+                        aa_accel.on_rejected()
+                elif x_aa is not None:
+                    aa_accel.on_rejected()
+            else:
+                aa_accel.reset()
+
+            # 支柱 1：基于精确 LM 增益比 ρ 的 Nielsen (1999) 连续光滑阻尼更新律（全步长统一决策）
             if accepted_step >= 0.5:
                 backtrack_streak = max(0, backtrack_streak - 1)
                 if (
@@ -2844,32 +2889,12 @@ class FluidStateEstimator:
                 ):
                     fullstep_osc_streak += 1
                     if fullstep_osc_streak >= 4:
-                        # 高斯-牛顿或轻阻尼下仍出现局部残差曲率谱半径 >= 1 的满步慢发散，阶梯抬升曲率阻尼镇压发散
                         lm_damping = min(100.0, max(lm_damping * 5.0, 0.1))
                         curvature_damping_active = True
                         fullstep_osc_streak = 0
                 else:
                     fullstep_osc_streak = 0
-                if lm_damping > 0.0:
-                    if curvature_damping_active:
-                        if max_correction < prev_max_correction and cached_objective < prev_objective:
-                            smooth_fullstep_streak += 1
-                        else:
-                            smooth_fullstep_streak = 0
-                        if max_correction < 0.5 * prev_max_correction or smooth_fullstep_streak >= 3:
-                            lm_damping = lm_damping * 0.5
-                            smooth_fullstep_streak = 0
-                            if lm_damping < 1e-4:
-                                lm_damping = 0.0
-                                curvature_damping_active = False
-                    else:
-                        smooth_fullstep_streak = 0
-                        # 高阻尼区 (>=0.5) 温和减半，避免 10 <-> 2.5 剧烈抖动；中低阻尼区快速释放
-                        lm_damping = lm_damping * (0.5 if lm_damping >= 0.5 else 0.25)
-                        if lm_damping < 1e-6:
-                            lm_damping = 0.0
             else:
-                smooth_fullstep_streak = 0
                 if (
                     max_correction > max(self.tol, 1e-5)
                     and obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
@@ -2882,9 +2907,25 @@ class FluidStateEstimator:
                 else:
                     fullstep_osc_streak = 0
                 backtrack_streak += 1
-                if backtrack_streak >= 2 or accepted_step < 1e-2:
-                    bump = 3.0 if lm_damping >= 0.5 else 10.0
-                    lm_damping = min(10.0, max(lm_damping * bump, 1e-3))
+                if lm_damping <= 0.0 and (backtrack_streak >= 2 or accepted_step < 1e-2):
+                    lm_damping = min(100.0, max(1e-3, singular_min_damping))
+                    backtrack_streak = 0
+            if lm_damping > 0.0:
+                lm_damping, _rho_lm = nielsen_lm_damping_update(
+                    lm_damping,
+                    rhs,
+                    dx,
+                    prev_objective - cached_objective,
+                    accepted_step,
+                    half_obj=False,
+                    diag_reg=diag_g,
+                    min_damping=singular_min_damping,
+                    max_damping=100.0,
+                    zero_cutoff=1e-4 if curvature_damping_active else 1e-6,
+                    dx_growing=(max_correction > 1.2 * prev_max_correction),
+                )
+                if lm_damping <= 0.0:
+                    curvature_damping_active = False
                     backtrack_streak = 0
             prev_max_correction = max_correction
 
@@ -3050,13 +3091,8 @@ class FluidStateEstimator:
         else:
             weights = np.asarray([item.weight for item in result.measurements], dtype=np.float64)
 
-        if table is not None and getattr(table, "status_code", None) is not None and int(table.status_code.size) == n_meas:
-            is_pseudo = np.asarray(table.status_code, dtype=np.int16) == MEAS_STATUS_PSEUDO
-        else:
-            is_pseudo = np.asarray(
-                [int(getattr(item, "status", MEAS_STATUS_NORMAL)) == MEAS_STATUS_PSEUDO for item in result.measurements],
-                dtype=bool,
-            )
+        # 伪量测（MEAS_STATUS_PSEUDO）允许参与坏数据辨识与排除；唯一补盲的临界量测由相对冗余度保护自动拦护
+        is_protected = np.zeros(n_meas, dtype=bool)
 
         # 使用精确杠杆 h_ii = diag(H G^-1 H^T) = diag(H_pu G_pu^-1 H_pu^T) 在标幺良态空间计算标准化残差
         leverage = None
@@ -3088,22 +3124,37 @@ class FluidStateEstimator:
                 leverage = None
 
         if leverage is not None and leverage.size == n_meas:
-            normalized, _ = compute_normalized_residuals_for_bad_data(
+            normalized, critical_mask = compute_normalized_residuals_for_bad_data(
                 np.asarray(result.residual, dtype=np.float64),
                 weights,
                 leverage,
-                is_pseudo=is_pseudo,
+                is_pseudo=is_protected,
             )
             # 掩蔽权重为 0（已剔除）的行不再上报
             normalized = np.where(weights > 0.0, normalized, 0.0)
         else:
+            critical_mask = np.zeros(n_meas, dtype=bool)
             normalized = np.where(
-                (weights > 0.0) & (~is_pseudo),
+                weights > 0.0,
                 np.sqrt(np.maximum(weights, 0.0)) * np.abs(result.residual),
                 0.0,
             )
 
-        hit_pos = np.flatnonzero(normalized > threshold_value)
+        n_eff = int(np.count_nonzero((weights > 0.0) & (~is_protected) & (~critical_mask)))
+        eff_threshold, per_row_thr = compute_adaptive_bad_threshold(
+            threshold_value,
+            n_eff if n_eff > 0 else int(np.count_nonzero(weights > 0.0)),
+            normalized=normalized,
+            weights=weights,
+            active_mask=(weights > 0.0),
+            protected_mask=is_protected,
+            critical_mask=critical_mask,
+        )
+        hit_pos = (
+            np.flatnonzero(normalized > per_row_thr)
+            if per_row_thr is not None
+            else np.flatnonzero(normalized > eff_threshold)
+        )
         if hit_pos.size > 1:
             order = np.argsort(-normalized[hit_pos], kind="mergesort")
             hit_pos = hit_pos[order]
@@ -3146,19 +3197,10 @@ class FluidStateEstimator:
             n_meas = len(self.active_measurements)
             if table is not None and int(table.weight.size) == n_meas:
                 base_weight = np.asarray(table.weight, dtype=np.float64).copy()
-                is_pseudo = (
-                    np.asarray(table.status_code, dtype=np.int16) == MEAS_STATUS_PSEUDO
-                    if getattr(table, "status_code", None) is not None and int(table.status_code.size) == n_meas
-                    else np.zeros(n_meas, dtype=bool)
-                )
             else:
                 base_weight = np.asarray([item.weight for item in self.active_measurements], dtype=np.float64)
-                is_pseudo = np.asarray(
-                    [int(getattr(item, "status", MEAS_STATUS_NORMAL)) == MEAS_STATUS_PSEUDO for item in self.active_measurements],
-                    dtype=bool,
-                )
-
-            n_real_valid = int(np.count_nonzero((base_weight > 0.0) & (~is_pseudo)))
+            is_protected = np.zeros(n_meas, dtype=bool)
+            n_real_valid = int(np.count_nonzero((base_weight > 0.0) & (~is_protected)))
             eff_max_remove = self.params.max_remove if max_remove is None else max_remove
             eff_max_per_round = (
                 self.params.max_remove_per_round if max_remove_per_round is None else max_remove_per_round
@@ -3217,7 +3259,7 @@ class FluidStateEstimator:
                     for it in bad_list
                     if int(it.row_pos) not in removed_rows_set
                     and int(it.row_pos) not in blocked_rows_set
-                    and not bool(is_pseudo[int(it.row_pos)])
+                    and not bool(is_protected[int(it.row_pos)])
                 ]
                 if not cand_rows:
                     break

@@ -181,6 +181,9 @@ from secore.se_array_plan import (
     take_measurement_view,
 )
 from secore.se_math import (
+    AndersonAccelerator,
+    nielsen_lm_damping_update,
+    projected_box_kkt_residual,
     CHOLMOD_ANALYZE_AAT,
     CHOLMOD_CHOLESKY,
     CHOLMOD_CHOLESKY_AAT,
@@ -195,10 +198,12 @@ from secore.se_math import (
     build_switch_current_curvature_columns,
     check_active_structural_full_rank,
     compute_active_column_degrees,
+    compute_adaptive_bad_threshold,
     compute_normalized_residuals_for_bad_data,
     detect_active_box_pinned_cols,
     filter_batch_preserving_column_coverage,
     full_normal_equation_from_lower,
+    is_critical_leverage_row,
     is_sparse_matrix,
     inverse_gain_for_bad_data,
     matrix_is_empty,
@@ -10548,16 +10553,8 @@ class HybridStateEstimator:
         high_damp_flat_streak = 0
         backtrack_streak = 0
         curvature_damping_active = False
-        curvature_probe_steps = 0
-        curvature_probe_interval = 2
-        last_regular_obj_drop = 0.0
         fullstep_osc_streak = 0
-        damped_nonshrink_streak = 0
-        curv_smooth_streak = 0
-        damp_relaxed_recently = False
-        last_safe_damping = 0.0
-        damp_bounce_count = 0
-        damp_cycle_floor = 0.0
+        aa_accel = AndersonAccelerator(m=4)
         curv_stagnation_streak = 0
         curv_stagnation_best_g = np.inf
         flat_valley_streak = 0
@@ -10670,7 +10667,6 @@ class HybridStateEstimator:
             used_sw_curv = False
             used_box_pin_step = False
             pinned_cols = np.empty(0, dtype=np.intp)
-            is_curvature_probe = False
             cur_rhs_inf = np.inf
             rhs = None
             solved_via_aat = False
@@ -10830,19 +10826,7 @@ class HybridStateEstimator:
                         self._record_profile_time("solve.normal_equations", time.perf_counter() - start)
                     start = time.perf_counter() if self.profile_enabled else None
                     cur_rhs_inf = float(np.max(np.abs(rhs))) if rhs.size else 0.0
-                    is_curvature_probe = (
-                        curvature_damping_active
-                        and curvature_probe_steps >= curvature_probe_interval
-                        and not (damp_cycle_floor > 0.0 and float(force_lm_damping) <= damp_cycle_floor * 1.05)
-                    )
-                    step_damping = (
-                        max(
-                            damp_cycle_floor,
-                            0.0 if float(force_lm_damping) <= 5e-3 else max(1e-4, float(force_lm_damping) * 0.2),
-                        )
-                        if is_curvature_probe
-                        else float(force_lm_damping)
-                    )
+                    step_damping = float(force_lm_damping)
                     pinned_cols = detect_active_box_pinned_cols(
                         x, rhs, v_cols, v_min_bound, v_max_bound, margin=1e-4
                     )
@@ -11093,6 +11077,7 @@ class HybridStateEstimator:
             nonfinite_candidates = 0
             oob_candidates = 0
             previous_objective = objective
+            x_before_step = x
             ls_slope = (
                 -float(np.dot(rhs, dx))
                 if (not used_frozen_step and rhs is not None and rhs.size == dx.size)
@@ -11100,9 +11085,6 @@ class HybridStateEstimator:
             )
             max_ls_trials = 1 if (used_frozen_step and not used_woodbury_step) else 16
             for _attempt in range(max_ls_trials):
-                if is_curvature_probe and step_scale < 0.25:
-                    # 探测步需要大幅回溯说明仍处于强非线性弯道，拒绝该畸形探测步防止把状态踹偏
-                    break
                 candidate = x + step_scale * dx
                 if _hybrid_state_out_of_bounds(candidate):
                     oob_candidates += 1
@@ -11111,7 +11093,6 @@ class HybridStateEstimator:
                         if (
                             boundary_proj_streak < 6
                             and v_cols.size
-                            and not is_curvature_probe
                         ):
                             proj_scales = (base_step_scale, step_scale) if base_step_scale > step_scale * 1.01 else (step_scale,)
                             for ps in proj_scales:
@@ -11182,12 +11163,7 @@ class HybridStateEstimator:
                 else:
                     step_scale *= 0.5
             if not accepted:
-                if is_curvature_probe:
-                    # 探测步更激进未接受仅拉大探测间隔，严禁反过来惩罚翻倍正常工作的常规阻尼
-                    curvature_probe_steps = 0
-                    curvature_probe_interval = min(16, curvature_probe_interval * 2)
-                    prev_step_accepted = False
-                    continue
+                aa_accel.reset()
                 if used_frozen_step:
                     prev_step_accepted = False
                     if used_woodbury_step:
@@ -11248,185 +11224,140 @@ class HybridStateEstimator:
             prev_rms_correction = float(np.sqrt(float(np.dot(dx, dx)) / dx.size)) if dx.size else 0.0
             objective_change = abs(previous_objective - objective)
             stagnation_tol = max(1e-14, 1e-10 * (abs(previous_objective) + 1.0))
-            if is_curvature_probe:
-                curvature_probe_steps = 0
-                if (
-                    accepted_step is not None
-                    and accepted_step >= 0.5
-                    and max_correction <= 2.0 * last_step_max_correction
-                ):
-                    # Marquardt 自适应放松阻尼：探测步满步接受且未暴涨说明已走出强非线性香蕉谷
-                    curvature_probe_interval = 2
-                    damped_nonshrink_streak = 0
-                    next_d = max(damp_cycle_floor, float(force_lm_damping) * 0.25)
-                    if next_d < float(force_lm_damping) - 1e-12:
-                        last_safe_damping = float(force_lm_damping)
-                        damp_relaxed_recently = True
-                    force_lm_damping = next_d
-                    if force_lm_damping <= 1e-3 and damp_cycle_floor <= 0.0:
-                        force_lm_damping = 0.0
-                        curvature_damping_active = False
-                        backtrack_streak = 0
-                        fullstep_osc_streak = 0
-                elif max_correction > 2.0 * last_step_max_correction:
-                    probe_beats_regular = (
-                        accepted_step is not None
-                        and accepted_step >= 0.8
-                        and objective_change > max(1e-7 * (abs(previous_objective) + 1.0), 1.5 * last_regular_obj_drop)
-                    )
-                    if (
-                        accepted_step is not None
-                        and accepted_step >= 0.5
-                        and (objective_change > 1e-4 * (abs(previous_objective) + 1.0) or probe_beats_regular)
-                    ):
-                        # 探测步步长已涨 >2x，即使目标降幅优亦仅温和减半（且不破周期安全下限），防止一步踹爆
-                        curvature_probe_interval = 2
-                        damped_nonshrink_streak = 0
-                        flat_valley_streak = 0
-                        if accepted_step >= 0.8:
-                            next_d = max(damp_cycle_floor, float(force_lm_damping) * 0.5)
-                            if next_d < float(force_lm_damping) - 1e-12:
-                                last_safe_damping = float(force_lm_damping)
-                                damp_relaxed_recently = True
-                            force_lm_damping = next_d
-                            if force_lm_damping <= 1e-3 and damp_cycle_floor <= 0.0:
-                                force_lm_damping = 0.0
-                                curvature_damping_active = False
-                                backtrack_streak = 0
-                                fullstep_osc_streak = 0
-                    else:
-                        # 探测步反弹过冲且目标降幅微末，指数退避拉大间隔，防止周期踹偏平底谷稳态
-                        curvature_probe_interval = min(16, curvature_probe_interval * 2)
-                elif (
-                    accepted_step is not None
-                    and accepted_step >= 0.5
-                    and objective_change > 1e-6 * (abs(previous_objective) + 1.0)
-                ):
-                    # 有效大跨度探测步真金白银压降了目标函数，保持高频探测加速
-                    curvature_probe_interval = 2
-                    damped_nonshrink_streak = 0
-            else:
-                if curvature_damping_active:
-                    curvature_probe_steps += 1
-                    last_regular_obj_drop = float(objective_change)
-                    if max_correction > 5e-4 and max_correction > 1.02 * last_step_max_correction:
-                        damped_nonshrink_streak += 1
-                        curv_smooth_streak = 0
-                        if damped_nonshrink_streak >= 3 and force_lm_damping < 2.0:
-                            # 曲率阻尼下步长连续显著放大(>2%)，记录周期反弹记忆并温和翻倍压制（上限 2.0 防冻死）
-                            if damp_relaxed_recently:
-                                damp_relaxed_recently = False
-                                if last_step_max_correction <= 0.25:
-                                    damp_bounce_count += 1
-                                    if damp_bounce_count >= 2:
-                                        damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
-                            force_lm_damping = min(2.0, max(float(force_lm_damping) * 2.0, max(0.2, damp_cycle_floor)))
-                            damped_nonshrink_streak = 0
-                            prev_step_accepted = False
-                    else:
-                        damped_nonshrink_streak = 0
-                        if (
-                            accepted_step is not None
-                            and accepted_step >= 0.8
-                            and max_correction < last_step_max_correction
-                            and objective < previous_objective
-                        ):
-                            curv_smooth_streak += 1
-                            if curv_smooth_streak >= 4:
-                                # 曲率阻尼常规步连续 4 步满步单调收缩，在不破安全下限前提下温和减半阻尼
-                                curv_smooth_streak = 0
-                                next_d = max(damp_cycle_floor, float(force_lm_damping) * 0.5)
-                                if next_d < float(force_lm_damping) - 1e-12:
-                                    last_safe_damping = float(force_lm_damping)
-                                    damp_relaxed_recently = True
-                                    force_lm_damping = next_d
-                                    prev_step_accepted = False
-                                    if force_lm_damping <= 1e-3 and damp_cycle_floor <= 0.0:
-                                        force_lm_damping = 0.0
-                                        curvature_damping_active = False
-                                        backtrack_streak = 0
-                                        fullstep_osc_streak = 0
+            if (
+                accepted_step is not None
+                and accepted_step >= 0.95
+                and not used_boundary_proj
+                and not used_frozen_step
+                and max_correction > 10.0 * self.tol
+            ):
+                aa_ratio = (
+                    (max_correction / last_step_max_correction)
+                    if (np.isfinite(last_step_max_correction) and last_step_max_correction > 0.0)
+                    else 0.0
+                )
+                x_aa = aa_accel.update_and_propose(
+                    x_before_step,
+                    x,
+                    step_ratio=aa_ratio,
+                    damping=step_damping,
+                    allow_propose=(max_correction < 0.5),
+                )
+                if x_aa is not None and not _hybrid_state_out_of_bounds(x_aa):
+                    self.evaluate(x_aa, measurements, out=cand_z_est)
+                    self._measurement_residual(z, cand_z_est, measurements, out=cand_residual)
+                    aa_obj = self._weighted_objective(weight, cand_residual)
+                    if np.isfinite(aa_obj) and aa_obj < objective - max(1e-12, 1e-10 * (abs(objective) + 1.0)):
+                        x = x_aa
+                        z_est, cand_z_est = cand_z_est, z_est
+                        residual, cand_residual = cand_residual, residual
+                        objective = aa_obj
+                        objective_change = abs(previous_objective - objective)
+                        if active_weight_mask is not None:
+                            residual_inf = float(np.linalg.norm(residual[active_weight_mask], np.inf)) if effective_n_meas else 0.0
                         else:
-                            curv_smooth_streak = 0
-                if accepted_step is not None and accepted_step < 1e-3 and max_correction > 1e-2:
-                    micro_step_streak += 1
-                    fullstep_osc_streak = 0
-                    if (accepted_step < 1e-4 and objective_change <= stagnation_tol) or micro_step_streak >= 3:
-                        if force_lm_damping >= 100.0:
-                            final_quantities_current = factor_is_current_weights
-                            break
-                        force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
-                        micro_step_streak = 0
-                        backtrack_streak = 0
+                            residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
                         prev_step_accepted = False
-                elif accepted_step is not None and accepted_step < 0.5 and max_correction > 10.0 * self.tol and not added_wall_nodes:
-                    micro_step_streak = 0
+                        aa_accel.on_accepted()
+                    else:
+                        aa_accel.on_rejected()
+                elif x_aa is not None:
+                    aa_accel.on_rejected()
+            else:
+                aa_accel.reset()
+
+            # 支柱 1：基于精确 LM 信赖域增益比 ρ 的 Nielsen (1999) 连续阻尼更新律
+            if curvature_damping_active and step_damping > 0.0:
+                diag_reg_lm = (
+                    aat_solver.unregularized_diagonal()
+                    if (not used_box_pin_step and solved_via_aat and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)))
+                    else None
+                )
+                new_d, _rho_lm = nielsen_lm_damping_update(
+                    step_damping,
+                    rhs,
+                    dx,
+                    previous_objective - objective,
+                    accepted_step if accepted_step is not None else 0.0,
+                    half_obj=True,
+                    diag_reg=diag_reg_lm,
+                    min_damping=0.0,
+                    max_damping=10.0,
+                    zero_cutoff=1e-3,
+                    dx_growing=(max_correction > 1.2 * last_step_max_correction),
+                )
+                force_lm_damping = new_d
+                if force_lm_damping <= 0.0:
+                    curvature_damping_active = False
+                    backtrack_streak = 0
                     fullstep_osc_streak = 0
-                    if accepted_step < 0.05 and objective_change <= max(1e-12, 1e-4 * (abs(previous_objective) + 1.0)):
-                        slow_micro_streak += 1
-                        if slow_micro_streak >= 10 and solved_via_aat and aat_solver is not None:
-                            # 持续小步长锯齿慢爬（如电流幅值量测轻载锥尖）：主动加大曲率阻尼跳出微步锁死
-                            force_lm_damping = min(10.0, max(float(force_lm_damping) * 5.0, 1.0))
-                            curvature_damping_active = True
-                            curvature_probe_steps = 0
-                            curvature_probe_interval = max(curvature_probe_interval, 8)
-                            slow_micro_streak = 0
-                            prev_step_accepted = False
-                    else:
+                if abs(new_d - step_damping) > max(1e-12, 0.05 * max(new_d, step_damping)):
+                    prev_step_accepted = False
+            if accepted_step is not None and accepted_step < 1e-3 and max_correction > 1e-2:
+                micro_step_streak += 1
+                fullstep_osc_streak = 0
+                if (accepted_step < 1e-4 and objective_change <= stagnation_tol) or micro_step_streak >= 3:
+                    if force_lm_damping >= 100.0:
+                        final_quantities_current = factor_is_current_weights
+                        break
+                    force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
+                    curvature_damping_active = True
+                    micro_step_streak = 0
+                    backtrack_streak = 0
+                    prev_step_accepted = False
+            elif accepted_step is not None and accepted_step < 0.5 and max_correction > 10.0 * self.tol and not added_wall_nodes:
+                micro_step_streak = 0
+                fullstep_osc_streak = 0
+                if accepted_step < 0.05 and objective_change <= max(1e-12, 1e-4 * (abs(previous_objective) + 1.0)):
+                    slow_micro_streak += 1
+                    if slow_micro_streak >= 10 and solved_via_aat and aat_solver is not None:
+                        force_lm_damping = min(10.0, max(float(force_lm_damping) * 5.0, 1.0))
+                        curvature_damping_active = True
                         slow_micro_streak = 0
-                    backtrack_streak += 4
-                    if backtrack_streak >= 12 and solved_via_aat and aat_solver is not None:
-                        if damp_relaxed_recently:
-                            damp_relaxed_recently = False
-                            if last_step_max_correction <= 0.25:
-                                damp_bounce_count += 1
-                                if damp_bounce_count >= 2:
-                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
-                        if force_lm_damping < 10.0:
+                        prev_step_accepted = False
+                else:
+                    slow_micro_streak = 0
+                backtrack_streak += 4
+                if backtrack_streak >= 12 and solved_via_aat and aat_solver is not None:
+                    if force_lm_damping < 10.0:
+                        hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
+                        force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
+                        curvature_damping_active = True
+                        prev_step_accepted = False
+                    backtrack_streak = 0
+            elif accepted_step is not None and accepted_step >= 0.5:
+                micro_step_streak = 0
+                if max_correction < 0.5 * last_step_max_correction:
+                    backtrack_streak = 0
+                    fullstep_osc_streak = 0
+                else:
+                    backtrack_streak = max(0, backtrack_streak - 1)
+                    if (
+                        (not curvature_damping_active)
+                        and max_correction > 1e-3
+                        and max_correction >= 0.85 * last_step_max_correction
+                        and objective_change <= 1e-3 * (abs(previous_objective) + 1.0)
+                    ):
+                        fullstep_osc_streak += 1
+                        if fullstep_osc_streak >= 4 and solved_via_aat and aat_solver is not None:
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
-                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, max(hint_base, damp_cycle_floor)))
+                            force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                             curvature_damping_active = True
-                            curvature_probe_steps = 0
-                            curvature_probe_interval = 2
-                            prev_step_accepted = False
-                        backtrack_streak = 0
-                elif accepted_step is not None and accepted_step >= 0.5:
-                    micro_step_streak = 0
-                    if max_correction < 0.5 * last_step_max_correction:
-                        backtrack_streak = 0
-                        fullstep_osc_streak = 0
-                    else:
-                        backtrack_streak = max(0, backtrack_streak - 1)
-                        if (
-                            (not curvature_damping_active)
-                            and max_correction > 1e-3
-                            and max_correction >= 0.85 * last_step_max_correction
-                            and objective_change <= 1e-3 * (abs(previous_objective) + 1.0)
-                        ):
-                            fullstep_osc_streak += 1
-                            if fullstep_osc_streak >= 4 and solved_via_aat and aat_solver is not None:
-                                # 满步锯齿振荡自愈：连续满步不收缩且目标几乎不降，提前切入曲率阻尼
-                                hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
-                                force_lm_damping = min(10.0, max(force_lm_damping * 10.0, hint_base))
-                                curvature_damping_active = True
-                                curvature_probe_steps = 0
-                                curvature_probe_interval = 2
-                                backtrack_streak = 0
-                                fullstep_osc_streak = 0
-                                prev_step_accepted = False
-                        else:
+                            backtrack_streak = 0
                             fullstep_osc_streak = 0
-                    if not curvature_damping_active:
-                        force_lm_damping = 0.0
-                elif accepted_step is not None and accepted_step >= 1e-2:
-                    micro_step_streak = 0
-                    if not curvature_damping_active:
-                        force_lm_damping = 0.0
+                            prev_step_accepted = False
+                    else:
+                        fullstep_osc_streak = 0
+                if not curvature_damping_active:
+                    force_lm_damping = 0.0
+            elif accepted_step is not None and accepted_step >= 1e-2:
+                micro_step_streak = 0
+                if not curvature_damping_active:
+                    force_lm_damping = 0.0
             damped_kkt_tol = max(5e-4, 500.0 * self.tol)
             damped_obj_tol = max(1e-12, 1e-7 * (abs(previous_objective) + 1.0))
             damped_kkt_stagnation_ok = (
                 curvature_damping_active
-                and not is_curvature_probe
                 and step_damping > 0.0
                 and cur_rhs_inf <= damped_kkt_tol
                 and max_correction < 1e-3
@@ -11434,7 +11365,6 @@ class HybridStateEstimator:
             )
             if (
                 curvature_damping_active
-                and not is_curvature_probe
                 and max_correction < 1e-3
                 and cur_rhs_inf > damped_kkt_tol
             ):
@@ -11453,15 +11383,13 @@ class HybridStateEstimator:
                     elif curv_stagnation_streak >= (12 if cur_rhs_inf > 2e-3 else 40):
                         final_quantities_current = factor_is_current_weights
                         break
-            elif not is_curvature_probe and max_correction >= 1e-3:
+            elif max_correction >= 1e-3:
                 curv_stagnation_streak = 0
                 curv_stagnation_best_g = np.inf
-            # 极高盲区平底谷驻点检测：当所有核心电压/相角与归一化 KKT 梯度均已收敛，
-            # 仅少数弱观测负荷零空间方向在平底谷以微幅目标变化慢爬时，避免空转满 max_iter
+            # 极高盲区平底谷驻点检测
             if (
                 not damped_kkt_stagnation_ok
                 and curvature_damping_active
-                and not is_curvature_probe
                 and not used_frozen_step
                 and step_damping > 0.0
                 and max_correction < 5e-2
@@ -11507,9 +11435,9 @@ class HybridStateEstimator:
                         damped_kkt_stagnation_ok = True
                 else:
                     flat_valley_streak = 0
-            elif not is_curvature_probe:
+            else:
                 flat_valley_streak = 0
-            # 高阻尼微步平底谷检测（如电流幅值量测极轻载锥尖）：阻尼 >= 1.0 且连续 8 步目标 5 位无变化且实际位移 <= 1e-2
+            # 高阻尼微步平底谷检测
             if (
                 (not damped_kkt_stagnation_ok)
                 and step_damping >= 1.0
@@ -11523,8 +11451,7 @@ class HybridStateEstimator:
                     damped_kkt_stagnation_ok = True
             else:
                 high_damp_flat_streak = 0
-            # 主循环内盒约束 KKT 驻点早停：阻尼态或存在活跃贴墙电压节点且核心电压/相角已稳态停滞时，
-            # 直接按终末盒约束 KKT 准则核验，达标即刻收敛退出，避免弱观测开关电流零空间拖满 max_iter 步
+            # 支柱 3：统一 Projected KKT 一阶最优性早停（无论是否带阻尼或贴墙，循环内外采用同一准则）
             va_max_dx_bk = 0.0
             if v_cols.size and dx.size:
                 va_max_dx_bk = max(va_max_dx_bk, float(np.max(np.abs(dx[v_cols]))))
@@ -11535,8 +11462,6 @@ class HybridStateEstimator:
             box_kkt_obj_tol = max(1e-12, 1e-5 * (abs(previous_objective) + 1.0))
             if (
                 not damped_kkt_stagnation_ok
-                and (step_damping > 0.0 or pinned_cols.size > 0)
-                and not is_curvature_probe
                 and not used_frozen_step
                 and va_max_dx_bk <= 2e-2
                 and max_correction <= 0.1
@@ -11556,25 +11481,17 @@ class HybridStateEstimator:
                     elif gain is not None:
                         diag_g_bk = np.asarray(gain.diagonal() if is_sparse_matrix(gain) else np.diag(gain), dtype=np.float64).ravel()
                     if diag_g_bk is not None and diag_g_bk.size == rhs.size:
-                        rhs_bk = rhs.copy()
-                        if v_cols.size:
-                            v_pin_lo = v_cols[(x[v_cols] <= float(self.voltage_floor) + 1e-4) & (rhs_bk[v_cols] < 0.0)]
-                            v_pin_hi = v_cols[(x[v_cols] >= float(self.voltage_max) - 1e-4) & (rhs_bk[v_cols] > 0.0)]
-                            if v_pin_lo.size:
-                                rhs_bk[v_pin_lo] = 0.0
-                            if v_pin_hi.size:
-                                rhs_bk[v_pin_hi] = 0.0
-                        sv_bk = np.abs(rhs_bk) / np.maximum(diag_g_bk, 1.0)
-                        va_g_bk = 0.0
-                        if v_cols.size:
-                            va_g_bk = max(va_g_bk, float(np.max(sv_bk[v_cols])))
-                        if a_cols.size:
-                            va_g_bk = max(va_g_bk, float(np.max(sv_bk[a_cols])))
-                        if not v_cols.size and not a_cols.size:
-                            va_g_bk = float(np.max(sv_bk))
+                        core_cols_bk = (
+                            np.concatenate([v_cols, a_cols])
+                            if (v_cols.size and a_cols.size)
+                            else (v_cols if v_cols.size else (a_cols if a_cols.size else None))
+                        )
+                        va_g_bk, _ = projected_box_kkt_residual(
+                            x, rhs, diag_g_bk, v_cols, float(self.voltage_floor), float(self.voltage_max), core_cols=core_cols_bk
+                        )
                         if va_g_bk <= max(1e-4, 100.0 * self.tol):
                             damped_kkt_stagnation_ok = True
-            elif not is_curvature_probe:
+            else:
                 box_kkt_stagnation_streak = 0
             practically_converged = (
                 (used_frozen_step or step_damping == 0.0 or damped_kkt_ok)
@@ -11850,14 +11767,7 @@ class HybridStateEstimator:
         delegate = None if is_multi_energy_result else self._delegate()
         if delegate is not None:
             return delegate.identify_bad_data(result, threshold)
-        threshold = self.params.bad_threshold if threshold is None else threshold
-        if result.residual.size and threshold > 0.0:
-            normalized_upper_bound = np.abs(result.residual) / np.sqrt(1e-12)
-            if float(normalized_upper_bound.max()) <= float(threshold):
-                self._record_profile_time("bad_data.fast_residual_bound", 0.0)
-                if profile_start is not None:
-                    self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
-                return [], normalized_upper_bound
+        base_threshold = float(self.params.bad_threshold if threshold is None else threshold)
         measurement_table = getattr(result, "measurement_table", None)
         table_weight = getattr(measurement_table, "weight", None)
         if table_weight is not None and np.asarray(table_weight).size == result.residual.size:
@@ -11867,6 +11777,20 @@ class HybridStateEstimator:
         is_pseudo = None
         if measurement_table is not None and int(measurement_table.idx.size) == result.residual.size:
             is_pseudo = measurement_table_bad_data_protected_mask(measurement_table)
+        n_eff_init = (
+            int(np.count_nonzero((~is_pseudo) & (weights > 0.0)))
+            if is_pseudo is not None
+            else int(np.count_nonzero(weights > 0.0))
+        )
+        eff_threshold, _ = compute_adaptive_bad_threshold(base_threshold, n_eff_init)
+        if result.residual.size and eff_threshold > 0.0:
+            normalized_upper_bound = np.abs(result.residual) / np.sqrt(1e-12)
+            if float(normalized_upper_bound.max()) <= float(eff_threshold):
+                self._record_profile_time("bad_data.fast_residual_bound", 0.0)
+                if profile_start is not None:
+                    self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
+                self._last_adaptive_bad_threshold = (id(result), float(eff_threshold), None)
+                return [], normalized_upper_bound
         cached_factor_entry = getattr(self, "_last_estimate_cholmod_factor", None)
         cached_factor = (
             cached_factor_entry[1]
@@ -11962,14 +11886,34 @@ class HybridStateEstimator:
                 leverage = measurement_leverage_for_bad_data(H_lev, gain_fb)
             if gain_inverse_start is not None:
                 self._record_profile_time("bad_data.gain_inverse", time.perf_counter() - gain_inverse_start)
-        normalized, _critical_mask = compute_normalized_residuals_for_bad_data(
+        normalized, critical_mask = compute_normalized_residuals_for_bad_data(
             result.residual,
             weights,
             leverage,
             is_pseudo=is_pseudo,
         )
+        n_eff_nc = (
+            int(np.count_nonzero((~is_pseudo) & (weights > 0.0) & (~critical_mask)))
+            if is_pseudo is not None
+            else int(np.count_nonzero((weights > 0.0) & (~critical_mask)))
+        )
+        eff_threshold, per_row_thr = compute_adaptive_bad_threshold(
+            base_threshold,
+            n_eff_nc if n_eff_nc > 0 else n_eff_init,
+            normalized=normalized,
+            weights=weights,
+            active_mask=(weights > 0.0),
+            protected_mask=is_pseudo,
+            critical_mask=critical_mask,
+        )
+        self._last_adaptive_bad_threshold = (id(result), float(eff_threshold), per_row_thr)
         bad_items: List[BadDataItem] = []
-        for idx in np.where(normalized > threshold)[0]:
+        hit_indices = (
+            np.where(normalized > per_row_thr)[0]
+            if per_row_thr is not None
+            else np.where(normalized > eff_threshold)[0]
+        )
+        for idx in hit_indices:
             row_pos = int(idx)
             if is_pseudo is not None and row_pos < is_pseudo.size and bool(is_pseudo[row_pos]):
                 continue
@@ -12599,7 +12543,7 @@ class HybridStateEstimator:
                 max_remove_per_round=max_remove_per_round,
                 verbose=verbose,
             )
-        threshold = self.params.bad_threshold if threshold is None else threshold
+        base_threshold = float(self.params.bad_threshold if threshold is None else threshold)
         base_measurements = self.active_measurements
         base_table = getattr(base_measurements, "table", None)
         base_weights = (
@@ -12618,6 +12562,46 @@ class HybridStateEstimator:
             if base_is_pseudo is not None
             else int(np.count_nonzero(base_weights > 0.0))
         )
+        threshold, _ = compute_adaptive_bad_threshold(
+            base_threshold,
+            n_real_meas if n_real_meas > 0 else n_base,
+        )
+        cur_row_thr: Optional[np.ndarray] = None
+
+        def _filter_fast_bad_items(
+            items_in: List[BadDataItem],
+            res_obj: EstimateResult,
+            w_cur: np.ndarray,
+            act_cur: np.ndarray,
+        ) -> List[BadDataItem]:
+            """在快速筛查路径上按异构权值分桶保守下界过滤失配高权桶假阳性。"""
+            if not items_in or base_threshold <= 0.0:
+                return items_in
+            row_thr_use = cur_row_thr
+            if row_thr_use is None and res_obj.residual.size == n_base:
+                lb_vec = np.abs(np.asarray(res_obj.residual, dtype=np.float64)) * np.sqrt(np.maximum(w_cur, 0.0))
+                n_act_eff = (
+                    int(np.count_nonzero((~base_is_pseudo) & act_cur & (w_cur > 0.0)))
+                    if base_is_pseudo is not None
+                    else int(np.count_nonzero(act_cur & (w_cur > 0.0)))
+                )
+                _, row_thr_use = compute_adaptive_bad_threshold(
+                    base_threshold,
+                    n_act_eff,
+                    normalized=lb_vec,
+                    weights=w_cur,
+                    active_mask=act_cur,
+                    protected_mask=base_is_pseudo,
+                )
+            if row_thr_use is None:
+                return items_in
+            return [
+                it
+                for it in items_in
+                if it.row_pos is not None
+                and 0 <= int(it.row_pos) < row_thr_use.size
+                and float(it.normalized_residual) > float(row_thr_use[int(it.row_pos)])
+            ]
         max_remove, max_remove_per_round = resolve_bad_data_limits(
             n_real_meas if n_real_meas > 0 else n_base,
             max_remove=max_remove,
@@ -12943,19 +12927,23 @@ class HybridStateEstimator:
                             row_pos=r_pos,
                         )
                     )
+                bad_items = _filter_fast_bad_items(bad_items, result, base_weights, active_mask)
                 normalized = None
                 cur_leverage = None
                 full_normalized_valid = False
-                init_fast_done = True
+                init_fast_done = bool(bad_items)
                 if init_screen_start is not None:
                     dt = time.perf_counter() - init_screen_start
                     self._record_profile_time("bad_data.gain_inverse", dt)
                     self._record_profile_time("bad_data.total", dt)
         if not init_fast_done:
             _ensure_exact_result()
-            bad_items, normalized = self.identify_bad_data(result, threshold)
+            bad_items, normalized = self.identify_bad_data(result, base_threshold)
             lev_pair = getattr(self, "_last_leverage_cache", None)
             cur_leverage = lev_pair[1] if (isinstance(lev_pair, tuple) and len(lev_pair) == 3 and lev_pair[0] == id(result)) else None
+            thr_pair = getattr(self, "_last_adaptive_bad_threshold", None)
+            if isinstance(thr_pair, tuple) and len(thr_pair) == 3 and thr_pair[0] == id(result):
+                cur_row_thr = thr_pair[2]
             full_normalized_valid = True
         _reset_anchor(result, cur_factor, cur_leverage)
 
@@ -13075,11 +13063,7 @@ class HybridStateEstimator:
             return False
 
         def _is_critical_leverage_row(row_pos: int) -> bool:
-            return (
-                cur_leverage is not None
-                and 0 <= row_pos < cur_leverage.size
-                and float(1.0 - cur_leverage[row_pos]) <= 1e-6
-            )
+            return is_critical_leverage_row(cur_leverage, masked_weights, row_pos)
 
         def _can_warm_start_from(res_obj: EstimateResult) -> bool:
             """仅当当前混合电网状态健康且无贴墙电压/相角节点（即使已收敛）时才允许原样延续温启动或刷新锚点 x0。"""
@@ -13591,7 +13575,7 @@ class HybridStateEstimator:
                 if not full_normalized_valid:
                     _refresh_exact_factor_for_current()
                     final_res, _ = _finalize_masked_result(result, cur_factor, None)
-                    bad_items, normalized = self.identify_bad_data(final_res, threshold)
+                    bad_items, normalized = self.identify_bad_data(final_res, base_threshold)
                     full_normalized_valid = True
                     keep_rows_cur = np.flatnonzero(active_mask)
                     lev_pair = getattr(self, "_last_leverage_cache", None)
@@ -13599,6 +13583,14 @@ class HybridStateEstimator:
                         full_lev = np.zeros(n_base, dtype=np.float64)
                         full_lev[keep_rows_cur] = lev_pair[1]
                         cur_leverage = full_lev
+                    thr_pair = getattr(self, "_last_adaptive_bad_threshold", None)
+                    if isinstance(thr_pair, tuple) and len(thr_pair) == 3 and thr_pair[0] == id(final_res):
+                        if thr_pair[2] is not None:
+                            full_thr = np.full(n_base, float(thr_pair[1]), dtype=np.float64)
+                            full_thr[keep_rows_cur] = thr_pair[2]
+                            cur_row_thr = full_thr
+                        else:
+                            cur_row_thr = None
                     _reset_anchor(result, cur_factor, cur_leverage)
                     for item in bad_items:
                         item.row_pos = int(keep_rows_cur[int(item.row_pos)])
@@ -13615,7 +13607,7 @@ class HybridStateEstimator:
                     ])
                     if not candidates:
                         if result.converged:
-                            self._last_bad_data_cache = (id(final_res), float(threshold), list(bad_items), normalized)
+                            self._last_bad_data_cache = (id(final_res), float(base_threshold), list(bad_items), normalized)
                             return final_res, removed
                         if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
                             rescue_rounds += 1
@@ -13791,6 +13783,7 @@ class HybridStateEstimator:
                                 row_pos=r_pos,
                             )
                         )
+                    bad_items = _filter_fast_bad_items(bad_items, result, masked_weights, active_mask)
                     normalized = None
                     cur_leverage = prop_lev
                     cur_factor = trial_factor
@@ -13810,7 +13803,7 @@ class HybridStateEstimator:
                         trial_factor = cur_factor
                 keep_rows_cur = np.flatnonzero(active_mask)
                 sliced_res, _ = _finalize_masked_result(result, trial_factor, None)
-                bad_items, normalized_sliced = self.identify_bad_data(sliced_res, threshold)
+                bad_items, normalized_sliced = self.identify_bad_data(sliced_res, base_threshold)
                 lev_pair = getattr(self, "_last_leverage_cache", None)
                 if isinstance(lev_pair, tuple) and len(lev_pair) == 3 and lev_pair[0] == id(sliced_res) and lev_pair[1] is not None:
                     full_lev = np.zeros(n_base, dtype=np.float64)
@@ -13818,11 +13811,19 @@ class HybridStateEstimator:
                     cur_leverage = full_lev
                 else:
                     cur_leverage = None
+                thr_pair = getattr(self, "_last_adaptive_bad_threshold", None)
+                if isinstance(thr_pair, tuple) and len(thr_pair) == 3 and thr_pair[0] == id(sliced_res):
+                    if thr_pair[2] is not None:
+                        full_thr = np.full(n_base, float(thr_pair[1]), dtype=np.float64)
+                        full_thr[keep_rows_cur] = thr_pair[2]
+                        cur_row_thr = full_thr
+                    else:
+                        cur_row_thr = None
                 cur_factor = trial_factor
                 _reset_anchor(result, cur_factor, cur_leverage)
                 if not bad_items:
                     if result.converged:
-                        self._last_bad_data_cache = (id(sliced_res), float(threshold), [], normalized_sliced)
+                        self._last_bad_data_cache = (id(sliced_res), float(base_threshold), [], normalized_sliced)
                         return sliced_res
                     normalized = None
                     full_normalized_valid = True
@@ -14122,7 +14123,7 @@ class HybridStateEstimator:
             _refresh_exact_factor_for_current()
         final_res, final_norm = _finalize_masked_result(result, cur_factor, normalized)
         self._last_bad_data_cache = (
-            (id(final_res), float(threshold), list(bad_items), final_norm)
+            (id(final_res), float(base_threshold), list(bad_items), final_norm)
             if full_normalized_valid
             else None
         )

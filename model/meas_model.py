@@ -429,9 +429,13 @@ def measurement_table_status_code(table: MeasurementTable) -> np.ndarray:
 
 
 def measurement_table_bad_data_protected_mask(table: MeasurementTable) -> np.ndarray:
-    """返回坏数据辨识与剔除阶段不可删除的受保护掩码（含伪量测、零注入/功率平衡量测及内部物理等式约束）。"""
-    status_code = measurement_table_status_code(table)
-    protected = status_code == MEAS_STATUS_PSEUDO
+    """返回坏数据辨识与剔除阶段不可删除的硬物理约束掩码（零注入/功率平衡量测及内部开关/零阻等式约束）。
+
+    伪量测（``MEAS_STATUS_PSEUDO``）不再被全局屏蔽，允许参与坏数据辨识与剔除；
+    若某伪量测属于唯一补盲的临界量测，将由相对冗余度保护与可观测性奇异检查自动拦护。
+    """
+    n_rows = int(np.asarray(table.idx).size)
+    protected = np.zeros(n_rows, dtype=bool)
     dt_code = getattr(table, "device_type_code", None)
     if dt_code is not None and int(np.asarray(dt_code).size) == protected.size:
         dt_arr = np.asarray(dt_code, dtype=np.int16)

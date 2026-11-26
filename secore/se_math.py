@@ -3001,21 +3001,139 @@ def measurement_leverage_for_bad_data(
     return measurement_leverage(H, gain_inv)
 
 
+DEFAULT_CRITICAL_REDUNDANCY_RATIO = 1e-4
+
+
+def is_critical_leverage_row(
+    cur_leverage: Optional[np.ndarray],
+    weights: Optional[np.ndarray],
+    row_pos: int,
+    *,
+    critical_ratio: float = DEFAULT_CRITICAL_REDUNDANCY_RATIO,
+) -> bool:
+    """按无量纲相对冗余度 ``S_ii = 1 - w_i * H_ii`` 判定单行是否为临界/准临界量测。
+
+    ``cur_leverage`` 存储带量纲的 ``H_ii = diag(H G^-1 H^T)``（量纲同 ``R_ii = 1/w_i``），
+    必须乘以权重 ``w_i`` 还原为无量纲杠杆率 ``h_ii = w_i * H_ii in [0, 1]``，
+    才能避免高权量测漏判、低权量测误判。
+    """
+    if cur_leverage is None or weights is None:
+        return False
+    pos = int(row_pos)
+    if pos < 0 or pos >= cur_leverage.size or pos >= weights.size:
+        return False
+    w_i = float(weights[pos])
+    if not np.isfinite(w_i) or w_i <= 0.0:
+        return False
+    lev_i = float(cur_leverage[pos])
+    if not np.isfinite(lev_i):
+        return False
+    return (1.0 - w_i * lev_i) <= float(critical_ratio)
+
+
+def compute_adaptive_bad_threshold(
+    base_threshold: float,
+    n_effective: int,
+    *,
+    normalized: Optional[np.ndarray] = None,
+    weights: Optional[np.ndarray] = None,
+    active_mask: Optional[np.ndarray] = None,
+    protected_mask: Optional[np.ndarray] = None,
+    critical_mask: Optional[np.ndarray] = None,
+    ref_count: int = 200,
+    min_bucket_size: int = 30,
+    hetero_weight_ratio: float = 1e3,
+) -> Tuple[float, Optional[np.ndarray]]:
+    """计算多重检验规模自适应与异构权值分桶校准的坏数据判定阈值 ``(scalar_thr, per_row_thr)``。
+
+    设计原则：
+    1. **下界守恒**：绝不低于用户给定的 ``base_threshold``；当 ``n_effective <= ref_count``（默认 200）时
+       标量阈值严格等于 ``base_threshold``，保障中小网与既有单元测试零回归；
+    2. **规模 FWER 守恒**：当 ``n_effective > ref_count`` 时，按
+       ``tau_scale = sqrt(tau_base^2 + 2 * ln(n_effective / ref_count))`` 自动抬高基准阈值，
+       消除万~十万节点大网下的多重检验假阳性爆发；
+    3. **异构权值分桶稳健尺度校准**：当传入全量 ``normalized`` 与 ``weights`` 且有效权值跨度
+       ``w_max / w_min >= hetero_weight_ratio`` 且 ``n_effective > ref_count`` 时，按 ``floor(log10(w))``
+       分桶，对样本数 ``>= min_bucket_size`` 的桶使用 75% 分位数（25% 崩溃点，对常规坏数据免疫）
+       估计该桶的噪声方差膨胀倍数 ``s_b = max(1.0, p75(r^N_b) / 1.15034938)``，仅向上防误删，
+       不压低正常桶阈值。未发生明显膨胀时返回 ``per_row_thr=None`` 以免额外数组开销。
+    """
+    tau_base = float(base_threshold)
+    if not np.isfinite(tau_base) or tau_base <= 0.0:
+        return max(0.0, tau_base) if np.isfinite(tau_base) else 0.0, None
+    m_eff = max(1, int(n_effective))
+    ref_m = max(1, int(ref_count))
+    if m_eff > ref_m:
+        tau_scale = float(math.sqrt(tau_base * tau_base + 2.0 * math.log(float(m_eff) / float(ref_m))))
+    else:
+        tau_scale = tau_base
+
+    if normalized is None or weights is None or m_eff <= ref_m:
+        return tau_scale, None
+
+    norm_arr = np.asarray(normalized, dtype=np.float64)
+    w_arr = np.asarray(weights, dtype=np.float64)
+    if norm_arr.size == 0 or norm_arr.size != w_arr.size:
+        return tau_scale, None
+
+    valid = np.isfinite(norm_arr) & np.isfinite(w_arr) & (w_arr > 0.0)
+    if active_mask is not None:
+        a_arr = np.asarray(active_mask, dtype=bool)
+        if a_arr.size == valid.size:
+            valid &= a_arr
+    if protected_mask is not None:
+        p_arr = np.asarray(protected_mask, dtype=bool)
+        if p_arr.size == valid.size:
+            valid &= ~p_arr
+    if critical_mask is not None:
+        c_arr = np.asarray(critical_mask, dtype=bool)
+        if c_arr.size == valid.size:
+            valid &= ~c_arr
+
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid <= ref_m:
+        return tau_scale, None
+
+    w_valid = w_arr[valid]
+    w_min = float(w_valid.min())
+    w_max = float(w_valid.max())
+    if w_min <= 0.0 or (w_max / w_min) < float(hetero_weight_ratio):
+        return tau_scale, None
+
+    # 标准正态 |Z| 的 75% 分位数为 Phi^-1(0.875) = 1.1503493803760079
+    _HALF_NORM_Q75 = 1.1503493803760079
+    buckets = np.floor(np.log10(np.maximum(w_arr, 1e-12))).astype(np.int32)
+    valid_buckets = np.unique(buckets[valid])
+    per_row_thr: Optional[np.ndarray] = None
+    min_b = max(10, int(min_bucket_size))
+    for b_val in valid_buckets.tolist():
+        bm = valid & (buckets == int(b_val))
+        if int(np.count_nonzero(bm)) < min_b:
+            continue
+        q75 = float(np.percentile(norm_arr[bm], 75.0))
+        scale_b = q75 / _HALF_NORM_Q75
+        if scale_b > 1.15:
+            if per_row_thr is None:
+                per_row_thr = np.full(norm_arr.size, tau_scale, dtype=np.float64)
+            per_row_thr[bm] = tau_scale * scale_b
+    return tau_scale, per_row_thr
+
+
 def compute_normalized_residuals_for_bad_data(
     residual: np.ndarray,
     weights: np.ndarray,
     leverage: Optional[np.ndarray],
     *,
     is_pseudo: Optional[np.ndarray] = None,
-    critical_ratio: float = 1e-9,
+    critical_ratio: float = DEFAULT_CRITICAL_REDUNDANCY_RATIO,
     critical_noise_sigma: float = 1e-4,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """计算坏数据辨识归一化残差并返回临界量测掩码 ``(normalized, critical_mask)``。
 
-    - 对于普通冗余量测，严格按 ``|r| / sqrt(max(R_ii - H_ii, 1e-12))`` 计算；
-    - 对于临界量测（``R_ii - H_ii <= critical_ratio * R_ii``），若属于伪量测或其残差
-      仅在数值收敛噪声量级（``|r_i| <= critical_noise_sigma * sqrt(R_ii)``），
-      将归一化残差置 ``0.0``，避免除以极小地板产生虚假坏数据误删。
+    - 对于普通冗余量测，按 ``|r| / sqrt(max(R_ii - H_ii, 1e-12))`` 计算；
+    - 对于临界/准临界量测（相对冗余度 ``(R_ii - H_ii) / R_ii <= critical_ratio``，默认 ``1e-4``），
+      因删去必致不可观测或灵敏度放大超百倍引发虚假误报，直接将归一化残差置 ``0.0``；
+    - 对于受保护的硬物理等式约束（``is_pseudo`` 传入的保护掩码），归一化残差一律置 ``0.0``。
     """
     res = np.asarray(residual, dtype=np.float64)
     w = np.asarray(weights, dtype=np.float64)
@@ -3038,11 +3156,10 @@ def compute_normalized_residuals_for_bad_data(
     omega_diag = np.maximum(raw_omega, 1e-12)
     normalized = np.abs(res) / np.sqrt(omega_diag)
     if np.any(critical_mask):
-        suppress = critical_mask & (np.abs(res) <= float(critical_noise_sigma) * np.sqrt(R_diag))
-        if np.any(suppress):
-            normalized[suppress] = 0.0
+        # 临界/准临界量测不可辨识且删除会破坏可观测性，统一归零屏蔽防数值放大爆炸
+        normalized[critical_mask] = 0.0
     if pseudo_arr is not None and np.any(pseudo_arr):
-        # 伪量测、零注入/功率平衡量测及内部物理等式约束绝不参与坏数据排除
+        # 硬物理等式约束（零注入/功率平衡/开关零阻等式）绝不参与坏数据排除
         normalized[pseudo_arr] = 0.0
     return normalized, critical_mask
 
@@ -3707,8 +3824,9 @@ def _strict_upper_bound_bad_data_cert(
     """基于严格残差方差下限的零误差稀疏坏数据认证。
 
     对于任意量测 i，与 ``compute_normalized_residuals_for_bad_data`` 严格一致：
-    - 非临界时残差方差 ``Omega_ii >= max(1e-9 * R_ii, 1e-12)``，故 ``r_Ni <= |r_i| / sqrt(max(1e-9 * R_ii, 1e-12))``；
-    - 临界时若为伪量测或 ``|r_i| <= 1e-4 * sqrt(R_ii)`` 则被抑制为 ``0.0``。
+    - 临界/准临界量测（``(R_ii - H_ii) / R_ii <= DEFAULT_CRITICAL_REDUNDANCY_RATIO``）与硬物理保护行均归零；
+    - 非临界量测必满足残差方差 ``Omega_ii > max(DEFAULT_CRITICAL_REDUNDANCY_RATIO * R_ii, 1e-12)``，
+      故 ``r_Ni < |r_i| / sqrt(max(DEFAULT_CRITICAL_REDUNDANCY_RATIO * R_ii, 1e-12))``。
     因此仅需对可能超阈值的稀疏集合 ``S`` 做 CHOLMOD 精确回代：
     - ``|S| == 0``：0 ms 严格认证全网无坏数据（``"fast_clean"``）；
     - ``0 < |S| <= max_exact_rows``：对 ``S`` 精确求杠杆率与归一化残差，若全不超阈则 100% 严格认证无坏数据
@@ -3722,17 +3840,16 @@ def _strict_upper_bound_bad_data_cert(
     active_w = w_arr > 0.0
     if active_mask is not None:
         active_w &= np.asarray(active_mask, dtype=bool)
+    if cur_is_pseudo is not None:
+        pseudo_arr = np.asarray(cur_is_pseudo, dtype=bool)
+        if pseudo_arr.size == res.size:
+            active_w &= ~pseudo_arr
     if not np.any(active_w):
         return "fast_clean", np.empty(0, dtype=np.intp), np.zeros(res.size, dtype=np.float64)
     abs_r = np.abs(res)
     R_diag = 1.0 / np.maximum(w_arr, 1e-12)
-    ub = abs_r / np.sqrt(np.maximum(1e-9 * R_diag, 1e-12))
-    crit_possible = abs_r > (1e-4 * np.sqrt(R_diag))
-    if cur_is_pseudo is not None:
-        pseudo_arr = np.asarray(cur_is_pseudo, dtype=bool)
-        if pseudo_arr.size == res.size:
-            crit_possible &= ~pseudo_arr
-    possible_rows = np.flatnonzero(active_w & ((ub > thr) | crit_possible))
+    ub = abs_r / np.sqrt(np.maximum(DEFAULT_CRITICAL_REDUNDANCY_RATIO * R_diag, 1e-12))
+    possible_rows = np.flatnonzero(active_w & (ub > thr))
     if possible_rows.size == 0:
         ub_out = np.where(active_w, ub, 0.0)
         return "fast_clean", np.empty(0, dtype=np.intp), ub_out
@@ -5741,6 +5858,240 @@ def solve_box_pinned_normal_equations(
             dx[pinned_cols] = 0.0
             return dx, True
     return np.full(n_state, np.nan, dtype=np.float64), False
+
+
+class AndersonAccelerator:
+    """Type-II Anderson 不动点加速器，用于加速大残差 Gauss-Newton 慢线性收敛。
+
+    将相同阻尼下连续满步迭代视为不动点映射 ``G(x_k) = x_{k+1} = x_k + f_k``：
+    仅在连续满步呈现慢线性收缩（步长收缩比处于 ``[0.55, 1.05]``）时求解极小
+    正则最小二乘 ``min ||f_k - dF @ gamma||^2 + reg ||gamma||^2`` 并提出外推点
+    ``x_aa = x_{k+1} - (dX + dF) @ gamma``。外推点是否采纳由调用方执行严格的物理
+    状态边界检查与目标函数单调下降检验 ``J(x_aa) < J(x_{k+1})`` 决定，确保零回退。
+    """
+
+    def __init__(
+        self,
+        m: int = 4,
+        reg: float = 1e-4,
+        max_gamma_norm: float = 1e6,
+        min_slow_streak: int = 3,
+    ) -> None:
+        self.m = max(2, int(m))
+        self.reg = float(reg)
+        self.max_gamma_norm = float(max_gamma_norm)
+        self.min_slow_streak = max(2, int(min_slow_streak))
+        self._last_x: Optional[np.ndarray] = None
+        self._last_f: Optional[np.ndarray] = None
+        self._last_damping: Optional[float] = None
+        self._dx_hist: List[np.ndarray] = []
+        self._df_hist: List[np.ndarray] = []
+        self._slow_streak: int = 0
+
+    def reset(self) -> None:
+        """清空历史切空间窗口与慢收缩计数。"""
+        self._last_x = None
+        self._last_f = None
+        self._last_damping = None
+        self._dx_hist.clear()
+        self._df_hist.clear()
+        self._slow_streak = 0
+
+    def update_and_propose(
+        self,
+        x_prev: np.ndarray,
+        x_next: np.ndarray,
+        *,
+        step_ratio: float,
+        damping: float = 0.0,
+        allow_propose: bool = True,
+    ) -> Optional[np.ndarray]:
+        """记录本步满步转移并按需通过列归一化薄 QR 构造 Anderson 外推候选点。"""
+        if x_prev.size == 0 or x_prev.size != x_next.size:
+            self.reset()
+            return None
+        d_cur = float(damping)
+        if self._last_damping is not None and abs(d_cur - self._last_damping) > max(1e-12, 0.05 * max(d_cur, self._last_damping)):
+            # 阻尼发生显著变化时不动点映射已改变，必须重置切空间窗口
+            self.reset()
+        self._last_damping = d_cur
+
+        f_cur = np.asarray(x_next - x_prev, dtype=np.float64)
+        if not np.all(np.isfinite(f_cur)):
+            self.reset()
+            return None
+        if self._last_x is not None and self._last_f is not None:
+            dx_pair = np.asarray(x_prev - self._last_x, dtype=np.float64)
+            df_pair = np.asarray(f_cur - self._last_f, dtype=np.float64)
+            if np.all(np.isfinite(dx_pair)) and np.all(np.isfinite(df_pair)):
+                self._dx_hist.append(dx_pair)
+                self._df_hist.append(df_pair)
+                if len(self._dx_hist) > self.m:
+                    self._dx_hist.pop(0)
+                    self._df_hist.pop(0)
+        self._last_x = np.asarray(x_prev, dtype=np.float64).copy()
+        self._last_f = f_cur
+
+        if allow_propose and (0.55 <= float(step_ratio) <= 1.05):
+            self._slow_streak += 1
+        else:
+            self._slow_streak = 0
+            return None
+
+        k = len(self._df_hist)
+        if self._slow_streak < self.min_slow_streak or k < 2:
+            return None
+
+        dF = np.column_stack(self._df_hist)
+        col_norms = np.linalg.norm(dF, axis=0)
+        if not np.all(np.isfinite(col_norms)) or float(np.max(col_norms)) <= 1e-15:
+            return None
+        valid_cols = col_norms > max(1e-15, 1e-12 * float(np.max(col_norms)))
+        if not np.any(valid_cols):
+            return None
+        dF_v = dF[:, valid_cols]
+        norms_v = col_norms[valid_cols]
+        dF_scaled = dF_v / norms_v[None, :]
+        try:
+            Q, R = np.linalg.qr(dF_scaled, mode="reduced")
+            gamma_s, *_ = np.linalg.lstsq(R, Q.T @ f_cur, rcond=max(self.reg, 1e-6))
+        except np.linalg.LinAlgError:
+            return None
+        gamma = gamma_s / norms_v
+        if (not np.all(np.isfinite(gamma))) or float(np.linalg.norm(gamma)) > self.max_gamma_norm:
+            return None
+
+        dX = np.column_stack(self._dx_hist)[:, valid_cols]
+        extrap_disp = -((dX + dF_v) @ gamma)
+        f_inf = float(np.max(np.abs(f_cur)))
+        if (not np.all(np.isfinite(extrap_disp))) or float(np.max(np.abs(extrap_disp))) > max(2.0, 500.0 * f_inf):
+            return None
+        x_aa = np.asarray(x_next, dtype=np.float64) + extrap_disp
+        if not np.all(np.isfinite(x_aa)):
+            return None
+        return x_aa
+
+    def on_accepted(self) -> None:
+        """外推点被采纳后重置旧切空间，避免跨越大距离后使用过时线性化。"""
+        self.reset()
+
+    def on_rejected(self) -> None:
+        """外推点未降低目标函数时清空窗口并重新积累，防止连续无效试探。"""
+        self.reset()
+
+
+def nielsen_lm_damping_update(
+    damping: float,
+    rhs: Optional[np.ndarray],
+    dx: Optional[np.ndarray],
+    actual_drop: float,
+    step_scale: float = 1.0,
+    *,
+    half_obj: bool = True,
+    diag_reg: Optional[np.ndarray] = None,
+    min_damping: float = 0.0,
+    max_damping: float = 100.0,
+    zero_cutoff: float = 1e-4,
+    dx_growing: bool = False,
+) -> Tuple[float, float]:
+    """基于大残差对称增益比 |ρ - 1| 的 Nielsen (1999) 连续信赖域阻尼更新律。
+
+    对于正则正规方程 ``(G + λ D) Δx = g``（其中 ``g = rhs = H^T W r``）：
+    - 目标函数 ``J = c * r^T W r``（``c = 0.5`` 当 ``half_obj=True``，否则 ``c = 1.0``）；
+    - 二次模型在步长 ``α = step_scale`` 处的精确预测下降量为：
+      ``ΔJ_pred = c * [α(2 - α) (g^T Δx) + α^2 λ (Δx^T D Δx)]``；
+    - 对称匹配度 ``ρ_eff = 1 - |ρ - 1|``（既识别 ``ρ < 0.5`` 的高估，也识别大残差非凸 ``ρ > 1.5`` 失配）：
+      * ``ρ ≈ 1``（且步长未放大）时按 ``max(1/3, 1 - (2ρ_eff - 1)^3)`` 平滑缩减阻尼；
+      * ``ρ ≈ 0.5`` 或 ``1.5`` 时因子趋近 ``1.0``，自动稳停在最优曲率阻尼台阶；
+      * ``ρ < 0.25`` 或 ``ρ > 1.75`` 时提前温和抬升阻尼，防止撞回溯或过冲震荡。
+
+    返回 ``(new_damping, rho)``。
+    """
+    lam = max(0.0, float(damping))
+    alpha = float(step_scale)
+    d_min = max(0.0, float(min_damping))
+    d_max = max(d_min, float(max_damping))
+
+    if lam <= 0.0:
+        return 0.0, 1.0
+
+    rho = np.nan
+    if rhs is not None and dx is not None and rhs.size > 0 and rhs.size == dx.size and alpha > 0.0:
+        g_dot_dx = float(np.dot(rhs, dx))
+        if diag_reg is not None and diag_reg.size == dx.size:
+            reg_quad = float(np.dot(dx * dx, np.maximum(diag_reg, 1e-12)))
+        else:
+            reg_quad = float(np.dot(dx, dx))
+        pred_raw = alpha * (2.0 - alpha) * g_dot_dx + (alpha * alpha) * lam * reg_quad
+        pred_drop = (0.5 * pred_raw) if half_obj else pred_raw
+        if np.isfinite(pred_drop) and pred_drop > 1e-30:
+            rho = float(actual_drop) / pred_drop
+
+    if alpha >= 0.8 and np.isfinite(rho) and rho > 0.0:
+        # 大残差双向对称信赖域更新律（Nielsen 1999 连续缩减 + 临界阻尼防死区抬升）：
+        # - rho_eff > 0.50 且步长未放大时按 Nielsen 原始连续律 max(1/3, 1 - (2*rho_eff - 1)^3) 平滑缩减，
+        #   消除 [0.50, 0.70) 人为锁死带导致平滑峡谷阻尼降不下去的问题；
+        # - rho_eff in [0.45, 0.50] 稳停；
+        # - rho_eff < 0.45（实际降幅不足模型一半或严重非凸失配）果断按 1.5x~2.0x 越过临界阻尼。
+        rho_eff = rho if rho <= 1.0 else max(0.0, 2.0 - rho)
+        if rho_eff > 0.50:
+            factor = max(1.0 / 3.0, 1.0 - (2.0 * rho_eff - 1.0) ** 3)
+            if dx_growing and factor < 1.0:
+                factor = 1.0
+        elif rho_eff >= 0.45:
+            factor = 1.0
+        else:
+            factor = 2.0 if rho_eff < 0.25 else 1.5
+        new_lam = lam * factor
+        if new_lam < zero_cutoff and d_min <= 0.0 and (0.75 <= rho <= 1.25) and not dx_growing:
+            new_lam = 0.0
+        else:
+            new_lam = min(d_max, max(d_min, new_lam))
+        return float(new_lam), float(rho)
+
+    if alpha < 0.5 or (np.isfinite(rho) and rho <= 0.0):
+        new_lam = min(d_max, max(lam * 2.0, max(1e-3, d_min)))
+        return float(new_lam), float(rho) if np.isfinite(rho) else 0.0
+
+    return float(min(d_max, max(d_min, lam))), float(rho) if np.isfinite(rho) else 0.5
+
+
+def projected_box_kkt_residual(
+    x: np.ndarray,
+    rhs: np.ndarray,
+    diag_g: np.ndarray,
+    v_cols: np.ndarray,
+    v_min: float,
+    v_max: float,
+    *,
+    core_cols: Optional[np.ndarray] = None,
+    margin: float = 1e-4,
+) -> Tuple[float, float]:
+    """计算带盒约束非线性最小二乘的归一化投影 KKT 一阶最优性残差。
+
+    扣除已紧贴电压下界/上界且梯度继续指向可行域外侧的活跃不等式约束分量后，
+    按 ``|rhs_i| / max(diag_g_i, 1.0)`` 返回 ``(core_kkt, all_kkt)``。
+    """
+    if rhs.size == 0 or diag_g.size != rhs.size or x.size != rhs.size:
+        return np.inf, np.inf
+    eff_rhs = np.asarray(rhs, dtype=np.float64).copy()
+    if v_cols.size > 0:
+        vc = np.asarray(v_cols, dtype=np.intp)
+        xv = x[vc]
+        rv = eff_rhs[vc]
+        pin = ((xv <= float(v_min) + margin) & (rv < 0.0)) | ((xv >= float(v_max) - margin) & (rv > 0.0))
+        if np.any(pin):
+            eff_rhs[vc[pin]] = 0.0
+    scaled = np.abs(eff_rhs) / np.maximum(np.asarray(diag_g, dtype=np.float64), 1.0)
+    all_kkt = float(np.max(scaled)) if scaled.size else 0.0
+    if core_cols is not None and core_cols.size > 0:
+        core_kkt = float(np.max(scaled[np.asarray(core_cols, dtype=np.intp)]))
+    else:
+        core_kkt = all_kkt
+    return core_kkt, all_kkt
+
+
+
 
 
 
