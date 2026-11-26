@@ -6741,3 +6741,29 @@ def test_huber_unhealthy_warmup_preserves_flat_fallback_x0(tmp_path, monkeypatch
     # 崩溃态 x_hub 不应传入任何一次 estimate(x0=...)，避免污染健康平启动兜底
     assert all(vmin >= float(est.voltage_min) + 0.10 for vmin in seen_x0_vmin)
     assert float(np.min(res.x[: est.n_voltage])) > 0.5
+
+
+def test_ac_lm_guard_handoff_and_fluid_mid_damping_escape(tmp_path):
+    """验证 AC/HYB 连续 LM 护栏拦截接管及流体中阻尼长尾脱困在边界场景下均稳定收敛。"""
+    # 1. AC 极端异构权重 + 脏初值：验证稳定收敛且不会因无阻尼反复被护栏拦截空转 200 步
+    ac_dir = tmp_path / "ac_lm_handoff"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(12, ac_dir, seed=2041)
+    lines = ac_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    idx_k = 0
+    for ln in lines:
+        if ln.startswith("#"):
+            parts = ln.split()
+            # 制造 6 个数量级异构权重跨度（第 7 列 parts[6] 为 weight）
+            parts[6] = "1e4" if (idx_k % 3 == 0) else "1e-2"
+            edited.append(" ".join(parts))
+            idx_k += 1
+        else:
+            edited.append(ln)
+    ac_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+    est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS, flat_start=True)
+    res, _rem = est.estimate_with_bad_data_removal(threshold=4.0, max_remove=5)
+    assert res.converged
+    assert res.iterations < 80
+

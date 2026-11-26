@@ -10789,6 +10789,7 @@ class HybridStateEstimator:
 
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
+        frozen_fail_count = 0
 
         for iteration in range(1, self.max_iter + 1):
             if _hybrid_state_out_of_bounds(x):
@@ -10906,6 +10907,7 @@ class HybridStateEstimator:
             )
             if (
                 not used_woodbury_step
+                and frozen_fail_count < 2
                 and use_aat_normal_solver
                 and aat_solver is not None
                 and aat_plan is not None
@@ -11320,6 +11322,7 @@ class HybridStateEstimator:
                     if used_woodbury_step:
                         wb_solver = None
                     else:
+                        frozen_fail_count += 1
                         frozen_steps = max(scale_profile.frozen_max_steps, scale_profile.local_warm_frozen_max_steps)
                     continue
                 if force_lm_damping < 100.0 and solved_via_aat and aat_solver is not None:

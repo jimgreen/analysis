@@ -2546,6 +2546,7 @@ class FluidStateEstimator:
         high_damp_stagnation_streak = 0
         high_damp_slow_streak = 0
         low_progress_streak = 0
+        damped_slow_progress_streak = 0
         fullstep_osc_streak = 0
         curvature_damping_active = False
         singular_fail_count = 0
@@ -2967,6 +2968,10 @@ class FluidStateEstimator:
                 low_progress_streak += 1
             else:
                 low_progress_streak = 0
+            if step_damping > 0.0 and obj_change <= rel_obj_tol_slow:
+                damped_slow_progress_streak += 1
+            else:
+                damped_slow_progress_streak = 0
             if tried_undamped_escape:
                 if obj_change <= max(1e-10, 5e-4 * (abs(prev_objective) + 1.0)):
                     if np.isfinite(pre_escape_max_correction):
@@ -2979,6 +2984,7 @@ class FluidStateEstimator:
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak = 0
                 low_progress_streak = 0
+                damped_slow_progress_streak = 0
             elif (
                 obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
                 and actual_rel_dx <= max(1e-6, self.tol)
@@ -3039,9 +3045,11 @@ class FluidStateEstimator:
                     tried_undamped_escape = True
                     pre_escape_max_correction = max_correction
                     high_damp_slow_streak = 0
-            elif low_progress_streak >= 12:
-                # 中低阻尼非光滑脊线微幅抖动（连续 12 步目标 6 位无实质进展）：触发无阻尼脱困确认，释放外层 BDR 剔坏
+            elif low_progress_streak >= 12 or damped_slow_progress_streak >= 20:
+                # 中低阻尼非光滑脊线微幅抖动或长尾极慢进展（连续 12 步目标 6 位不变，或带阻尼连续 20 步相对降幅 <= 5e-4）：
+                # 触发无阻尼脱困确认，打破 bounce_floor 中低阻尼真空带锁死并释放外层 BDR 剔坏
                 low_progress_streak = 0
+                damped_slow_progress_streak = 0
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak = 0

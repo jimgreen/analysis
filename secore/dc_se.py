@@ -6353,6 +6353,7 @@ class DCStateEstimator:
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
         lm_guard_streak = 0
+        frozen_fail_count = 0
 
         for iteration in range(1, self.max_iter + 1):
             if _dc_state_out_of_bounds(x):
@@ -6463,6 +6464,7 @@ class DCStateEstimator:
                     wb_solver = None
             if (
                 not used_woodbury_step
+                and frozen_fail_count < 2
                 and use_aat_normal_solver
                 and aat_solver is not None
                 and aat_plan is not None
@@ -6850,6 +6852,7 @@ class DCStateEstimator:
                     if used_woodbury_step:
                         wb_solver = None
                     else:
+                        frozen_fail_count += 1
                         frozen_steps = 3
                     continue
                 if force_lm_damping < 100.0 and normal_operand is not None and aat_solver is not None:

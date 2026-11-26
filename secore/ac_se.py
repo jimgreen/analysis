@@ -10362,6 +10362,8 @@ class ACStateEstimator:
         )
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
+        lm_guard_streak = 0
+        frozen_fail_count = 0
 
         for iteration in range(1, iteration_limit + 1):
             if _state_out_of_bounds(x):
@@ -10388,6 +10390,7 @@ class ACStateEstimator:
             used_woodbury_step = False
             used_sw_curv = False
             used_box_pin_step = False
+            used_lm_guard_step = False
             pinned_cols = np.empty(0, dtype=np.intp)
             cur_rhs_inf = np.inf
             rhs = None
@@ -10476,6 +10479,7 @@ class ACStateEstimator:
             )
             if (
                 not used_woodbury_step
+                and frozen_fail_count < 2
                 and use_aat_normal_solver
                 and aat_solver is not None
                 and aat_plan is not None
@@ -10695,6 +10699,7 @@ class ACStateEstimator:
                             if lm_ok:
                                 dx_pin = dx_lm
                                 step_damping = beta_try
+                                used_lm_guard_step = True
                                 if not _dx_needs_lm_guard(dx_pin, strict_step=False):
                                     break
                     if not pin_ok:
@@ -10760,6 +10765,7 @@ class ACStateEstimator:
                                 if dx_lm.size == dx.size and np.all(np.isfinite(dx_lm)):
                                     dx = dx_lm
                                     step_damping = beta_try
+                                    used_lm_guard_step = True
                                     if not _dx_needs_lm_guard(dx, strict_step=False):
                                         break
                     else:
@@ -10928,11 +10934,12 @@ class ACStateEstimator:
             if not accepted:
                 aa_accel.reset()
                 if used_frozen_step:
-                    # 冻结因子或 Woodbury 试探未改善目标函数，立即退回精确雅可比与分解重试
+                    # 冻结因子或 Woodbury 试探未改善目标函数，立即退回精确雅可比与分解重试；连续失败 2 次则熔断冻结步防止乒乓
                     prev_step_accepted = False
                     if used_woodbury_step:
                         wb_solver = None
                     else:
+                        frozen_fail_count += 1
                         frozen_steps = max(scale_profile.frozen_max_steps, scale_profile.local_warm_frozen_max_steps)
                     continue
                 if force_lm_damping < 100.0 and normal_operand is not None and aat_solver is not None:
@@ -11060,6 +11067,17 @@ class ACStateEstimator:
                     fullstep_osc_streak = 0
                 if abs(new_d - step_damping) > max(1e-12, 0.05 * max(new_d, step_damping)):
                     prev_step_accepted = False
+            elif used_lm_guard_step and step_damping > 0.0:
+                # 连续 3 步无阻尼方向触发 LM 护栏拦截时，正式移交信赖域控制器管控，避免每轮白做无阻尼分解与绕过停滞检测
+                lm_guard_streak += 1
+                if lm_guard_streak >= 3:
+                    force_lm_damping = min(10.0, max(float(step_damping), 1e-2))
+                    curvature_damping_active = True
+                    tr_ctrl.notify_damping_activated(force_lm_damping, objective)
+                    lm_guard_streak = 0
+                    prev_step_accepted = False
+            else:
+                lm_guard_streak = 0
             if accepted_step is not None and accepted_step < 1e-3 and max_correction > 1e-2:
                 micro_step_streak += 1
                 fullstep_osc_streak = 0
