@@ -6583,6 +6583,42 @@ def test_nielsen_trust_region_controller_anti_limit_cycle_and_anderson_rolling_w
     assert len(aa._df_hist) == 0
 
 
+def test_nielsen_spectral_scaled_zero_cutoff_for_high_susceptance():
+    """验证超高电纳网络在 Jacobi 相对阻尼模式下按 90 分位主体刚度缩细归零阈值，且不被单个高权节点误触发。"""
+    from secore.se_math import nielsen_lm_damping_update
+
+    rhs = np.ones(20, dtype=np.float64)
+    dx = np.full(20, 1e-3, dtype=np.float64)
+    lam = 1.2e-3
+    # 1. 普通网络（含 1 个极端高权零注入节点 1e9，占比 5%，主体 90 分位仍为 1e6 <= 5e7）：按 zero_cutoff=1e-3 正常归零
+    dg_normal = np.full(20, 1e6, dtype=np.float64)
+    dg_normal[0] = 1e9
+    dg_normal[-1] = 1e4
+    pred_norm = 0.5 * (float(np.dot(rhs, dx)) + lam * float(np.dot(dx * dx, dg_normal)))
+    new_norm, rho_norm = nielsen_lm_damping_update(
+        lam, rhs, dx, pred_norm, 1.0, half_obj=True, diag_reg=dg_normal, zero_cutoff=1e-3
+    )
+    assert 0.99 <= rho_norm <= 1.01
+    assert new_norm == 0.0
+
+    # 2. 主体超高电纳网络（90 分位 = 5e9 > 5e7）：1e-3*d_90 仍高达 5e6，不在 1e-3 过早一刀归零
+    dg_stiff = np.full(20, 5e9, dtype=np.float64)
+    pred_stiff = 0.5 * (float(np.dot(rhs, dx)) + lam * float(np.dot(dx * dx, dg_stiff)))
+    new_stiff, rho_stiff = nielsen_lm_damping_update(
+        lam, rhs, dx, pred_stiff, 1.0, half_obj=True, diag_reg=dg_stiff, zero_cutoff=1e-3
+    )
+    assert 0.99 <= rho_stiff <= 1.01
+    assert 0.0 < new_stiff < lam
+    # 当阻尼进一步平滑降至频谱阈值 (5e2/5e9 = 1e-7) 以下时正常归零
+    lam_tiny = 2e-7
+    pred_tiny = 0.5 * (float(np.dot(rhs, dx)) + lam_tiny * float(np.dot(dx * dx, dg_stiff)))
+    new_tiny, _ = nielsen_lm_damping_update(
+        lam_tiny, rhs, dx, pred_tiny, 1.0, half_obj=True, diag_reg=dg_stiff, zero_cutoff=1e-3
+    )
+    assert new_tiny == 0.0
+
+
+
 
 
 

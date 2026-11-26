@@ -6202,7 +6202,15 @@ def nielsen_lm_damping_update(
         else:
             factor = 2.0 if rho_eff < 0.25 else 1.5
         new_lam = lam * factor
-        if new_lam < zero_cutoff and d_min <= 0.0 and (0.75 <= rho <= 1.25) and not dx_growing:
+        # 超高电纳/刚性网络在 Jacobi 相对阻尼模式下，若主体刚度（90 分位 diag_reg）> 5e7，则标称 zero_cutoff=1e-3
+        # 对应的主体绝对正则项 λ·d_90 仍高达 5e4~1e6，过早一刀归零会导致弱模态瞬间过冲并反复弹回重开阻尼；
+        # 采用 90 分位而非 max 避免被单个零注入/换流器极端权重节点误触发，对普通网络保持 100% 零扰动。
+        eff_zero_cutoff = float(zero_cutoff)
+        if diag_reg is not None and diag_reg.size > 0 and eff_zero_cutoff > 0.0:
+            d_reg_scale = float(np.percentile(diag_reg, 90))
+            if np.isfinite(d_reg_scale) and d_reg_scale > 5e7:
+                eff_zero_cutoff = min(eff_zero_cutoff, max(1e-7, 5e2 / d_reg_scale))
+        if new_lam < eff_zero_cutoff and d_min <= 0.0 and (0.75 <= rho <= 1.25) and not dx_growing:
             new_lam = 0.0
         else:
             new_lam = min(d_max, max(d_min, new_lam))

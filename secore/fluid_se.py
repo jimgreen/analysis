@@ -3001,7 +3001,13 @@ class FluidStateEstimator:
                 stagnation_streak = 0
                 high_damp_stagnation_streak += 1
                 high_damp_slow_streak += 1
-                if high_damp_stagnation_streak >= 6:
+                is_cliff_locked = (
+                    step_damping >= 10.0
+                    and accepted_step < 0.5
+                    and np.isfinite(rho_lm)
+                    and (0.90 <= rho_lm <= 1.10)
+                )
+                if high_damp_stagnation_streak >= (4 if is_cliff_locked else 6):
                     lm_damping = 0.0
                     curvature_damping_active = False
                     tr_ctrl.reset()
@@ -3020,7 +3026,13 @@ class FluidStateEstimator:
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak += 1
-                if high_damp_slow_streak >= 12:
+                is_cliff_locked = (
+                    step_damping >= 10.0
+                    and accepted_step < 0.5
+                    and np.isfinite(rho_lm)
+                    and (0.90 <= rho_lm <= 1.10)
+                )
+                if high_damp_slow_streak >= (4 if is_cliff_locked else 12):
                     lm_damping = 0.0
                     curvature_damping_active = False
                     tr_ctrl.reset()
