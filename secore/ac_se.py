@@ -11080,10 +11080,11 @@ class ACStateEstimator:
                         if damped_nonshrink_streak >= 3 and force_lm_damping < 2.0:
                             # 曲率阻尼下步长连续显著放大(>2%)，记录周期反弹记忆并温和翻倍压制（上限 2.0 防冻死）
                             if damp_relaxed_recently:
-                                damp_bounce_count += 1
                                 damp_relaxed_recently = False
-                                if damp_bounce_count >= 2:
-                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
+                                if last_step_max_correction <= 0.25:
+                                    damp_bounce_count += 1
+                                    if damp_bounce_count >= 2:
+                                        damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
                             force_lm_damping = min(2.0, max(float(force_lm_damping) * 2.0, max(0.2, damp_cycle_floor)))
                             damped_nonshrink_streak = 0
                             prev_step_accepted = False
@@ -11131,10 +11132,11 @@ class ACStateEstimator:
                     # 非零残差香蕉谷极限环自愈（通用防 k-周期漏桶计数，识破连续与 2/3/4-周期交替回溯）
                     if backtrack_streak >= 12 and normal_operand is not None and aat_solver is not None:
                         if damp_relaxed_recently:
-                            damp_bounce_count += 1
                             damp_relaxed_recently = False
-                            if damp_bounce_count >= 2:
-                                damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
+                            if last_step_max_correction <= 0.25:
+                                damp_bounce_count += 1
+                                if damp_bounce_count >= 2:
+                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
                         if force_lm_damping < 10.0:
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                             force_lm_damping = min(10.0, max(force_lm_damping * 10.0, max(hint_base, damp_cycle_floor)))

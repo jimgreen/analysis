@@ -3989,8 +3989,8 @@ class HybridStateEstimator:
                         damp_cycle_count += 1
                         damp_relaxed_flag = False
                         if damp_cycle_count >= 2:
-                            # 阻尼放松后反复撞回溯形成周期震荡，锁住温和阻尼下限防止再次跌零撞墙
-                            min_cycle_damping = min(1.0, max(min_cycle_damping, 0.05))
+                            # 阻尼放松后反复撞回溯形成周期震荡，锁住温和防跌零下限(1e-3)防止跌零撞墙且不截断有效热网推进区间
+                            min_cycle_damping = min(1.0, max(min_cycle_damping, 1e-3))
                     force_lm_damping = min(100.0, max(force_lm_damping * 10.0, max(1e-2, min_cycle_damping)))
                     curvature_damping_active = True
                     backtrack_streak = 0
@@ -4009,8 +4009,11 @@ class HybridStateEstimator:
             else:
                 cycle_slow_streak = 0
             if tried_undamped_escape:
-                if obj_change <= max(1e-10, 5e-4 * (abs(previous_objective) + 1.0)):
-                    # 无阻尼脱困试探未能令目标函数实质下降，确认已到达非光滑局部极小驻点
+                if (
+                    obj_change <= max(1e-10, 5e-4 * (abs(previous_objective) + 1.0))
+                    or (step_scale < 0.5 and obj_change <= max(1e-10, 5e-3 * (abs(previous_objective) + 1.0)))
+                ):
+                    # 无阻尼脱困试探未能令目标函数实质下降（或需大幅回溯且仅挤出极微降幅），确认已到达非光滑局部极小驻点
                     stationary = True
                 else:
                     tried_undamped_escape = False
@@ -11312,10 +11315,11 @@ class HybridStateEstimator:
                         if damped_nonshrink_streak >= 3 and force_lm_damping < 2.0:
                             # 曲率阻尼下步长连续显著放大(>2%)，记录周期反弹记忆并温和翻倍压制（上限 2.0 防冻死）
                             if damp_relaxed_recently:
-                                damp_bounce_count += 1
                                 damp_relaxed_recently = False
-                                if damp_bounce_count >= 2:
-                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
+                                if last_step_max_correction <= 0.25:
+                                    damp_bounce_count += 1
+                                    if damp_bounce_count >= 2:
+                                        damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
                             force_lm_damping = min(2.0, max(float(force_lm_damping) * 2.0, max(0.2, damp_cycle_floor)))
                             damped_nonshrink_streak = 0
                             prev_step_accepted = False
@@ -11373,10 +11377,11 @@ class HybridStateEstimator:
                     backtrack_streak += 4
                     if backtrack_streak >= 12 and solved_via_aat and aat_solver is not None:
                         if damp_relaxed_recently:
-                            damp_bounce_count += 1
                             damp_relaxed_recently = False
-                            if damp_bounce_count >= 2:
-                                damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
+                            if last_step_max_correction <= 0.25:
+                                damp_bounce_count += 1
+                                if damp_bounce_count >= 2:
+                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
                         if force_lm_damping < 10.0:
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                             force_lm_damping = min(10.0, max(force_lm_damping * 10.0, max(hint_base, damp_cycle_floor)))
@@ -11597,9 +11602,14 @@ class HybridStateEstimator:
                 and not used_woodbury_step
                 and prev_rms_correction < 2e-2
                 and H is not None
-                and last_solved_via_aat
-                and aat_solver is not None
-                and aat_solver.last_cholmod_factor is not None
+                and (
+                    used_box_pin_step
+                    or (
+                        last_solved_via_aat
+                        and aat_solver is not None
+                        and (aat_solver.last_cholmod_factor is not None or bool(getattr(aat_solver, "_last_factor_scaled", False)))
+                    )
+                )
             ):
                 # 前期仍存在大批显性大坏数据时，主体已稳定即可安全提前结束注定被废弃的尾部磨步
                 strong_bad_cnt = int(
@@ -11609,7 +11619,7 @@ class HybridStateEstimator:
                 )
                 if strong_bad_cnt >= 10:
                     coarse_stopped = True
-                    final_quantities_current = True
+                    final_quantities_current = not used_box_pin_step
                     break
 
         if z_est_dirty:
@@ -13964,7 +13974,9 @@ class HybridStateEstimator:
                                 # 大批量粗早停仅重置停滞计数，不重置未收敛累计轮次，避免拖延尾段贴边自救
                                 unconverged_stall_rounds = 0
                             else:
-                                unconverged_total_rounds += 1
+                                significant_batch_drop = np.isfinite(cur_obj) and cur_obj < 0.90 * prev_obj
+                                if not significant_batch_drop:
+                                    unconverged_total_rounds += 1
                                 unconverged_stall_rounds = (
                                     0
                                     if (

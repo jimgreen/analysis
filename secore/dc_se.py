@@ -7006,10 +7006,11 @@ class DCStateEstimator:
                     backtrack_streak += 4
                     if backtrack_streak >= 12 and normal_operand is not None and aat_solver is not None:
                         if damp_relaxed_recently:
-                            damp_bounce_count += 1
                             damp_relaxed_recently = False
-                            if damp_bounce_count >= 2:
-                                damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
+                            if last_step_max_correction <= 0.25:
+                                damp_bounce_count += 1
+                                if damp_bounce_count >= 2:
+                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
                         if force_lm_damping < 10.0:
                             force_lm_damping = min(10.0, max(force_lm_damping * 10.0, max(1e-1, damp_cycle_floor)))
                             curvature_damping_active = True
