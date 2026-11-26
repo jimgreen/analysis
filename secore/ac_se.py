@@ -70,8 +70,6 @@ from model.meas_type import (
     DEVICE_TYPE_ACACConverter,
     MEAS_TYPE_CODES,
     MEAS_TYPE_V,
-    MEAS_TYPE_ANGLE,
-    MEAS_TYPE_THETA,
     MEAS_TYPE_P_FROM,
     MEAS_TYPE_Q_FROM,
     MEAS_TYPE_V_FROM,
@@ -94,9 +92,6 @@ from model.meas_type import (
     MEAS_TYPE_I_GEN,
     MEAS_TYPE_P_BALANCE,
     MEAS_TYPE_Q_BALANCE,
-    MEAS_TYPE_V_DIFF,
-    MEAS_TYPE_ANGLE_DIFF,
-    MEAS_TYPE_THETA_DIFF,
     DEVICE_TYPE_NAMES,
     MEAS_TYPE_NAMES,
 )
@@ -128,7 +123,6 @@ from model.meas_model import (
     print_iteration_header as _print_iteration_header,
 )
 from secore.se_math import (
-    ANGLE_MEASUREMENT_TYPES,
     CHOLMOD_ANALYZE_AAT,
     CHOLMOD_CHOLESKY,
     CHOLMOD_CHOLESKY_AAT,
@@ -136,12 +130,12 @@ from secore.se_math import (
     CholmodAAtNormalEquationSolver,
     SEScaleProfile,
     SparseJacobianBuilder,
-    angle_residual_mask,
     build_normal_equations,
     build_switch_current_curvature_columns,
     check_active_structural_full_rank,
     compute_active_column_degrees,
     compute_normalized_residuals_for_bad_data,
+    detect_active_box_pinned_cols,
     filter_batch_preserving_column_coverage,
     full_normal_equation_from_lower,
     inverse_gain_for_bad_data,
@@ -159,6 +153,7 @@ from secore.se_math import (
     screen_initial_bad_data_fast,
     select_independent_bad_data_batch,
     select_island_fixed_voltage_reference_buses,
+    solve_box_pinned_normal_equations,
     solve_woodbury_after_row_removal,
     sparse_structural_rank,
     targeted_redundancy_count,
@@ -227,14 +222,6 @@ _VOLTAGE_MEASUREMENT_TYPES = frozenset(
         MEAS_TYPE_V_LOAD,
     )
 )
-_ANGLE_MEASUREMENT_CODE_SET = frozenset(
-    (
-        MEAS_TYPE_ANGLE,
-        MEAS_TYPE_THETA,
-        MEAS_TYPE_ANGLE_DIFF,
-        MEAS_TYPE_THETA_DIFF,
-    )
-)
 _PSEUDO_DEVICE_SUMMARY_TYPES = frozenset(
     (
         DEVICE_TYPE_ACGenerator,
@@ -255,7 +242,6 @@ _PSEUDO_MEASUREMENT_SUMMARY_TYPES = {
 _MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
 _TERMINAL_POWER_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_TERMINAL_POWER_MEASUREMENT_TYPES), dtype=np.int16)
 _VOLTAGE_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_VOLTAGE_MEASUREMENT_TYPES), dtype=np.int16)
-_ANGLE_MEASUREMENT_TYPE_CODES = np.asarray(tuple(_ANGLE_MEASUREMENT_CODE_SET), dtype=np.int16)
 
 
 def _measurement_type_code_lookup_from_codes(codes: Sequence[int]) -> np.ndarray:
@@ -306,16 +292,11 @@ _AC_ZERO_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
         MEAS_TYPE_Q_TO,
         MEAS_TYPE_V_TO,
         MEAS_TYPE_I_TO,
-        MEAS_TYPE_V_DIFF,
-        MEAS_TYPE_ANGLE_DIFF,
-        MEAS_TYPE_THETA_DIFF,
     )
 )
 _AC_NODE_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
     (
         MEAS_TYPE_V,
-        MEAS_TYPE_ANGLE,
-        MEAS_TYPE_THETA,
     )
 )
 _AC_LOAD_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
@@ -340,13 +321,6 @@ _AC_BALANCE_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
     (
         MEAS_TYPE_P_BALANCE,
         MEAS_TYPE_Q_BALANCE,
-    )
-)
-_AC_CONSTRAINT_MEAS_TYPE_LOOKUP = _measurement_type_code_lookup_from_codes(
-    (
-        MEAS_TYPE_V_DIFF,
-        MEAS_TYPE_ANGLE_DIFF,
-        MEAS_TYPE_THETA_DIFF,
     )
 )
 
@@ -627,7 +601,6 @@ def _measurement_table_from_measurements(measurements: Sequence["Measurement"]) 
     table = measurement_table_from_measurements(
         measurements,
         device_type_codes=_DEVICE_TYPE_CODES,
-        angle_measurement_types=ANGLE_MEASUREMENT_TYPES,
     )
     meas_type_code = getattr(table, "meas_type_code", None)
     if meas_type_code is None or np.asarray(meas_type_code).size != table.idx.size:
@@ -1024,7 +997,7 @@ class ACStateEstimator:
             legacy_label[rows] = np.char.add("theta:", names.astype(str)).astype(object)
             device_pos[rows] = plan_pos_for_states(node_plan_by_solver_pos, angle_state_pos)
             device_type_code[rows] = DEVICE_TYPE_ACNode
-            meas_type_code[rows] = MEAS_TYPE_ANGLE
+            meas_type_code[rows] = 0
             cursor += count
 
         voltage_state_pos = np.asarray(getattr(self, "voltage_state_pos", ()), dtype=np.int64)
@@ -1291,7 +1264,6 @@ class ACStateEstimator:
             and int(self._ac_node_ids[int(pos)]) in self.node_voltage_measurements
         }
         self.reference_angle_by_pos = self._reference_angle_offsets()
-        self._rebase_angle_measurements()
         self._build_zero_tie_state_layout()
         self._record_profile_time("init.state_layout", time.perf_counter() - stage_start)
         ppc = self._ac_ppc_dict()
@@ -1487,8 +1459,6 @@ class ACStateEstimator:
             self.active_measurement_rows = np.array([], dtype=np.int64)
             self.active_z = np.array([], dtype=np.float64)
             self.active_weight = np.array([], dtype=np.float64)
-            self.active_angle_residual_mask = np.array([], dtype=bool)
-            self.active_has_angle_residuals = False
             self.active_uniform_weight = None
             self.active_weights_are_uniform = False
             self._active_rows_by_device_type_code = {}
@@ -1680,7 +1650,6 @@ class ACStateEstimator:
         self.active_measurement_table = common_table
         self.active_z = np.asarray(common_table.value, dtype=np.float64)
         self.active_weight = np.asarray(common_table.weight, dtype=np.float64)
-        self.active_angle_residual_mask = np.asarray(common_table.angle_mask, dtype=bool)
         self._allow_nonflat_fast_observability_certificate = True
         self._active_branch_transformer_vector_plan = None
         self._active_zero_current_vector_plan = None
@@ -1968,8 +1937,6 @@ class ACStateEstimator:
         self.active_measurement_table = active_table
         self.active_z = active_view.z
         self.active_weight = active_view.weight
-        self.active_angle_residual_mask = active_view.angle_mask
-        self.active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask))
         self.active_uniform_weight = self._uniform_weight(self.active_weight)
         self.active_weights_are_uniform = self.active_uniform_weight is not None
         self._active_rows_by_device_type_code = active_view.rows_by_device_type_code
@@ -2108,8 +2075,6 @@ class ACStateEstimator:
         self.active_measurement_table = active_view.table
         self.active_z = active_view.z
         self.active_weight = active_view.weight
-        self.active_angle_residual_mask = active_view.angle_mask
-        self.active_has_angle_residuals = bool(np.any(self.active_angle_residual_mask))
         self.active_uniform_weight = self._uniform_weight(self.active_weight)
         self.active_weights_are_uniform = self.active_uniform_weight is not None
         self._active_rows_by_device_type_code = active_view.rows_by_device_type_code
@@ -2150,9 +2115,6 @@ class ACStateEstimator:
                 row_keys=(
                     "scalar_rows",
                     "value_voltage_rows",
-                    "value_angle_rows",
-                    "value_voltage_diff_rows",
-                    "value_angle_diff_rows",
                     "load_rows",
                 ),
             )
@@ -2168,10 +2130,7 @@ class ACStateEstimator:
                 self._build_zero_current_vector_plan(appended_view),
                 row_offset=row_offset,
                 row_keys=(
-                    "scalar_rows",
                     "voltage_rows",
-                    "angle_diff_rows",
-                    "voltage_diff_rows",
                     "power_rows",
                     "current_rows",
                 ),
@@ -2321,23 +2280,6 @@ class ACStateEstimator:
         first_weight = float(weight[0])
         return first_weight if bool(np.all(weight == first_weight)) else None
 
-    def _angle_residual_mask(self, measurements) -> np.ndarray:
-        if isinstance(measurements, dict) or isinstance(measurements, MeasurementPlanTable):
-            return np.asarray(self._common_measurement_plan_table(measurements).table.angle_mask, dtype=bool)
-        if measurements is None:
-            return np.asarray(self._active_measurement_table_ref().angle_mask, dtype=bool)
-        table = getattr(measurements, "table", None)
-        if table is not None and len(table.angle_mask) == len(measurements):
-            return np.asarray(table.angle_mask, dtype=bool)
-        return angle_residual_mask(measurements)
-
-    def _has_angle_residuals(self, measurements, angle_mask: np.ndarray) -> bool:
-        if isinstance(measurements, dict) or isinstance(measurements, MeasurementPlanTable):
-            return bool(np.any(angle_mask))
-        if measurements is None:
-            return self.active_has_angle_residuals
-        return bool(np.any(angle_mask))
-
     def _measurement_residual(
         self,
         z: np.ndarray,
@@ -2346,16 +2288,10 @@ class ACStateEstimator:
         *,
         out: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        angle_mask = self._angle_residual_mask(measurements)
-        has_angle = self._has_angle_residuals(measurements, angle_mask)
         if out is None:
-            residual = np.subtract(z, z_est, dtype=np.float64)
-        else:
-            np.subtract(z, z_est, out=out)
-            residual = out
-        if has_angle:
-            residual[angle_mask] = (residual[angle_mask] + np.pi) % (2.0 * np.pi) - np.pi
-        return residual
+            return np.subtract(z, z_est, dtype=np.float64)
+        np.subtract(z, z_est, out=out)
+        return out
 
     @staticmethod
     def _weighted_objective(weight: np.ndarray, residual: np.ndarray) -> float:
@@ -3753,14 +3689,7 @@ class ACStateEstimator:
         unavailable_mask = ~available
 
         max_idx = int(idx_array.max()) if n_rows else 0
-        angle_mask = np.asarray(table.angle_mask, dtype=bool)
         invalidated_mask = np.zeros(n_rows, dtype=bool)
-        if angle_mask.any():
-            if self.flat_start:
-                value_array[angle_mask] = 0.0
-            valid_array[angle_mask] = False
-            status_array[angle_mask] = MEAS_STATUS_INVALID
-            invalidated_mask[angle_mask] = True
 
         ac_current_mask = np.isin(
             meas_type_code_array,
@@ -3788,7 +3717,7 @@ class ACStateEstimator:
             status_array[ac_current_mask] = MEAS_STATUS_INVALID
             invalidated_mask[ac_current_mask] = True
 
-        candidate_mask = valid_array & (weight_array > 0.0) & (~angle_mask) & (status_array == MEAS_STATUS_NORMAL)
+        candidate_mask = valid_array & (weight_array > 0.0) & (status_array == MEAS_STATUS_NORMAL)
         flagged_unavailable = candidate_mask & unavailable_mask
         processable_mask = candidate_mask & (~unavailable_mask)
         if processable_mask.any():
@@ -3813,7 +3742,7 @@ class ACStateEstimator:
         if pf_invalidated.any():
             invalidated_mask |= pf_invalidated
         self._prefilter_reasons = pf_reasons
-        processable_mask = valid_array & (weight_array > 0.0) & (~angle_mask) & (~unavailable_mask)
+        processable_mask = valid_array & (weight_array > 0.0) & (~unavailable_mask)
 
         is_pseudo_array = status_array == MEAS_STATUS_PSEUDO
         real_mask = processable_mask & (~is_pseudo_array)
@@ -3853,7 +3782,6 @@ class ACStateEstimator:
         self._real_voltage_observation_node_cache = real_voltage_best
         self._real_power_measurement_seed_cache = power_seed_best
         self._power_flow_seed_rows = power_flow_seed_rows
-        self._has_valid_angle_measurements = False
         try:
             self.measurements.normalized = True
         except AttributeError:
@@ -3884,7 +3812,6 @@ class ACStateEstimator:
         if getattr(self.measurements, "normalized", False):
             self.measurement_table = table
             self._refresh_measurement_summary_cache()
-            self._has_valid_angle_measurements = bool(np.any(table.valid & table.angle_mask))
             self.meas_ppc["normalized"] = True
             return
         if self._normalize_measurements_to_pu_from_meas_ppc(table, self.meas_ppc):
@@ -3907,7 +3834,6 @@ class ACStateEstimator:
             "ppc_row": np.empty(0, dtype=np.int64),
             "value": np.empty(0, dtype=np.float64),
         }
-        self._has_valid_angle_measurements = bool(np.any(table.valid & table.angle_mask))
         warnings.warn(
             "AC SE measurement normalization requires measurement PPC arrays; name-based fallback is disabled.",
             RuntimeWarning,
@@ -5622,7 +5548,6 @@ class ACStateEstimator:
             meas_type_code[invalid_rows],
         )
         candidate_mask = (device_pos[invalid_rows] >= 0) & np.asarray(available, dtype=bool)
-        candidate_mask &= ~np.isin(meas_type_code[invalid_rows], _ANGLE_MEASUREMENT_TYPE_CODES)
         candidate_mask &= ~(
             (device_type_code[invalid_rows] == DEVICE_TYPE_ACNode)
             & (meas_type_code[invalid_rows] == MEAS_TYPE_V)
@@ -6271,70 +6196,6 @@ class ACStateEstimator:
         hit_pos = valid_pos[hit]
         hit_off = island_offset[isl_vals[hit]]
         return dict(zip(hit_pos.tolist(), hit_off.tolist()))
-
-    def _rebase_angle_measurements(self) -> None:
-        """Convert absolute node angle measurements to the estimator reference frame."""
-        if not getattr(self, "_has_valid_angle_measurements", True):
-            return
-        table = _measurement_table_from_measurements(self.measurements)
-        row_count = int(table.idx.size)
-        if row_count == 0:
-            return
-        device_type_code = np.asarray(table.device_type_code, dtype=np.int16)
-        meas_type_code = getattr(table, "meas_type_code", None)
-        device_pos = getattr(table, "device_pos", None)
-        if (
-            meas_type_code is None
-            or device_pos is None
-            or np.asarray(meas_type_code).size != row_count
-            or np.asarray(device_pos).size != row_count
-        ):
-            warnings.warn(
-                "AC SE angle rebasing requires meas_type_code and device_pos; string fallback is disabled.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return
-        meas_type_code = np.asarray(meas_type_code, dtype=np.int16)
-        device_pos = np.asarray(device_pos, dtype=np.int64)
-        candidate_rows = np.flatnonzero(
-            np.asarray(table.valid, dtype=bool)
-            & (np.asarray(table.weight, dtype=np.float64) > 0.0)
-            & (device_type_code == DEVICE_TYPE_ACNode)
-            & ((meas_type_code == MEAS_TYPE_ANGLE) | (meas_type_code == MEAS_TYPE_THETA))
-            & (device_pos >= 0)
-        ).astype(np.int64, copy=False)
-        if candidate_rows.size == 0:
-            return
-        reference_angle_by_pos = getattr(self, "reference_angle_by_pos", {})
-        if not reference_angle_by_pos:
-            return
-        node_plan_pos = np.asarray(getattr(self, "_ac_node_plan_pos", ()), dtype=np.int64)
-        valid_plan, node_pos = self._values_for_plan_pos(node_plan_pos, device_pos[candidate_rows])
-        if not np.any(valid_plan):
-            return
-        ref_keys = np.fromiter((int(pos) for pos in reference_angle_by_pos.keys()), dtype=np.int64)
-        if ref_keys.size == 0:
-            return
-        valid_keys = ref_keys >= 0
-        if not np.any(valid_keys):
-            return
-        ref_keys = ref_keys[valid_keys]
-        ref_values_input = np.fromiter(
-            (float(value) for pos, value in reference_angle_by_pos.items() if int(pos) >= 0),
-            dtype=np.float64,
-            count=int(ref_keys.size),
-        )
-        max_pos = int(max(int(ref_keys.max()), int(node_pos[valid_plan].max())))
-        ref_values = np.zeros(max_pos + 1, dtype=np.float64)
-        ref_values[ref_keys.astype(np.intp, copy=False)] = ref_values_input
-        valid_node = valid_plan & (node_pos >= 0) & (node_pos < ref_values.size)
-        if np.any(valid_node):
-            rows = candidate_rows[valid_node]
-            table.value[rows] = np.asarray(table.value, dtype=np.float64)[rows] - ref_values[
-                node_pos[valid_node].astype(np.intp, copy=False)
-            ]
-            self.measurement_table = table
 
     def _zero_tie_solver_edges_from_ppc(self) -> Tuple[np.ndarray, np.ndarray]:
         ppc = self._ac_ppc_dict()
@@ -7594,8 +7455,6 @@ class ACStateEstimator:
             DEVICE_TYPE_ACNode: _AC_NODE_MEAS_TYPE_LOOKUP,
             DEVICE_TYPE_ACGenerator: _AC_GENERATOR_SIMPLE_MEAS_TYPE_LOOKUP,
             DEVICE_TYPE_ACLoad: _AC_LOAD_MEAS_TYPE_LOOKUP,
-            DEVICE_TYPE_ACZeroBranchConstraint: _AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
-            DEVICE_TYPE_ACBreakConstraint: _AC_CONSTRAINT_MEAS_TYPE_LOOKUP,
         }
         self._ac_generator_plan_kind_by_type_code = {
             DEVICE_TYPE_ACGenerator: _AC_GENERATOR_POWER_MEAS_TYPE_LOOKUP,
@@ -8306,17 +8165,8 @@ class ACStateEstimator:
             empty_f = np.array([], dtype=np.float64)
             return {
                 "handled_mask": handled_mask,
-                "scalar_rows": empty_i,
-                "scalar_cols": empty_i,
-                "scalar_values": empty_f,
                 "voltage_rows": empty_i,
                 "voltage_pos": empty_i,
-                "angle_diff_rows": empty_i,
-                "angle_diff_i": empty_i,
-                "angle_diff_j": empty_i,
-                "voltage_diff_rows": empty_i,
-                "voltage_diff_i": empty_i,
-                "voltage_diff_j": empty_i,
                 "power_rows": empty_i,
                 "power_is_p": empty_b,
                 "power_pos": empty_i,
@@ -8362,10 +8212,6 @@ class ACStateEstimator:
                 ),
                 "current_rows": self._concat_plan_arrays((rows[i_from], rows[i_to]), np.int64),
                 "current_idx": self._concat_plan_arrays((current_pos[i_from], current_pos[i_to]), np.int64),
-                "v_diff_rows": rows[row_kind == MEAS_TYPE_V_DIFF],
-                "angle_diff_rows": rows[
-                    (row_kind == MEAS_TYPE_ANGLE_DIFF) | (row_kind == MEAS_TYPE_THETA_DIFF)
-                ],
                 "i": i,
                 "j": j,
                 "kind": row_kind,
@@ -8383,57 +8229,10 @@ class ACStateEstimator:
             self._ac_break_plan_j,
             self._ac_break_plan_current_pos,
         )
-        zero_rows = row[(code == DEVICE_TYPE_ACZeroBranch) & handled_mask]
-        zero_pos = plan_table.device_pos[zero_rows]
-        zero_kind = kind[zero_rows]
-        zero_i = self._ac_zero_branch_plan_i[zero_pos]
-        zero_j = self._ac_zero_branch_plan_j[zero_pos]
-        v_diff = zero_kind == MEAS_TYPE_V_DIFF
-        angle_diff = (zero_kind == MEAS_TYPE_ANGLE_DIFF) | (zero_kind == MEAS_TYPE_THETA_DIFF)
-        voltage_diff_rows = zero_rows[v_diff]
-        voltage_diff_i = zero_i[v_diff]
-        voltage_diff_j = zero_j[v_diff]
-        angle_diff_rows = zero_rows[angle_diff]
-        angle_diff_i = zero_i[angle_diff]
-        angle_diff_j = zero_j[angle_diff]
-        scalar_rows = self._concat_plan_arrays(
-            (
-                np.repeat(voltage_diff_rows, 2),
-                np.repeat(angle_diff_rows, 2),
-            ),
-            np.int64,
-        )
-        scalar_cols = self._concat_plan_arrays(
-            (
-                np.column_stack((self.voltage_col[voltage_diff_i], self.voltage_col[voltage_diff_j])).ravel()
-                if voltage_diff_rows.size
-                else np.array([], dtype=np.int64),
-                np.column_stack((self.angle_col[angle_diff_i], self.angle_col[angle_diff_j])).ravel()
-                if angle_diff_rows.size
-                else np.array([], dtype=np.int64),
-            ),
-            np.int64,
-        )
-        scalar_values = self._concat_plan_arrays(
-            (
-                np.tile(np.array([1.0, -1.0], dtype=np.float64), voltage_diff_rows.size),
-                np.tile(np.array([1.0, -1.0], dtype=np.float64), angle_diff_rows.size),
-            ),
-            np.float64,
-        )
         return {
             "handled_mask": handled_mask,
-            "scalar_rows": scalar_rows,
-            "scalar_cols": scalar_cols,
-            "scalar_values": scalar_values,
             "voltage_rows": self._concat_plan_arrays((zero_plan["voltage_rows"], break_plan["voltage_rows"]), np.int64),
             "voltage_pos": self._concat_plan_arrays((zero_plan["voltage_pos"], break_plan["voltage_pos"]), np.int64),
-            "angle_diff_rows": self._int_array(angle_diff_rows),
-            "angle_diff_i": self._int_array(angle_diff_i),
-            "angle_diff_j": self._int_array(angle_diff_j),
-            "voltage_diff_rows": self._int_array(voltage_diff_rows),
-            "voltage_diff_i": self._int_array(voltage_diff_i),
-            "voltage_diff_j": self._int_array(voltage_diff_j),
             "power_rows": self._concat_plan_arrays((zero_plan["power_rows"], break_plan["power_rows"]), np.int64),
             "power_is_p": self._concat_plan_arrays((zero_plan["power_is_p"], break_plan["power_is_p"]), bool),
             "power_pos": self._concat_plan_arrays((zero_plan["power_pos"], break_plan["power_pos"]), np.int64),
@@ -8460,14 +8259,6 @@ class ACStateEstimator:
         if rows.size:
             values[rows] = voltage[plan["voltage_pos"]]
 
-        rows = plan["voltage_diff_rows"]
-        if rows.size:
-            values[rows] = voltage[plan["voltage_diff_i"]] - voltage[plan["voltage_diff_j"]]
-
-        rows = plan["angle_diff_rows"]
-        if rows.size:
-            values[rows] = theta[plan["angle_diff_i"]] - theta[plan["angle_diff_j"]]
-
         rows = plan["power_rows"]
         if rows.size:
             pos = plan["power_pos"]
@@ -8490,9 +8281,6 @@ class ACStateEstimator:
         switch_current: np.ndarray,
     ) -> np.ndarray:
         """Batch-fill ACZeroBranch/ACBreak Jacobian rows from explicit current states."""
-        if plan["scalar_rows"].size:
-            self._add_indexed_values(H, plan["scalar_rows"], plan["scalar_cols"], plan["scalar_values"])
-
         rows = plan["voltage_rows"]
         if rows.size:
             self._add_indexed_values(
@@ -8913,14 +8701,6 @@ class ACStateEstimator:
                 "scalar_values": empty_f,
                 "value_voltage_rows": empty_i,
                 "value_voltage_pos": empty_i,
-                "value_angle_rows": empty_i,
-                "value_angle_pos": empty_i,
-                "value_voltage_diff_rows": empty_i,
-                "value_voltage_diff_i": empty_i,
-                "value_voltage_diff_j": empty_i,
-                "value_angle_diff_rows": empty_i,
-                "value_angle_diff_i": empty_i,
-                "value_angle_diff_j": empty_i,
                 "load_rows": empty_i,
                 "load_pos": empty_i,
                 "load_index": empty_i,
@@ -8931,7 +8711,6 @@ class ACStateEstimator:
         node_pos = self._ac_node_plan_pos[device_pos[node_rows]]
         node_kind = kind[node_rows]
         node_v = node_kind == MEAS_TYPE_V
-        node_angle = (node_kind == MEAS_TYPE_ANGLE) | (node_kind == MEAS_TYPE_THETA)
 
         gen_rows = row[(code == DEVICE_TYPE_ACGenerator) & handled]
         gen_pos = self._ac_generator_plan_node_pos[device_pos[gen_rows]]
@@ -8943,68 +8722,12 @@ class ACStateEstimator:
         load_v = load_kind_all == MEAS_TYPE_V_LOAD
         load_state = load_kind_all != MEAS_TYPE_V_LOAD
 
-        def constraint_rows_for(device_code, i_array, j_array):
-            rows = row[(code == device_code) & handled]
-            pos = device_pos[rows]
-            row_kind = kind[rows]
-            i = i_array[pos]
-            j = j_array[pos]
-            v_diff = row_kind == MEAS_TYPE_V_DIFF
-            angle_diff = (row_kind == MEAS_TYPE_ANGLE_DIFF) | (row_kind == MEAS_TYPE_THETA_DIFF)
-            return rows[v_diff], i[v_diff], j[v_diff], rows[angle_diff], i[angle_diff], j[angle_diff]
-
-        zero_v_rows, zero_v_i, zero_v_j, zero_a_rows, zero_a_i, zero_a_j = constraint_rows_for(
-            DEVICE_TYPE_ACZeroBranchConstraint,
-            self._ac_zero_branch_plan_i,
-            self._ac_zero_branch_plan_j,
-        )
-        break_v_rows, break_v_i, break_v_j, break_a_rows, break_a_i, break_a_j = constraint_rows_for(
-            DEVICE_TYPE_ACBreakConstraint,
-            self._ac_break_plan_i,
-            self._ac_break_plan_j,
-        )
         value_voltage_rows = self._concat_plan_arrays((node_rows[node_v], gen_rows, load_rows_all[load_v]), np.int64)
         value_voltage_pos = self._concat_plan_arrays((node_pos[node_v], gen_pos, load_node_pos[load_v]), np.int64)
-        value_angle_rows = self._int_array(node_rows[node_angle])
-        value_angle_pos = self._int_array(node_pos[node_angle])
-        value_voltage_diff_rows = self._concat_plan_arrays((zero_v_rows, break_v_rows), np.int64)
-        value_voltage_diff_i = self._concat_plan_arrays((zero_v_i, break_v_i), np.int64)
-        value_voltage_diff_j = self._concat_plan_arrays((zero_v_j, break_v_j), np.int64)
-        value_angle_diff_rows = self._concat_plan_arrays((zero_a_rows, break_a_rows), np.int64)
-        value_angle_diff_i = self._concat_plan_arrays((zero_a_i, break_a_i), np.int64)
-        value_angle_diff_j = self._concat_plan_arrays((zero_a_j, break_a_j), np.int64)
 
-        scalar_rows = self._concat_plan_arrays(
-            (
-                value_voltage_rows,
-                value_angle_rows,
-                np.repeat(value_voltage_diff_rows, 2),
-                np.repeat(value_angle_diff_rows, 2),
-            ),
-            np.int64,
-        )
-        scalar_cols = self._concat_plan_arrays(
-            (
-                self.voltage_col[value_voltage_pos],
-                self.angle_col[value_angle_pos],
-                np.column_stack((self.voltage_col[value_voltage_diff_i], self.voltage_col[value_voltage_diff_j])).ravel()
-                if value_voltage_diff_rows.size
-                else np.array([], dtype=np.int64),
-                np.column_stack((self.angle_col[value_angle_diff_i], self.angle_col[value_angle_diff_j])).ravel()
-                if value_angle_diff_rows.size
-                else np.array([], dtype=np.int64),
-            ),
-            np.int64,
-        )
-        scalar_values = self._concat_plan_arrays(
-            (
-                np.ones(value_voltage_rows.size, dtype=np.float64),
-                np.ones(value_angle_rows.size, dtype=np.float64),
-                np.tile(np.array([1.0, -1.0], dtype=np.float64), value_voltage_diff_rows.size),
-                np.tile(np.array([1.0, -1.0], dtype=np.float64), value_angle_diff_rows.size),
-            ),
-            np.float64,
-        )
+        scalar_rows = value_voltage_rows
+        scalar_cols = self.voltage_col[value_voltage_pos]
+        scalar_values = np.ones(value_voltage_rows.size, dtype=np.float64)
         load_rows = load_rows_all[load_state]
         load_device_pos = load_plan_pos[load_state]
         return {
@@ -9014,14 +8737,6 @@ class ACStateEstimator:
             "scalar_values": scalar_values,
             "value_voltage_rows": value_voltage_rows,
             "value_voltage_pos": value_voltage_pos,
-            "value_angle_rows": value_angle_rows,
-            "value_angle_pos": value_angle_pos,
-            "value_voltage_diff_rows": value_voltage_diff_rows,
-            "value_voltage_diff_i": value_voltage_diff_i,
-            "value_voltage_diff_j": value_voltage_diff_j,
-            "value_angle_diff_rows": value_angle_diff_rows,
-            "value_angle_diff_i": value_angle_diff_i,
-            "value_angle_diff_j": value_angle_diff_j,
             "load_rows": self._int_array(load_rows),
             "load_pos": self._ac_load_plan_node_pos[load_device_pos],
             "load_index": self._ac_load_plan_index[load_device_pos],
@@ -9036,22 +8751,10 @@ class ACStateEstimator:
         theta: np.ndarray,
         voltage: np.ndarray,
     ) -> np.ndarray:
-        """Batch-evaluate node, load, generator-voltage and pseudo-constraint rows."""
+        """Batch-evaluate node, load, and generator-voltage rows."""
         rows = plan["value_voltage_rows"]
         if rows.size:
             values[rows] = voltage[plan["value_voltage_pos"]]
-
-        rows = plan["value_angle_rows"]
-        if rows.size:
-            values[rows] = theta[plan["value_angle_pos"]]
-
-        rows = plan["value_voltage_diff_rows"]
-        if rows.size:
-            values[rows] = voltage[plan["value_voltage_diff_i"]] - voltage[plan["value_voltage_diff_j"]]
-
-        rows = plan["value_angle_diff_rows"]
-        if rows.size:
-            values[rows] = theta[plan["value_angle_diff_i"]] - theta[plan["value_angle_diff_j"]]
 
         rows = plan["load_rows"]
         if rows.size:
@@ -10579,9 +10282,15 @@ class ACStateEstimator:
         last_regular_obj_drop = 0.0
         fullstep_osc_streak = 0
         damped_nonshrink_streak = 0
+        curv_smooth_streak = 0
+        damp_relaxed_recently = False
+        last_safe_damping = 0.0
+        damp_bounce_count = 0
+        damp_cycle_floor = 0.0
         curv_stagnation_streak = 0
         curv_stagnation_best_g = np.inf
         flat_valley_streak = 0
+        box_kkt_stagnation_streak = 0
         cur_rhs_inf = np.inf
         last_undamped_spd_failed = False
         active_weight_mask = (weight > 0.0) if weight_masked else None
@@ -10614,29 +10323,20 @@ class ACStateEstimator:
                 sw_curv_col_im = int(self.base_switch_im) + sw_cidx
 
         def _dx_needs_lm_guard(dx_vec: np.ndarray, *, strict_step: bool = True) -> bool:
-            """判断无阻尼步是否非有限、剧烈过冲或直接越出物理电压允许范围 [voltage_min, voltage_max]。"""
+            """判断无阻尼步是否非有限或幅值剧烈过冲；健康幅值的贴墙跨界交由线搜索与活跃集投影处理。"""
             if dx_vec.size == 0:
                 return False
             if not np.all(np.isfinite(dx_vec)):
                 return True
-            s0 = 1.0
             if self.base_switch_re > self.n_angle:
                 dv_slice = dx_vec[self.n_angle : self.base_switch_re]
                 max_dv = float(np.max(np.abs(dv_slice)))
                 if max_dv > (0.50 if strict_step else 1.2):
                     return True
-                if max_dv > 0.35:
-                    s0 = min(s0, 0.35 / max_dv)
             if self.n_angle > 0:
                 da_slice = dx_vec[: self.n_angle]
                 max_da = float(np.max(np.abs(da_slice)))
                 if max_da > (1.0 if strict_step else 2.0):
-                    return True
-                if max_da > 0.75:
-                    s0 = min(s0, 0.75 / max_da)
-            if self.base_switch_re > self.n_angle:
-                xv_next = x[self.n_angle : self.base_switch_re] + s0 * dx_vec[self.n_angle : self.base_switch_re]
-                if float(xv_next.min()) < v_min_bound or float(xv_next.max()) > v_max_bound:
                     return True
             return False
 
@@ -10655,6 +10355,14 @@ class ACStateEstimator:
                 if float(a_part.min()) < a_min_bound or float(a_part.max()) > a_max_bound:
                     return True
             return False
+
+        v_cols_box = (
+            np.arange(self.n_angle, self.base_switch_re, dtype=np.intp)
+            if self.base_switch_re > self.n_angle
+            else np.empty(0, dtype=np.intp)
+        )
+        box_pin_cache: Dict = {}
+        boundary_proj_streak = 0
 
         for iteration in range(1, iteration_limit + 1):
             if _state_out_of_bounds(x):
@@ -10680,6 +10388,8 @@ class ACStateEstimator:
             used_frozen_step = False
             used_woodbury_step = False
             used_sw_curv = False
+            used_box_pin_step = False
+            pinned_cols = np.empty(0, dtype=np.intp)
             is_curvature_probe = False
             cur_rhs_inf = np.inf
             rhs = None
@@ -10942,14 +10652,25 @@ class ACStateEstimator:
                         self._record_profile_time("solve.matrix_dump", time.perf_counter() - start)
                 start = time.perf_counter() if self.profile_enabled else None
                 cur_rhs_inf = float(np.max(np.abs(rhs))) if rhs.size else 0.0
-                is_curvature_probe = curvature_damping_active and curvature_probe_steps >= curvature_probe_interval
+                is_curvature_probe = (
+                    curvature_damping_active
+                    and curvature_probe_steps >= curvature_probe_interval
+                    and not (damp_cycle_floor > 0.0 and float(force_lm_damping) <= damp_cycle_floor * 1.05)
+                )
                 step_damping = (
-                    max(1e-4, float(force_lm_damping) * 0.05)
+                    max(
+                        damp_cycle_floor,
+                        0.0 if float(force_lm_damping) <= 5e-3 else max(1e-4, float(force_lm_damping) * 0.2),
+                    )
                     if is_curvature_probe
                     else float(force_lm_damping)
                 )
-                if normal_operand is not None and aat_solver is not None:
+                pinned_cols = detect_active_box_pinned_cols(
+                    x, rhs, v_cols_box, v_min_bound, v_max_bound, margin=1e-4
+                )
+                if pinned_cols.size > 0:
                     solve_operand = normal_operand
+                    solve_gain = gain
                     if sw_curv_rows.size > 0:
                         V_curv, has_sw_curv = build_switch_current_curvature_columns(
                             self.n_state,
@@ -10961,63 +10682,126 @@ class ACStateEstimator:
                             weight,
                         )
                         if has_sw_curv and V_curv is not None:
-                            solve_operand = sp_hstack([normal_operand, V_curv], format="csc")
+                            if solve_operand is not None:
+                                solve_operand = sp_hstack([solve_operand, V_curv], format="csc")
+                            elif solve_gain is not None:
+                                curv_term = V_curv @ V_curv.T
+                                solve_gain = (solve_gain + curv_term).tocsc() if issparse(solve_gain) else (solve_gain + curv_term.toarray())
                             used_sw_curv = True
-                    use_fast_lm_handoff = step_damping == 0.0 and self.n_state >= 500
-                    dx, _ = aat_solver.solve(
+                    dx_pin, pin_ok = solve_box_pinned_normal_equations(
                         solve_operand,
-                        rhs,
-                        return_factor_diag=False,
-                        damping=step_damping,
-                        allow_slow_fallback=not use_fast_lm_handoff,
-                    )
-                    if step_damping == 0.0:
-                        undamped_ok = (
-                            (dx.size == 0 or bool(np.all(np.isfinite(dx))))
-                            and getattr(aat_solver, "_active_backend", None) in ("pardiso", "cholmod")
-                        )
-                        last_undamped_spd_failed = not undamped_ok
-                    # 若无阻尼牛顿步出现非有限值、显著过冲或将弱盲节点推入低/过电压危险区，提前采用分级 LM 阻尼扶正方向
-                    if step_damping == 0.0 and _dx_needs_lm_guard(dx, strict_step=True):
-                        for beta_try in (1e-2, 1e-1, 1.0, 10.0):
-                            dx_lm, _ = aat_solver.solve(
-                                solve_operand,
-                                rhs,
-                                return_factor_diag=False,
-                                damping=beta_try,
-                                allow_slow_fallback=(self.n_state < 500 or beta_try >= 10.0),
-                            )
-                            if dx_lm.size == dx.size and np.all(np.isfinite(dx_lm)):
-                                dx = dx_lm
-                                step_damping = beta_try
-                                if not _dx_needs_lm_guard(dx, strict_step=False):
-                                    break
-                else:
-                    solve_gain = gain
-                    if sw_curv_rows.size > 0 and solve_gain is not None:
-                        V_curv, has_sw_curv = build_switch_current_curvature_columns(
-                            self.n_state,
-                            sw_curv_rows,
-                            sw_curv_col_re,
-                            sw_curv_col_im,
-                            x,
-                            residual,
-                            weight,
-                        )
-                        if has_sw_curv and V_curv is not None:
-                            curv_term = V_curv @ V_curv.T
-                            solve_gain = (solve_gain + curv_term).tocsc() if issparse(solve_gain) else (solve_gain + curv_term.toarray())
-                            used_sw_curv = True
-                    dx, _ = normal_solver.solve(
                         solve_gain,
                         rhs,
-                        return_factor_diag=False,
+                        pinned_cols,
+                        damping=step_damping,
+                        solver_cache=box_pin_cache,
                     )
+                    if pin_ok and step_damping == 0.0 and _dx_needs_lm_guard(dx_pin, strict_step=True):
+                        for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                            dx_lm, lm_ok = solve_box_pinned_normal_equations(
+                                solve_operand,
+                                solve_gain,
+                                rhs,
+                                pinned_cols,
+                                damping=beta_try,
+                                solver_cache=box_pin_cache,
+                            )
+                            if lm_ok:
+                                dx_pin = dx_lm
+                                step_damping = beta_try
+                                if not _dx_needs_lm_guard(dx_pin, strict_step=False):
+                                    break
+                    if not pin_ok:
+                        for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                            dx_lm, lm_ok = solve_box_pinned_normal_equations(
+                                solve_operand,
+                                solve_gain,
+                                rhs,
+                                pinned_cols,
+                                damping=beta_try,
+                                solver_cache=box_pin_cache,
+                            )
+                            if lm_ok:
+                                dx_pin = dx_lm
+                                pin_ok = True
+                                step_damping = beta_try
+                                break
+                    if pin_ok:
+                        dx = dx_pin
+                        used_box_pin_step = True
+                    else:
+                        pinned_cols = np.empty(0, dtype=np.intp)
+                if not used_box_pin_step:
+                    if normal_operand is not None and aat_solver is not None:
+                        solve_operand = normal_operand
+                        if sw_curv_rows.size > 0:
+                            V_curv, has_sw_curv = build_switch_current_curvature_columns(
+                                self.n_state,
+                                sw_curv_rows,
+                                sw_curv_col_re,
+                                sw_curv_col_im,
+                                x,
+                                residual,
+                                weight,
+                            )
+                            if has_sw_curv and V_curv is not None:
+                                solve_operand = sp_hstack([normal_operand, V_curv], format="csc")
+                                used_sw_curv = True
+                        use_fast_lm_handoff = step_damping == 0.0 and self.n_state >= 500
+                        dx, _ = aat_solver.solve(
+                            solve_operand,
+                            rhs,
+                            return_factor_diag=False,
+                            damping=step_damping,
+                            allow_slow_fallback=not use_fast_lm_handoff,
+                        )
+                        if step_damping == 0.0:
+                            undamped_ok = (
+                                (dx.size == 0 or bool(np.all(np.isfinite(dx))))
+                                and getattr(aat_solver, "_active_backend", None) in ("pardiso", "cholmod")
+                            )
+                            last_undamped_spd_failed = not undamped_ok
+                        # 若无阻尼牛顿步出现非有限值、显著过冲或将弱盲节点推入低/过电压危险区，提前采用分级 LM 阻尼扶正方向
+                        if step_damping == 0.0 and _dx_needs_lm_guard(dx, strict_step=True):
+                            for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                                dx_lm, _ = aat_solver.solve(
+                                    solve_operand,
+                                    rhs,
+                                    return_factor_diag=False,
+                                    damping=beta_try,
+                                    allow_slow_fallback=(self.n_state < 500 or beta_try >= 10.0),
+                                )
+                                if dx_lm.size == dx.size and np.all(np.isfinite(dx_lm)):
+                                    dx = dx_lm
+                                    step_damping = beta_try
+                                    if not _dx_needs_lm_guard(dx, strict_step=False):
+                                        break
+                    else:
+                        solve_gain = gain
+                        if sw_curv_rows.size > 0 and solve_gain is not None:
+                            V_curv, has_sw_curv = build_switch_current_curvature_columns(
+                                self.n_state,
+                                sw_curv_rows,
+                                sw_curv_col_re,
+                                sw_curv_col_im,
+                                x,
+                                residual,
+                                weight,
+                            )
+                            if has_sw_curv and V_curv is not None:
+                                curv_term = V_curv @ V_curv.T
+                                solve_gain = (solve_gain + curv_term).tocsc() if issparse(solve_gain) else (solve_gain + curv_term.toarray())
+                                used_sw_curv = True
+                        dx, _ = normal_solver.solve(
+                            solve_gain,
+                            rhs,
+                            return_factor_diag=False,
+                        )
                 if start is not None:
                     self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
                 frozen_steps = 0
                 wb_solver = None
-                factor_is_current_weights = not used_sw_curv
+                factor_is_current_weights = (not used_sw_curv) and (not used_box_pin_step)
                 if dx.size and not np.all(np.isfinite(dx)):
                     final_quantities_current = False
                     break
@@ -11034,13 +10818,20 @@ class ACStateEstimator:
             ):
                 diag_g = None
                 if normal_operand is not None:
-                    diag_g = aat_solver.unregularized_diagonal() if aat_solver is not None else None
+                    diag_g = (
+                        aat_solver.unregularized_diagonal()
+                        if (aat_solver is not None and not used_box_pin_step)
+                        else None
+                    )
                     if diag_g is None:
                         diag_g = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
                 elif gain is not None:
                     diag_g = np.asarray(gain.diagonal() if issparse(gain) else np.diag(gain), dtype=np.float64).ravel()
                 if diag_g is not None and diag_g.size == rhs.size:
-                    cur_rhs_inf = float(np.max(np.abs(rhs) / np.maximum(diag_g, 1.0)))
+                    rhs_kkt = rhs.copy() if pinned_cols.size > 0 else rhs
+                    if pinned_cols.size > 0:
+                        rhs_kkt[pinned_cols] = 0.0
+                    cur_rhs_inf = float(np.max(np.abs(rhs_kkt) / np.maximum(diag_g, 1.0)))
                 damped_kkt_ok = cur_rhs_inf <= max(1e-4, 100.0 * self.tol)
             if max_correction < self.tol and (used_frozen_step or step_damping == 0.0 or damped_kkt_ok):
                 converged = True
@@ -11060,7 +10851,10 @@ class ACStateEstimator:
                 max_a_dx = float(np.max(np.abs(dx[: self.n_angle])))
                 if max_a_dx > 0.75:
                     step_scale = min(step_scale, 0.75 / max_a_dx)
+            base_step_scale = step_scale
             accepted_step = None
+            used_boundary_proj = False
+            added_wall_nodes = False
             nonfinite_candidates = 0
             oob_candidates = 0
             previous_objective = objective
@@ -11079,29 +10873,36 @@ class ACStateEstimator:
                 candidate = x + step_scale * dx
                 if _state_out_of_bounds(candidate):
                     oob_candidates += 1
-                    # 严禁为避开单个越界节点把全局步长压成贴墙微步空转：最多折半 3 次即切向 LM 阻尼或判发散退出
+                    # 严禁为避开单个越界节点把全局步长压成贴墙微步空转：最多折半 3 次即尝试投影接入活跃集或切向 LM 阻尼
                     if oob_candidates >= 3:
-                        # 仅在阻尼上限近驻点时，若个别电压节点紧贴边界墙向墙外推，尝试一次边界投影裁剪释放其余节点收敛
                         if (
-                            force_lm_damping >= 100.0
-                            and max_correction <= 5e-2
+                            boundary_proj_streak < 6
                             and self.base_switch_re > self.n_angle
                             and not is_curvature_probe
                         ):
-                            proj_cand = candidate.copy()
-                            v_slice = proj_cand[self.n_angle : self.base_switch_re]
-                            np.clip(v_slice, v_min_bound + 1e-6, v_max_bound - 1e-6, out=v_slice)
-                            if not _state_out_of_bounds(proj_cand):
-                                self.evaluate(proj_cand, measurement_plan_tables, out=cand_z_est)
-                                self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
-                                proj_obj = self._weighted_objective(weight, cand_residual)
-                                if np.isfinite(proj_obj) and proj_obj < objective - max(1e-12, 1e-8 * (abs(objective) + 1.0)):
-                                    x = proj_cand
-                                    z_est, cand_z_est = cand_z_est, z_est
-                                    residual, cand_residual = cand_residual, residual
-                                    objective = proj_obj
-                                    accepted_step = step_scale
-                                    accepted = True
+                            proj_scales = (base_step_scale, step_scale) if base_step_scale > step_scale * 1.01 else (step_scale,)
+                            for ps in proj_scales:
+                                proj_cand = x + ps * dx
+                                v_slice = proj_cand[self.n_angle : self.base_switch_re]
+                                np.clip(v_slice, v_min_bound + 1e-6, v_max_bound - 1e-6, out=v_slice)
+                                if not _state_out_of_bounds(proj_cand):
+                                    self.evaluate(proj_cand, measurement_plan_tables, out=cand_z_est)
+                                    self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                                    proj_obj = self._weighted_objective(weight, cand_residual)
+                                    if np.isfinite(proj_obj) and proj_obj < objective - max(1e-12, 1e-5 * (abs(objective) + 1.0)):
+                                        prev_v_s = x[self.n_angle : self.base_switch_re]
+                                        prev_wall = int(np.count_nonzero((prev_v_s <= v_min_bound + 1e-4) | (prev_v_s >= v_max_bound - 1e-4)))
+                                        new_wall = int(np.count_nonzero((v_slice <= v_min_bound + 1e-4) | (v_slice >= v_max_bound - 1e-4)))
+                                        x = proj_cand
+                                        z_est, cand_z_est = cand_z_est, z_est
+                                        residual, cand_residual = cand_residual, residual
+                                        objective = proj_obj
+                                        accepted_step = ps
+                                        used_boundary_proj = True
+                                        added_wall_nodes = new_wall > prev_wall
+                                        boundary_proj_streak = 0 if added_wall_nodes else (boundary_proj_streak + 1)
+                                        accepted = True
+                                        break
                         break
                     step_scale *= 0.5
                     continue
@@ -11143,9 +10944,9 @@ class ACStateEstimator:
                     step_scale *= 0.5
             if not accepted:
                 if is_curvature_probe:
+                    # 探测步更激进未接受仅拉大探测间隔，严禁反过来惩罚翻倍正常工作的常规阻尼
                     curvature_probe_steps = 0
                     curvature_probe_interval = min(16, curvature_probe_interval * 2)
-                    force_lm_damping = min(10.0, float(force_lm_damping) * 2.0)
                     prev_step_accepted = False
                     continue
                 if used_frozen_step:
@@ -11200,9 +11001,11 @@ class ACStateEstimator:
                 final_quantities_current = False
                 break
 
+            if not used_boundary_proj:
+                boundary_proj_streak = 0
             prev_step_accepted = (
                 False
-                if (used_woodbury_step or used_sw_curv)
+                if (used_woodbury_step or used_sw_curv or used_box_pin_step)
                 else (True if (used_frozen_step or step_damping == 0.0) else False)
             )
             last_step_max_correction = prev_max_correction
@@ -11220,8 +11023,12 @@ class ACStateEstimator:
                     # Marquardt 自适应放松阻尼：探测步满步接受且未暴涨说明已走出强非线性香蕉谷
                     curvature_probe_interval = 2
                     damped_nonshrink_streak = 0
-                    force_lm_damping = float(force_lm_damping) * 0.25
-                    if force_lm_damping <= 1e-3:
+                    next_d = max(damp_cycle_floor, float(force_lm_damping) * 0.25)
+                    if next_d < float(force_lm_damping) - 1e-12:
+                        last_safe_damping = float(force_lm_damping)
+                        damp_relaxed_recently = True
+                    force_lm_damping = next_d
+                    if force_lm_damping <= 1e-3 and damp_cycle_floor <= 0.0:
                         force_lm_damping = 0.0
                         curvature_damping_active = False
                         backtrack_streak = 0
@@ -11237,13 +11044,17 @@ class ACStateEstimator:
                         and accepted_step >= 0.5
                         and (objective_change > 1e-4 * (abs(previous_objective) + 1.0) or probe_beats_regular)
                     ):
-                        # 低阻尼探测步满步接受且带来显著目标压降（或明显优于普通阻尼步），说明当前阻尼偏大，主动放松阻尼
+                        # 探测步步长已涨 >2x，即使目标降幅优亦仅温和减半（且不破周期安全下限），防止一步踹爆
                         curvature_probe_interval = 2
                         damped_nonshrink_streak = 0
                         flat_valley_streak = 0
                         if accepted_step >= 0.8:
-                            force_lm_damping = max(float(step_damping) * 2.0, float(force_lm_damping) * 0.1)
-                            if force_lm_damping <= 1e-3:
+                            next_d = max(damp_cycle_floor, float(force_lm_damping) * 0.5)
+                            if next_d < float(force_lm_damping) - 1e-12:
+                                last_safe_damping = float(force_lm_damping)
+                                damp_relaxed_recently = True
+                            force_lm_damping = next_d
+                            if force_lm_damping <= 1e-3 and damp_cycle_floor <= 0.0:
                                 force_lm_damping = 0.0
                                 curvature_damping_active = False
                                 backtrack_streak = 0
@@ -11263,15 +11074,44 @@ class ACStateEstimator:
                 if curvature_damping_active:
                     curvature_probe_steps += 1
                     last_regular_obj_drop = float(objective_change)
-                    if max_correction > 5e-4 and max_correction >= last_step_max_correction:
+                    if max_correction > 5e-4 and max_correction > 1.02 * last_step_max_correction:
                         damped_nonshrink_streak += 1
+                        curv_smooth_streak = 0
                         if damped_nonshrink_streak >= 3 and force_lm_damping < 2.0:
-                            # 曲率阻尼下步长连续不降反增，说明局部二阶残差曲率谱半径 >= 1，温和翻倍压制（上限 2.0 防冻死）
-                            force_lm_damping = min(2.0, max(float(force_lm_damping) * 2.0, 0.2))
+                            # 曲率阻尼下步长连续显著放大(>2%)，记录周期反弹记忆并温和翻倍压制（上限 2.0 防冻死）
+                            if damp_relaxed_recently:
+                                damp_bounce_count += 1
+                                damp_relaxed_recently = False
+                                if damp_bounce_count >= 2:
+                                    damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
+                            force_lm_damping = min(2.0, max(float(force_lm_damping) * 2.0, max(0.2, damp_cycle_floor)))
                             damped_nonshrink_streak = 0
                             prev_step_accepted = False
                     else:
                         damped_nonshrink_streak = 0
+                        if (
+                            accepted_step is not None
+                            and accepted_step >= 0.8
+                            and max_correction < last_step_max_correction
+                            and objective < previous_objective
+                        ):
+                            curv_smooth_streak += 1
+                            if curv_smooth_streak >= 4:
+                                # 曲率阻尼常规步连续 4 步满步单调收缩，在不破安全下限前提下温和减半阻尼
+                                curv_smooth_streak = 0
+                                next_d = max(damp_cycle_floor, float(force_lm_damping) * 0.5)
+                                if next_d < float(force_lm_damping) - 1e-12:
+                                    last_safe_damping = float(force_lm_damping)
+                                    damp_relaxed_recently = True
+                                    force_lm_damping = next_d
+                                    prev_step_accepted = False
+                                    if force_lm_damping <= 1e-3 and damp_cycle_floor <= 0.0:
+                                        force_lm_damping = 0.0
+                                        curvature_damping_active = False
+                                        backtrack_streak = 0
+                                        fullstep_osc_streak = 0
+                        else:
+                            curv_smooth_streak = 0
                 if accepted_step is not None and accepted_step < 1e-3 and max_correction > 1e-2:
                     micro_step_streak += 1
                     fullstep_osc_streak = 0
@@ -11284,15 +11124,20 @@ class ACStateEstimator:
                         micro_step_streak = 0
                         backtrack_streak = 0
                         prev_step_accepted = False
-                elif accepted_step is not None and accepted_step < 0.5 and max_correction > 10.0 * self.tol:
+                elif accepted_step is not None and accepted_step < 0.5 and max_correction > 10.0 * self.tol and not added_wall_nodes:
                     micro_step_streak = 0
                     fullstep_osc_streak = 0
                     backtrack_streak += 4
                     # 非零残差香蕉谷极限环自愈（通用防 k-周期漏桶计数，识破连续与 2/3/4-周期交替回溯）
                     if backtrack_streak >= 12 and normal_operand is not None and aat_solver is not None:
+                        if damp_relaxed_recently:
+                            damp_bounce_count += 1
+                            damp_relaxed_recently = False
+                            if damp_bounce_count >= 2:
+                                damp_cycle_floor = max(damp_cycle_floor, min(1.0, max(last_safe_damping, 0.1)))
                         if force_lm_damping < 10.0:
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
-                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, hint_base))
+                            force_lm_damping = min(10.0, max(force_lm_damping * 10.0, max(hint_base, damp_cycle_floor)))
                             curvature_damping_active = True
                             curvature_probe_steps = 0
                             curvature_probe_interval = 2
@@ -11407,6 +11252,49 @@ class ACStateEstimator:
                     flat_valley_streak = 0
             elif not is_curvature_probe:
                 flat_valley_streak = 0
+            # 主循环内盒约束 KKT 驻点早停：阻尼态或存在活跃贴墙电压节点且核心电压/相角已稳态停滞时，
+            # 直接按终末盒约束 KKT 准则核验，达标即刻收敛退出，避免弱观测开关电流零空间拖满 max_iter 步
+            va_end_bk = min(int(self.base_switch_re), int(dx.size))
+            va_max_dx_bk = float(np.max(np.abs(dx[:va_end_bk]))) if va_end_bk > 0 else max_correction
+            box_kkt_obj_tol = max(1e-12, 1e-5 * (abs(previous_objective) + 1.0))
+            if (
+                not damped_kkt_stagnation_ok
+                and (step_damping > 0.0 or pinned_cols.size > 0)
+                and not is_curvature_probe
+                and not used_frozen_step
+                and va_max_dx_bk <= 2e-2
+                and max_correction <= 0.1
+                and objective_change <= box_kkt_obj_tol
+                and rhs is not None
+                and rhs.size == x.size
+                and not _state_out_of_bounds(x)
+            ):
+                box_kkt_stagnation_streak += 1
+                need_bk_streak = 3 if objective_change <= damped_obj_tol else 5
+                if box_kkt_stagnation_streak >= need_bk_streak:
+                    diag_g_bk = None
+                    if normal_operand is not None:
+                        diag_g_bk = aat_solver.unregularized_diagonal() if aat_solver is not None else None
+                        if diag_g_bk is None:
+                            diag_g_bk = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    elif gain is not None:
+                        diag_g_bk = np.asarray(gain.diagonal() if issparse(gain) else np.diag(gain), dtype=np.float64).ravel()
+                    if diag_g_bk is not None and diag_g_bk.size == rhs.size:
+                        rhs_bk = rhs.copy()
+                        if self.base_switch_re > self.n_angle:
+                            vc_bk = np.arange(self.n_angle, self.base_switch_re, dtype=np.int64)
+                            v_pin_lo = vc_bk[(x[vc_bk] <= float(self.voltage_floor) + 1e-4) & (rhs_bk[vc_bk] < 0.0)]
+                            v_pin_hi = vc_bk[(x[vc_bk] >= float(self.voltage_max) - 1e-4) & (rhs_bk[vc_bk] > 0.0)]
+                            if v_pin_lo.size:
+                                rhs_bk[v_pin_lo] = 0.0
+                            if v_pin_hi.size:
+                                rhs_bk[v_pin_hi] = 0.0
+                        sv_bk = np.abs(rhs_bk) / np.maximum(diag_g_bk, 1.0)
+                        va_g_bk = float(np.max(sv_bk[:va_end_bk])) if va_end_bk > 0 else float(np.max(sv_bk))
+                        if va_g_bk <= max(1e-4, 100.0 * self.tol):
+                            damped_kkt_stagnation_ok = True
+            elif not is_curvature_probe:
+                box_kkt_stagnation_streak = 0
             practically_converged = (
                 (used_frozen_step or step_damping == 0.0 or damped_kkt_ok)
                 and max_correction < 10.0 * self.tol
@@ -11484,6 +11372,39 @@ class ACStateEstimator:
             objective = self._weighted_objective(weight, residual)
             if start is not None:
                 self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        if box_pin_cache.get("solver") is not None:
+            try:
+                box_pin_cache["solver"]._reset_pardiso()
+            except Exception:
+                pass
+            box_pin_cache.clear()
+        # 有界约束 KKT 驻点终末核验：扣除紧贴电压边界且梯度指外的活跃分量后，若自由子空间梯度满足容差则优雅收敛
+        if (
+            (not converged)
+            and (not coarse_stopped)
+            and iteration >= 3
+            and np.isfinite(objective)
+            and max_correction <= 2e-2
+            and H is not None
+            and not _state_out_of_bounds(x)
+        ):
+            if H.shape[0] == residual.size and weight.size == residual.size:
+                rhs_chk = np.asarray(H.T @ (weight * residual), dtype=np.float64).ravel()
+                if issparse(H):
+                    dg_chk = np.asarray(H.power(2).T @ weight, dtype=np.float64).ravel()
+                else:
+                    dg_chk = np.asarray(np.sum((H * H) * weight[:, None], axis=0), dtype=np.float64).ravel()
+                if rhs_chk.size == x.size and dg_chk.size == x.size:
+                    if v_cols_box.size:
+                        pin_lo = v_cols_box[(x[v_cols_box] <= v_min_bound + 1e-3) & (rhs_chk[v_cols_box] < 0.0)]
+                        pin_hi = v_cols_box[(x[v_cols_box] >= v_max_bound - 1e-3) & (rhs_chk[v_cols_box] > 0.0)]
+                        if pin_lo.size:
+                            rhs_chk[pin_lo] = 0.0
+                        if pin_hi.size:
+                            rhs_chk[pin_hi] = 0.0
+                    sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
+                    if float(np.max(sv_chk)) <= max(5e-3, 5000.0 * self.tol):
+                        converged = True
         factor_deferred = False
         inplace_factor_modified = bool(factor_is_current_weights)
         if final_diagnostics and not final_quantities_current:
@@ -11601,7 +11522,7 @@ class ACStateEstimator:
             and (not coarse_stopped)
             and iteration >= 3
             and np.isfinite(objective)
-            and max_correction <= 2e-2
+            and max_correction <= 0.1
             and H is not None
             and not _state_out_of_bounds(x)
         ):
@@ -11999,6 +11920,27 @@ class ACStateEstimator:
             _shared_aat_solver=init_aat_solver,
             _coarse_bad_data_threshold=coarse_thr,
         )
+        # 严重污染热启动（flat_start=False）首轮未收敛时，立即在原始全量测集上试探 1 次平启动，
+        # 避免陷入错误局部盆地后在 BDR 中耗尽配额误删健康量测
+        if (
+            (not self.flat_start)
+            and (not result.converged)
+            and (not bool(getattr(result, "_coarse_stopped", False)))
+        ):
+            x_flat_init = self.initial_state(flat=True)
+            flat_init_res = self.estimate(
+                base_plan_tables,
+                x0=x_flat_init,
+                verbose=verbose,
+                observability=initial_obs,
+                _shared_aat_solver=init_aat_solver,
+                _coarse_bad_data_threshold=coarse_thr,
+            )
+            prev_obj_i = float(result.objective) if np.isfinite(result.objective) else float("inf")
+            flat_obj_i = float(flat_init_res.objective) if np.isfinite(flat_init_res.objective) else float("inf")
+            if flat_init_res.converged or (np.isfinite(flat_obj_i) and flat_obj_i < 0.5 * prev_obj_i):
+                result = flat_init_res
+                x0 = x_flat_init.copy()
         huber_warmup_items: Optional[List[BadDataItem]] = None
         if (
             not result.converged
@@ -12379,26 +12321,53 @@ class ACStateEstimator:
             )
 
         def _can_warm_start_from(res_obj: EstimateResult) -> bool:
-            """仅当当前状态已收敛、或处于未贴边的粗早停/高度稳定态（max_correction < 1e-2）时延续温启动。"""
-            if res_obj.converged:
-                return True
+            """仅当当前状态健康且无贴墙电压/相角节点（即使已收敛）时才允许原样延续温启动或刷新锚点 x0。"""
             if not np.isfinite(float(res_obj.objective)):
                 return False
             is_coarse = bool(getattr(res_obj, "_coarse_stopped", False))
-            if not is_coarse and not (float(res_obj.max_correction) < 1e-2):
+            if not res_obj.converged and not is_coarse and not (float(res_obj.max_correction) < 1e-2):
                 return False
             xv = res_obj.x
             if xv is None or xv.size == 0 or not np.all(np.isfinite(xv)):
                 return False
             if self.base_switch_re > self.n_angle:
                 vp = xv[self.n_angle : self.base_switch_re]
-                if float(vp.min()) < float(self.voltage_min) + 0.02 or float(vp.max()) > float(self.voltage_max) - 0.02:
+                if float(vp.min()) < float(self.voltage_min) + 0.03 or float(vp.max()) > float(self.voltage_max) - 0.03:
                     return False
             if self.n_angle > 0:
                 ap = xv[: self.n_angle]
                 if float(ap.min()) < float(self.angle_min_rad) + 0.1 or float(ap.max()) > float(self.angle_max_rad) - 0.1:
                     return False
             return True
+
+        def _warm_start_x0(res_obj: EstimateResult, fallback_x0: np.ndarray) -> Tuple[np.ndarray, bool]:
+            """构造删坏后重算初值：若存在贴墙电压节点则仅将贴墙节点复位为标称 1.0，跳出低电压下支盆地。"""
+            if _can_warm_start_from(res_obj):
+                return res_obj.x, False
+            xv = res_obj.x
+            if (
+                xv is None
+                or xv.size == 0
+                or not np.all(np.isfinite(xv))
+                or not np.isfinite(float(res_obj.objective))
+            ):
+                return fallback_x0, True
+            is_coarse = bool(getattr(res_obj, "_coarse_stopped", False))
+            if not res_obj.converged and not is_coarse and not (float(res_obj.max_correction) < 1e-2):
+                return fallback_x0, True
+            if self.n_angle > 0:
+                ap = xv[: self.n_angle]
+                if float(ap.min()) < float(self.angle_min_rad) + 0.1 or float(ap.max()) > float(self.angle_max_rad) - 0.1:
+                    return fallback_x0, True
+            if self.base_switch_re > self.n_angle:
+                vp = xv[self.n_angle : self.base_switch_re]
+                pin_mask = (vp < float(self.voltage_min) + 0.03) | (vp > float(self.voltage_max) - 0.03)
+                if np.any(pin_mask):
+                    clean_x = xv.copy()
+                    v_nom = float(np.clip(1.0, float(self.voltage_min) + 0.05, float(self.voltage_max) - 0.05))
+                    clean_x[self.n_angle : self.base_switch_re][pin_mask] = v_nom
+                    return clean_x, True
+            return fallback_x0, True
 
         def _try_boundary_node_rescue_once() -> bool:
             """当常规坏数据剔除结束仍未收敛且存在贴边电压节点时，执行两级自救：
@@ -13130,8 +13099,8 @@ class ACStateEstimator:
                             for rp in batch_rows:
                                 masked_weights[rp] = 0.0
                                 active_mask[rp] = False
-                            trial_x0 = prev_x if _can_warm_start_from(result) else x0
-                            if result.converged:
+                            trial_x0, trial_sanitized = _warm_start_x0(result, x0)
+                            if result.converged and not trial_sanitized:
                                 wb_rows, wb_prev_w, wb_prev_H, wb_defer, wb_used_anc = _prepare_woodbury_args(
                                     batch_rows, prev_x, prev_H, prev_weights
                                 )
@@ -13163,7 +13132,7 @@ class ACStateEstimator:
                                 _coarse_bad_data_threshold=batch_coarse_thr,
                                 _defer_factor_refresh=wb_defer and len(batch_rows) < 8,
                                 _woodbury_u_cache=anchor_u_cache,
-                                _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
+                                _hint_lm_damping=0.0 if trial_sanitized else float(getattr(result, "_final_lm_damping", 0.0)),
                             )
                             trial_obs = getattr(trial_result, "observability", None)
                             trial_coarse_stopped = bool(getattr(trial_result, "_coarse_stopped", False))
@@ -13204,7 +13173,8 @@ class ACStateEstimator:
                             if trial_result.converged:
                                 unconverged_stall_rounds = 0
                                 unconverged_total_rounds = 0
-                                x0 = trial_result.x.copy()
+                                if _can_warm_start_from(trial_result):
+                                    x0 = trial_result.x.copy()
                             elif trial_coarse_stopped:
                                 # 大批量粗早停仅重置停滞计数，不重置未收敛累计轮次，避免拖延尾段贴边自救
                                 unconverged_stall_rounds = 0
@@ -13265,8 +13235,8 @@ class ACStateEstimator:
                 prev_x = result.x
                 masked_weights[remove_pos] = 0.0
                 active_mask[remove_pos] = False
-                trial_x0 = prev_x if _can_warm_start_from(result) else x0
-                if result.converged:
+                trial_x0, trial_sanitized = _warm_start_x0(result, x0)
+                if result.converged and not trial_sanitized:
                     wb_rows, wb_prev_w, wb_prev_H, wb_defer, wb_used_anc = _prepare_woodbury_args(
                         [remove_pos], prev_x, prev_H, prev_weights
                     )
@@ -13286,7 +13256,7 @@ class ACStateEstimator:
                     _woodbury_prev_H=wb_prev_H,
                     _defer_factor_refresh=wb_defer,
                     _woodbury_u_cache=anchor_u_cache,
-                    _hint_lm_damping=float(getattr(result, "_final_lm_damping", 0.0)),
+                    _hint_lm_damping=0.0 if trial_sanitized else float(getattr(result, "_final_lm_damping", 0.0)),
                 )
                 trial_obs = getattr(trial_result, "observability", None)
                 trial_coarse_stopped = bool(getattr(trial_result, "_coarse_stopped", False))
@@ -13316,7 +13286,7 @@ class ACStateEstimator:
                 if trial_result.converged or trial_coarse_stopped:
                     unconverged_stall_rounds = 0
                     unconverged_total_rounds = 0
-                    if trial_result.converged:
+                    if trial_result.converged and _can_warm_start_from(trial_result):
                         x0 = trial_result.x.copy()
                 else:
                     unconverged_total_rounds += 1

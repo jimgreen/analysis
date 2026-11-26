@@ -250,35 +250,58 @@ def _query_mkl_version(lib: ctypes.CDLL) -> Tuple[int, int]:
         return 0, 0
 
 
+def _sanitize_mkl_threads(n_threads: int, *, platform_name: Optional[str] = None) -> int:
+    """规避 Intel oneMKL 2026 在 Windows 平台恰好 2 线程执行 PARDISO phase=22 时的原生访问违例缺陷。"""
+    val = max(1, int(n_threads))
+    plat = sys.platform if platform_name is None else str(platform_name)
+    if plat == "win32" and val == 2:
+        return 1
+    return val
+
+
 def _resolve_mkl_num_threads() -> int:
-    raw = os.environ.get("SE_MKL_NUM_THREADS")
-    if raw is not None and str(raw).strip():
-        try:
-            val = int(str(raw).strip())
-            if val >= 1:
-                return val
-        except ValueError:
-            pass
-    # 默认使用物理核估算值（逻辑核一半，钳位在 [2, 8]），避免与 OpenBLAS 争抢及笔记本满载降频
+    for env_key in ("SE_MKL_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS"):
+        raw = os.environ.get(env_key)
+        if raw is not None and str(raw).strip():
+            try:
+                val = int(str(raw).strip())
+                if val >= 1:
+                    return _sanitize_mkl_threads(val)
+            except ValueError:
+                pass
+    # 默认使用物理核估算值（逻辑核一半，钳位在 [2, 8]），并在 Windows 上自动避开 2 线程 PARDISO 缺陷
     logical = int(os.cpu_count() or 4)
-    return max(2, min(8, logical // 2))
+    return _sanitize_mkl_threads(max(2, min(8, logical // 2)))
 
 
 def _configure_mkl_threads(lib: ctypes.CDLL, n_threads: int) -> None:
-    fn = (
-        getattr(lib, "MKL_Set_Num_Threads_Local", None)
-        or getattr(lib, "mkl_set_num_threads_local", None)
-        or getattr(lib, "MKL_Set_Num_Threads", None)
-        or getattr(lib, "mkl_set_num_threads", None)
-    )
-    if fn is None:
-        return
-    try:
-        fn.argtypes = [ctypes.c_int]
-        fn.restype = ctypes.c_int
-        fn(int(n_threads))
-    except Exception:
-        pass
+    """设置 MKL 线程数（仅调用 C ABI 值传递接口，避免误按值传递调用 Fortran 指针接口）。"""
+    safe_threads = _sanitize_mkl_threads(n_threads)
+    applied = False
+    for fn_name in ("MKL_Set_Num_Threads_Local", "MKL_Set_Num_Threads"):
+        fn = getattr(lib, fn_name, None)
+        if fn is None:
+            continue
+        try:
+            fn.argtypes = [ctypes.c_int]
+            fn.restype = ctypes.c_int
+            fn(int(safe_threads))
+            applied = True
+        except Exception:
+            pass
+    if not applied:
+        for fn_name in ("mkl_set_num_threads_local", "mkl_set_num_threads"):
+            fn = getattr(lib, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+                fn.restype = ctypes.c_int
+                c_val = ctypes.c_int(int(safe_threads))
+                fn(ctypes.byref(c_val))
+                break
+            except Exception:
+                pass
 
 
 def _smoke_test_pardiso(pardiso_fn) -> Tuple[bool, str]:

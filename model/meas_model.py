@@ -465,7 +465,6 @@ def measurement_table_from_measurements(
     measurements: Sequence[Measurement],
     *,
     device_type_codes=DEVICE_TYPE_CODES,
-    angle_measurement_types=frozenset(),
 ) -> MeasurementTable:
     table = getattr(measurements, "table", None)
     if table is not None:
@@ -486,7 +485,6 @@ def measurement_table_from_measurements(
             tail_table = measurement_table_from_measurements(
                 tail_measurements,
                 device_type_codes=device_type_codes,
-                angle_measurement_types=angle_measurement_types,
             )
             table = MeasurementTable(
                 idx=np.concatenate((table.idx, tail_table.idx)),
@@ -524,7 +522,6 @@ def measurement_table_from_measurements(
     valid_list = [False] * count
     value_list = [0.0] * count
     device_type_code_list = [0] * count
-    angle_mask_list = [False] * count
     status_list = [0] * count
     meas_type_code_values = [0] * count
     device_pos_values = [-1] * count
@@ -541,7 +538,6 @@ def measurement_table_from_measurements(
         valid_list[pos] = bool(meas.valid)
         value_list[pos] = float(meas.value)
         device_type_code_list[pos] = device_type_codes_get(meas.device_type, 0)
-        angle_mask_list[pos] = meas.meas_type in angle_measurement_types
         status_list[pos] = measurement_status_from_measurement(meas)
         meas_code = int(getattr(meas, "meas_type_code", 0) or 0)
         dev_pos = int(getattr(meas, "device_pos", -1))
@@ -559,7 +555,7 @@ def measurement_table_from_measurements(
         valid=np.asarray(valid_list, dtype=bool),
         value=np.asarray(value_list, dtype=np.float64),
         device_type_code=np.asarray(device_type_code_list, dtype=np.int16),
-        angle_mask=np.asarray(angle_mask_list, dtype=bool),
+        angle_mask=np.zeros(count, dtype=bool),
         status_code=np.asarray(status_list, dtype=np.int16),
         meas_type_code=np.asarray(meas_type_code_values, dtype=np.int16) if has_meas_type_code else None,
         device_pos=np.asarray(device_pos_values, dtype=np.int64) if has_device_pos else None,

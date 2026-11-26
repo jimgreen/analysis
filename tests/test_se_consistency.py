@@ -109,8 +109,6 @@ def _generate_ac_case(n_bus: int, out_dir: Path, *, seed: int = 101, inject_bad:
         err = 35.0 if (inject_bad and i == n_bus // 2) else 0.0
         mlines.append(f"# {m_idx} m_{m_idx} ACNode bus_{i + 1} V 100.0 1 {bus_res[i, 2] * bus_res[i, 1] + err:.6f}")
         m_idx += 1
-    mlines.append(f"# {m_idx} m_{m_idx} ACNode bus_1 ANGLE 1000.0 1 0.0")
-    m_idx += 1
     for i in range(br_res.shape[0]):
         for mtype, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
             mlines.append(f"# {m_idx} m_{m_idx} ACBranch br_{i + 1} {mtype} 25.0 1 {br_res[i, col] * p_base:.6f}")
@@ -213,8 +211,6 @@ def _generate_hybrid_case(n_ac: int, n_dc: int, out_dir: Path, *, inject_bad: bo
         err = 35.0 if (inject_bad and i == n_ac // 2) else 0.0
         mlines.append(f"# {m_idx} m_{m_idx} ACNode bus_{i + 1} V 100.0 1 {ab[i, 2] * ab[i, 1] + err:.6f}")
         m_idx += 1
-    mlines.append(f"# {m_idx} m_{m_idx} ACNode bus_1 ANGLE 1000.0 1 0.0")
-    m_idx += 1
     for i in range(abr.shape[0]):
         for mtype, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
             mlines.append(f"# {m_idx} m_{m_idx} ACBranch br_{i + 1} {mtype} 25.0 1 {abr[i, col] * p_base:.6f}")
@@ -477,9 +473,6 @@ def test_multi_island_reference_selection_ac_and_dc(tmp_path: Path):
         m_id += 1
         ac_meas.append(f"# {m_id} m_{m_id} ACNode bus_{base + 1} V 100.0 1 110.0")
         m_id += 1
-        if isl % 3 == 1:
-            ac_meas.append(f"# {m_id} m_{m_id} ACNode bus_{base + 1} ANGLE 1000.0 1 0.0")
-            m_id += 1
         ac_meas.append(f"# {m_id} m_{m_id} ACBranch br_{isl + 1} P_FROM 25.0 1 0.0")
         m_id += 1
         ac_meas.append(f"# {m_id} m_{m_id} ACBranch br_{isl + 1} Q_FROM 25.0 1 0.0")
@@ -3695,7 +3688,7 @@ def test_native_kernels_equivalence_aat_ac_and_meas_parser(tmp_path):
         for i in range(1, 201):
             dev = f"BUS_{(i % 40) + 1}"
             dt = "ACNode" if i % 3 else "ACBranch"
-            mt = "V" if i % 3 == 1 else ("angle" if i % 15 == 0 else "P_FROM")
+            mt = "V" if i % 3 == 1 else ("q_from" if i % 15 == 0 else "P_FROM")
             w_val = 100.0 + (i % 7) * 0.125
             vld = 0 if i % 11 == 0 else 1
             val = ((-1) ** i) * (1.2345e-2 * i)
@@ -5656,6 +5649,734 @@ def test_unconverged_bdr_prioritization_and_warm_start_flat_fallback(tmp_path):
     _, rem_short = est_short.estimate_with_bad_data_removal(threshold=3.5, max_remove=3)
     assert len(rem_short) >= 1
     assert int(rem_short[0].measurement.idx) == bad_idx
+
+
+def test_steam_multistage_prv_potential_floor_prevents_zero_singularity(tmp_path):
+    """验证三级减压阀蒸汽网在高压平启动下，压势防穿零下界可避开 u->1e-12 真空奇点并精确收敛。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    e_file = tmp_path / "steam_prv_3stage.e"
+    e_file.write_text(
+        "\n".join(
+            [
+                "<SteamMedium>",
+                "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+                "# 2.1 2500.0 419.0 2800.0 200.0",
+                "</SteamMedium>",
+                "<SteamNode>",
+                "@ idx name pressure enthalpy run_stat",
+                "# 1 sn_1 12.0 3100.0 1",
+                "# 2 sn_2 11.8 3095.0 1",
+                "# 3 sn_3 6.0 2950.0 1",
+                "# 4 sn_4 5.8 2945.0 1",
+                "# 5 sn_5 2.5 2820.0 1",
+                "# 6 sn_6 2.4 2815.0 1",
+                "</SteamNode>",
+                "<SteamSource>",
+                "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+                "# 1 ss_1 1 PRESSURE 12.0 0.0 3100.0 1.0 0.0 500.0 1",
+                "</SteamSource>",
+                "<SteamLoad>",
+                "@ idx name node flow_set condensate_enthalpy run_stat",
+                "# 1 sl_1 2 0.20 419.0 1",
+                "# 2 sl_2 4 0.15 419.0 1",
+                "# 3 sl_3 6 0.12 419.0 1",
+                "</SteamLoad>",
+                "<SteamPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat",
+                "# 1 sp_1 1 2 1.5 0.00002 1",
+                "# 2 sp_2 3 4 1.5 0.00002 1",
+                "# 3 sp_3 5 6 1.5 0.00002 1",
+                "</SteamPipe>",
+                "<SteamPressureReducer>",
+                "@ idx name i_node j_node control_type ratio flow_set heat_loss run_stat",
+                "# 1 sprv_1 2 3 RATIO 0.50 0.0 0.0001 1",
+                "# 2 sprv_2 4 5 RATIO 0.42 0.0 0.0001 1",
+                "</SteamPressureReducer>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 先以真实三压级状态计算物理一致量测，再以高压平启动（全网 u0=144）求解
+    net_ref = load_steam_network_from_e_file(e_file)
+    tpl_m = tmp_path / "steam_prv_tpl.meas"
+    tpl_rows = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value status",
+    ]
+    mid = 0
+    for nname in ("sn_1", "sn_2", "sn_3", "sn_4", "sn_5", "sn_6"):
+        for mt in ("PRESSURE", "ENTHALPY"):
+            mid += 1
+            tpl_rows.append(f"# {mid} m_{mid} SteamNode {nname} {mt} 100.0 1 1.0 0")
+    for pname in ("sp_1", "sp_2", "sp_3"):
+        for mt in ("FLOW_FROM", "H_TO"):
+            mid += 1
+            tpl_rows.append(f"# {mid} m_{mid} SteamPipe {pname} {mt} 50.0 1 1.0 0")
+    for rname in ("sprv_1", "sprv_2"):
+        for mt in ("PRESSURE_FROM", "PRESSURE_TO", "H_FROM", "H_TO"):
+            mid += 1
+            tpl_rows.append(f"# {mid} m_{mid} SteamPressureReducer {rname} {mt} 50.0 1 1.0 0")
+    tpl_rows.append("</Measurement>")
+    tpl_m.write_text("\n".join(tpl_rows) + "\n", encoding="utf-8")
+
+    ref_est = SteamStateEstimator(net_ref, str(tpl_m), parameters=SE_PARAMS, flat_start=False)
+    ref_est.prepare()
+    x_true = ref_est.initial_state()
+    z_true = ref_est.evaluate(x_true, ref_est.active_measurements)
+    exact_rows = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value status",
+    ]
+    for pos, m_obj in enumerate(ref_est.active_measurements):
+        exact_rows.append(
+            f"# {int(m_obj.idx)} {m_obj.name} {m_obj.device_type} {m_obj.device_name} "
+            f"{m_obj.meas_type} {float(m_obj.weight):.1f} 1 {float(z_true[pos]):.6f} 0"
+        )
+    exact_rows.append("</Measurement>")
+    m_file = tmp_path / "steam_prv_exact.meas"
+    m_file.write_text("\n".join(exact_rows) + "\n", encoding="utf-8")
+
+    for use_flat in (True, False):
+        net_run = load_steam_network_from_e_file(e_file)
+        est = SteamStateEstimator(net_run, str(m_file), parameters=SE_PARAMS, flat_start=use_flat)
+        est.prepare()
+        rc = est.run()
+        assert rc == 0
+        assert est.result is not None and est.result.converged
+        p_est = np.sqrt(np.maximum(est.result.x[: est.n_potential], 0.0))
+        p_true = np.sqrt(np.maximum(x_true[: est.n_potential], 0.0))
+        assert float(np.min(est.result.x[: est.n_potential])) > 1.0
+        assert float(np.max(np.abs(p_est - p_true))) < 1e-3
+
+
+def test_dc_box_constrained_kkt_releases_bad_branch_power_pinning(tmp_path):
+    """验证 DC 极端支路功率坏数据把健康节点拉至电压下界墙时，盒约束驻点确认可释放 BDR 并精准剔除坏数据。"""
+    dc_dir = tmp_path / "dc_box_kkt"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(12, dc_dir, seed=2041)
+    lines = dc_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    bad_idx = None
+    for ln in lines:
+        if ln.startswith("#") and " DCBranch " in ln and " P_FROM " in ln and bad_idx is None:
+            parts = ln.split()
+            bad_idx = int(parts[1])
+            # 注入极端支路有功坏数据，将关联节点拉向物理下界 voltage_min=0.1
+            parts[-1] = f"{float(parts[-1]) + 3000.0:.6f}"
+            edited.append(" ".join(parts))
+        else:
+            edited.append(ln)
+    dc_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+    assert bad_idx is not None
+
+    est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS, flat_start=False)
+    est.prepare()
+    res, rem = est.estimate_with_bad_data_removal(threshold=3.5, max_remove=5)
+    assert res.converged
+    assert bad_idx in [int(item.measurement.idx) for item in rem]
+    v_est = res.x[: est.n_voltage]
+    assert float(v_est.min()) > 0.85 and float(v_est.max()) < 1.15
+
+
+def test_multi_energy_ac_fluid_without_dc_run_and_bad_data(tmp_path):
+    """验证 2 域无 DC 侧多能联合（AC + Steam）执行 run() 与 identify_bad_data() 不再误委派给 ACStateEstimator 崩溃。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.hybrid_se import HybridStateEstimator
+    from secore.steam_se import SteamStateEstimator
+
+    me_dir = tmp_path / "me_ac_steam"
+    me_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(6, me_dir, seed=2045)
+
+    # 在 AC .e 模型后追加小型 Steam 子网（不含任何 DC 元件）
+    ac_text = ac_e.read_text(encoding="utf-8")
+    steam_block = "\n".join(
+        [
+            "",
+            "<SteamMedium>",
+            "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+            "# 2.1 2500.0 419.0 2800.0 200.0",
+            "</SteamMedium>",
+            "<SteamNode>",
+            "@ idx name pressure enthalpy run_stat",
+            "# 1 sn_1 10.0 3000.0 1",
+            "# 2 sn_2 9.6 2990.0 1",
+            "# 3 sn_3 9.2 2980.0 1",
+            "</SteamNode>",
+            "<SteamSource>",
+            "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+            "# 1 ss_1 1 PRESSURE 10.0 0.0 3000.0 1.0 0.0 500.0 1",
+            "</SteamSource>",
+            "<SteamLoad>",
+            "@ idx name node flow_set condensate_enthalpy run_stat",
+            "# 1 sl_1 3 0.20 419.0 1",
+            "</SteamLoad>",
+            "<SteamPipe>",
+            "@ idx name i_node j_node conductance heat_loss run_stat",
+            "# 1 sp_1 1 2 1.5 0.00002 1",
+            "# 2 sp_2 2 3 1.5 0.00002 1",
+            "</SteamPipe>",
+        ]
+    )
+    me_e = me_dir / "me_ac_steam.e"
+    me_e.write_text(ac_text + steam_block + "\n", encoding="utf-8")
+
+    # 生成与 Steam 子网物理一致的量测并拼入 .meas
+    s_net = load_steam_network_from_e_file(me_e)
+    tpl_sm = me_dir / "steam_tpl.meas"
+    tpl_sm.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value status",
+                "# 10001 sm_p1 SteamNode sn_1 PRESSURE 100.0 1 10.0 0",
+                "# 10002 sm_h1 SteamNode sn_1 ENTHALPY 100.0 1 3000.0 0",
+                "# 10003 sm_p2 SteamNode sn_2 PRESSURE 100.0 1 9.6 0",
+                "# 10004 sm_h2 SteamNode sn_2 ENTHALPY 100.0 1 2990.0 0",
+                "# 10005 sm_p3 SteamNode sn_3 PRESSURE 100.0 1 9.2 0",
+                "# 10006 sm_h3 SteamNode sn_3 ENTHALPY 100.0 1 2980.0 0",
+                "# 10007 sm_f1 SteamPipe sp_1 FLOW_FROM 50.0 1 0.2 0",
+                "# 10008 sm_f2 SteamPipe sp_2 FLOW_FROM 50.0 1 0.2 0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    s_ref = SteamStateEstimator(s_net, str(tpl_sm), parameters=SE_PARAMS, flat_start=False)
+    s_ref.prepare()
+    z_s = s_ref.evaluate(s_ref.initial_state(), s_ref.active_measurements)
+    ac_m_lines = [ln for ln in ac_m.read_text(encoding="utf-8").splitlines() if ln.strip() != "</Measurement>"]
+    has_status_col = any(ln.startswith("@") and "status" in ln.split() for ln in ac_m_lines)
+    steam_meas = [
+        (
+            f"# {int(m_obj.idx)} {m_obj.name} {m_obj.device_type} {m_obj.device_name} "
+            f"{m_obj.meas_type} {float(m_obj.weight):.1f} 1 {float(z_s[pos]):.6f}"
+            + (" 0" if has_status_col else "")
+        )
+        for pos, m_obj in enumerate(s_ref.active_measurements)
+    ]
+    me_m = me_dir / "me_ac_steam.meas"
+    me_m.write_text("\n".join(ac_m_lines + steam_meas + ["</Measurement>"]) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS, flat_start=True)
+    assert isinstance(est._delegate(), ACStateEstimator) and bool(est.fluid_estimators)
+    se_res = est.run()
+    assert se_res is not None
+    assert est.converged
+    assert est.estimate_result is not None and est.estimate_result.converged
+
+
+def test_active_set_box_constrained_gn_converges_without_boundary_crawl(tmp_path):
+    """验证活跃集约化牛顿求解数学精确性，及超额不可删坏数据将电压拉贴物理墙时快速收敛不空爬。"""
+    from scipy.sparse import csc_matrix
+    from secore.se_math import detect_active_box_pinned_cols, solve_box_pinned_normal_equations
+
+    # 1. 数学单元测试：验证块解耦求解 dx[A]=0 且自由子空间解与直接子矩阵求解完全一致
+    rng = np.random.default_rng(20261126)
+    A_dense = rng.normal(size=(6, 12))
+    A_sp = csc_matrix(A_dense)
+    G_full = A_dense @ A_dense.T
+    rhs = np.asarray([-5.0, 2.0, 1.5, 8.0, -0.7, 3.3], dtype=np.float64)
+    x_box = np.asarray([0.10002, 1.0, 1.0, 1.89998, 1.0, 1.0], dtype=np.float64)
+    v_cols = np.arange(6, dtype=np.intp)
+    pinned = detect_active_box_pinned_cols(x_box, rhs, v_cols, 0.1, 1.9, margin=1e-4)
+    assert np.array_equal(pinned, np.asarray([0, 3], dtype=np.intp))
+    dx_pin, ok = solve_box_pinned_normal_equations(A_sp, None, rhs, pinned, damping=0.0)
+    assert ok
+    assert dx_pin[0] == 0.0 and dx_pin[3] == 0.0
+    free = np.asarray([1, 2, 4, 5], dtype=np.intp)
+    dx_free_ref = np.linalg.solve(G_full[np.ix_(free, free)], rhs[free])
+    assert np.allclose(dx_pin[free], dx_free_ref, rtol=1e-10, atol=1e-10)
+
+    # 2. 端到端 DC 验证：禁止删坏 (max_remove=0) 且注入极端大电流坏数据把节点拉死在边界墙，验证短步收敛
+    dc_dir = tmp_path / "dc_active_set_pin"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(12, dc_dir, seed=2046)
+    lines = dc_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    injected = 0
+    for ln in lines:
+        if ln.startswith("#") and " DCBranch " in ln and " P_FROM " in ln and injected < 2:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) + 2500.0:.6f}"
+            edited.append(" ".join(parts))
+            injected += 1
+        else:
+            edited.append(ln)
+    dc_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS.with_overrides(max_iter=80, max_remove=0), flat_start=True)
+    dc_est.prepare()
+    dc_res = dc_est.estimate()
+    assert dc_res.converged
+    assert dc_res.iterations < 60
+
+    # 3. 端到端 AC 验证：禁止删坏且注入极端支路坏数据拉墙，验证活跃集快速收敛
+    ac_dir = tmp_path / "ac_active_set_pin"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(10, ac_dir, seed=2047)
+    ac_lines = ac_m.read_text(encoding="utf-8").splitlines()
+    ac_edited = []
+    ac_inj = 0
+    for ln in ac_lines:
+        if ln.startswith("#") and " ACBranch " in ln and " Q_FROM " in ln and ac_inj < 2:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) - 1500.0:.6f}"
+            ac_edited.append(" ".join(parts))
+            ac_inj += 1
+        else:
+            ac_edited.append(ln)
+    ac_m.write_text("\n".join(ac_edited) + "\n", encoding="utf-8")
+
+    ac_est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(max_iter=80, max_remove=0), flat_start=True)
+    ac_est.prepare()
+    ac_res = ac_est.estimate()
+    assert ac_res.converged
+    assert ac_res.iterations < 60
+
+
+def test_dirty_warm_start_switches_to_flat_start_before_bdr(tmp_path):
+    """验证严重污染热启动 (flat_start=False) 首轮未收敛时自动切换平启动，不误删健康量测。"""
+    dc_dir = tmp_path / "dc_dirty_warm"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(12, dc_dir, seed=2048)
+
+    # 严重污染 .e 中直流母线初始电压值（交替设 0.15 / 1.85 倍基准）
+    e_lines = dc_e.read_text(encoding="utf-8").splitlines()
+    in_dc_node = False
+    dirty_lines = []
+    k = 0
+    for ln in e_lines:
+        if ln.strip() == "<DCNode>":
+            in_dc_node = True
+            dirty_lines.append(ln)
+            continue
+        if ln.strip() == "</DCNode>":
+            in_dc_node = False
+            dirty_lines.append(ln)
+            continue
+        if in_dc_node and ln.startswith("#"):
+            parts = ln.split()
+            vb = float(parts[3])
+            parts[4] = f"{vb * (0.15 if k % 2 == 0 else 1.85):.6f}"
+            k += 1
+            dirty_lines.append(" ".join(parts))
+        else:
+            dirty_lines.append(ln)
+    dc_e.write_text("\n".join(dirty_lines) + "\n", encoding="utf-8")
+
+    est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS.with_overrides(max_remove=10), flat_start=False)
+    est.prepare()
+    res, rem = est.estimate_with_bad_data_removal(threshold=3.5, max_remove=10)
+    assert res.converged
+    assert len(rem) == 0
+
+
+def test_fluid_sawtooth_limit_cycle_damping_breaks_stagnation(tmp_path):
+    """验证流体无阻尼 2~3 步锯齿周期极限环下，9 位冻结目标函数检测可及时切入曲率阻尼打破震荡收敛。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    # 构造 2 级减压阀蒸汽网并施加 6 数量级异构权重与轻微噪声，回归验证曲率阻尼稳定收敛
+    e_file = tmp_path / "steam_sawtooth.e"
+    e_file.write_text(
+        "\n".join(
+            [
+                "<SteamMedium>",
+                "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+                "# 2.1 2500.0 419.0 2800.0 200.0",
+                "</SteamMedium>",
+                "<SteamNode>",
+                "@ idx name pressure enthalpy run_stat",
+                "# 1 sn_1 18.0 2950.0 1",
+                "# 2 sn_2 17.4 2940.0 1",
+                "# 3 sn_3 9.0 2940.0 1",
+                "# 4 sn_4 8.5 2925.0 1",
+                "# 5 sn_5 4.0 2925.0 1",
+                "# 6 sn_6 3.6 2910.0 1",
+                "</SteamNode>",
+                "<SteamSource>",
+                "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+                "# 1 ss_1 1 PRESSURE 18.0 0.0 2950.0 1.0 0.0 500.0 1",
+                "</SteamSource>",
+                "<SteamLoad>",
+                "@ idx name node flow_set condensate_enthalpy run_stat",
+                "# 1 sl_1 2 0.15 419.0 1",
+                "# 2 sl_2 4 0.15 419.0 1",
+                "# 3 sl_3 6 0.12 419.0 1",
+                "</SteamLoad>",
+                "<SteamPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat",
+                "# 1 sp_1 1 2 1.5 0.00002 1",
+                "# 2 sp_2 3 4 1.5 0.00002 1",
+                "# 3 sp_3 5 6 1.5 0.00002 1",
+                "</SteamPipe>",
+                "<SteamPressureReducer>",
+                "@ idx name i_node j_node control_type ratio flow_set heat_loss run_stat",
+                "# 1 sprv_1 2 3 RATIO 0.517 0.0 0.0001 1",
+                "# 2 sprv_2 4 5 RATIO 0.471 0.0 0.0001 1",
+                "</SteamPressureReducer>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    net_ref = load_steam_network_from_e_file(e_file)
+    tpl_m = tmp_path / "steam_sawtooth_tpl.meas"
+    tpl_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value status"]
+    mid = 0
+    weights_cycle = [0.1, 1.0, 10.0, 1000.0, 1e5]
+    for nname in ("sn_1", "sn_2", "sn_3", "sn_4", "sn_5", "sn_6"):
+        for mt in ("PRESSURE", "ENTHALPY"):
+            mid += 1
+            w = weights_cycle[mid % len(weights_cycle)]
+            tpl_rows.append(f"# {mid} m_{mid} SteamNode {nname} {mt} {w} 1 100.0 0")
+    for pname in ("sp_1", "sp_2", "sp_3"):
+        for mt in ("FLOW_FROM", "H_TO"):
+            mid += 1
+            w = weights_cycle[mid % len(weights_cycle)]
+            tpl_rows.append(f"# {mid} m_{mid} SteamPipe {pname} {mt} {w} 1 50.0 0")
+    for rname in ("sprv_1", "sprv_2"):
+        for mt in ("PRESSURE_FROM", "PRESSURE_TO", "H_FROM", "H_TO"):
+            mid += 1
+            w = weights_cycle[mid % len(weights_cycle)]
+            tpl_rows.append(f"# {mid} m_{mid} SteamPressureReducer {rname} {mt} {w} 1 50.0 0")
+    tpl_rows.append("</Measurement>")
+    tpl_m.write_text("\n".join(tpl_rows) + "\n", encoding="utf-8")
+
+    ref_est = SteamStateEstimator(net_ref, str(tpl_m), parameters=SE_PARAMS, flat_start=False)
+    ref_est.prepare()
+    x_true = ref_est.initial_state()
+    z_true = ref_est.evaluate(x_true, ref_est.active_measurements)
+    rng = np.random.default_rng(438)
+    noisy_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value status"]
+    for pos, m_obj in enumerate(ref_est.active_measurements):
+        sigma = 0.25 / float(np.sqrt(max(float(m_obj.weight), 1.0)))
+        val = float(z_true[pos]) + float(rng.normal(0.0, sigma))
+        noisy_rows.append(
+            f"# {int(m_obj.idx)} {m_obj.name} {m_obj.device_type} {m_obj.device_name} "
+            f"{m_obj.meas_type} {float(m_obj.weight):.1f} 1 {val:.6f} 0"
+        )
+    noisy_rows.append("</Measurement>")
+    m_file = tmp_path / "steam_sawtooth_noisy.meas"
+    m_file.write_text("\n".join(noisy_rows) + "\n", encoding="utf-8")
+
+    net_run = load_steam_network_from_e_file(e_file)
+    est = SteamStateEstimator(net_run, str(m_file), parameters=SE_PARAMS.with_overrides(max_iter=120), flat_start=True)
+    est.prepare()
+    rc = est.run()
+    assert rc == 0
+    assert est.result is not None and est.result.converged
+    assert est.result.iterations < 120
+
+
+def test_fluid_nonnegative_potential_active_set_prevents_zero_wall_oscillation(tmp_path):
+    """验证热网极端流量坏数据将节点压势拉至非负下界 1e-12 时，活跃集约化牛顿步可快速收敛不震荡。"""
+    from model.heat_model import load_heat_network_from_e_file
+    from secore.heat_se import HeatStateEstimator
+
+    e_file = tmp_path / "heat_zero_wall.e"
+    e_file.write_text(
+        "\n".join(
+            [
+                "<HeatMedium>",
+                "@ heat_capacity ambient_temperature return_temperature_default",
+                "# 4.186 15.0 50.0",
+                "</HeatMedium>",
+                "<HeatNode>",
+                "@ idx name pressure supply_temperature return_temperature run_stat",
+                "# 1 hn_1 1.20 80.0 50.0 1",
+                "# 2 hn_2 1.15 79.0 50.5 1",
+                "# 3 hn_3 1.10 78.0 51.0 1",
+                "# 4 hn_4 1.05 77.0 51.5 1",
+                "</HeatNode>",
+                "<HeatSource>",
+                "@ idx name node control_type pressure_set flow_set supply_temperature_set return_temperature_set alpha flow_min flow_max run_stat",
+                "# 1 hs_1 1 PRESSURE 1.20 0.0 80.0 50.0 1.0 0.0 200.0 1",
+                "</HeatSource>",
+                "<HeatLoad>",
+                "@ idx name node flow_set return_temperature_set run_stat",
+                "# 1 hl_1 3 0.25 51.0 1",
+                "# 2 hl_2 4 0.25 51.5 1",
+                "</HeatLoad>",
+                "<HeatPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat",
+                "# 1 hp_1 1 2 2.0 0.0001 1",
+                "# 2 hp_2 2 3 2.0 0.0001 1",
+                "# 3 hp_3 3 4 2.0 0.0001 1",
+                "</HeatPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    net_ref = load_heat_network_from_e_file(e_file)
+    tpl_m = tmp_path / "heat_zero_wall_tpl.meas"
+    tpl_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value status"]
+    mid = 0
+    for nname in ("hn_1", "hn_2", "hn_3", "hn_4"):
+        for mt in ("PRESSURE", "T_SUPPLY", "T_RETURN"):
+            mid += 1
+            tpl_rows.append(f"# {mid} m_{mid} HeatNode {nname} {mt} 100.0 1 1.0 0")
+    for pname in ("hp_1", "hp_2", "hp_3"):
+        for mt in ("FLOW_FROM", "FLOW_TO"):
+            mid += 1
+            tpl_rows.append(f"# {mid} m_{mid} HeatPipe {pname} {mt} 200.0 1 0.5 0")
+    tpl_rows.append("</Measurement>")
+    tpl_m.write_text("\n".join(tpl_rows) + "\n", encoding="utf-8")
+
+    ref_est = HeatStateEstimator(net_ref, str(tpl_m), parameters=SE_PARAMS, flat_start=False)
+    ref_est.prepare()
+    z_true = ref_est.evaluate(ref_est.initial_state(), ref_est.active_measurements)
+    bad_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value status"]
+    for pos, m_obj in enumerate(ref_est.active_measurements):
+        val = float(z_true[pos])
+        # 在末端支路 hp_3 FLOW_TO 注入极端大流量坏数据，将节点 hn_4 压势死拉向非负下界 1e-12
+        if m_obj.device_name == "hp_3" and m_obj.meas_type == "FLOW_TO":
+            val = val - 25.0
+        bad_rows.append(
+            f"# {int(m_obj.idx)} {m_obj.name} {m_obj.device_type} {m_obj.device_name} "
+            f"{m_obj.meas_type} {float(m_obj.weight):.1f} 1 {val:.6f} 0"
+        )
+    bad_rows.append("</Measurement>")
+    m_file = tmp_path / "heat_zero_wall.meas"
+    m_file.write_text("\n".join(bad_rows) + "\n", encoding="utf-8")
+
+    net_run = load_heat_network_from_e_file(e_file)
+    est = HeatStateEstimator(net_run, str(m_file), parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    est.prepare()
+    rc = est.run()
+    assert rc == 0
+    assert est.result is not None and est.result.converged
+    assert est.result.iterations < 80
+
+
+def test_ac_dc_lm_guard_allows_healthy_wall_crossing_into_active_set(tmp_path):
+    """验证健康幅值贴墙跨界步不被 LM 护栏劫持为重阻尼蜗牛爬，可迅速接入活跃集并满足盒约束 KKT 收敛。"""
+    # DC：多条支路功率同时注入极端坏数据且 max_remove=0，触发多节点先后撞墙接入活跃集
+    dc_dir = tmp_path / "dc_multi_wall"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(18, dc_dir, seed=2055)
+    dc_lines = dc_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    inj = 0
+    for ln in dc_lines:
+        if ln.startswith("#") and " DCBranch " in ln and " P_FROM " in ln and inj < 5:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) + (3000.0 if inj % 2 == 0 else -3000.0):.6f}"
+            edited.append(" ".join(parts))
+            inj += 1
+        else:
+            edited.append(ln)
+    dc_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS.with_overrides(max_iter=100, max_remove=0), flat_start=True)
+    dc_est.prepare()
+    dc_res = dc_est.estimate()
+    assert dc_res.converged
+    assert dc_res.iterations < 80
+
+    # AC：多条支路无功/电流同时注入极端坏数据且 max_remove=0，验证不陷入 200 步重阻尼蜗牛爬
+    ac_dir = tmp_path / "ac_multi_wall"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(16, ac_dir, seed=2056)
+    ac_lines = ac_m.read_text(encoding="utf-8").splitlines()
+    ac_edited = []
+    ac_inj = 0
+    for ln in ac_lines:
+        if ln.startswith("#") and " ACBranch " in ln and " Q_FROM " in ln and ac_inj < 4:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) - 1800.0:.6f}"
+            ac_edited.append(" ".join(parts))
+            ac_inj += 1
+        else:
+            ac_edited.append(ln)
+    ac_m.write_text("\n".join(ac_edited) + "\n", encoding="utf-8")
+
+    ac_est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(max_iter=100, max_remove=0), flat_start=True)
+    ac_est.prepare()
+    ac_res = ac_est.estimate()
+    assert ac_res.converged
+    assert ac_res.iterations < 80
+
+
+def test_bdr_warm_start_resets_pinned_voltage_and_avoids_low_branch_trap(tmp_path):
+    """验证 BDR 删坏后即使上一轮贴墙收敛，也能将贴墙电压复位为 1.0，跳出低电压下支盆地并快速达全局最优。"""
+    # 1. DC：极端支路功率坏数据把局部节点电压拍至下界 0.10 并贴墙收敛，删坏后必须摆脱下支并低步收敛
+    dc_dir = tmp_path / "dc_bdr_pin"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(20, dc_dir, seed=2071)
+    dc_lines = dc_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    injected = 0
+    for ln in dc_lines:
+        if ln.startswith("#") and " DCBranch " in ln and " P_FROM " in ln and injected < 3:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) - 5000.0:.6f}"
+            edited.append(" ".join(parts))
+            injected += 1
+        else:
+            edited.append(ln)
+    dc_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS.with_overrides(max_iter=100, bad_threshold=4.0), flat_start=True)
+    dc_est.prepare()
+    dc_res, dc_rem = dc_est.estimate_with_bad_data_removal(verbose=False)
+    assert dc_res.converged
+    assert dc_res.iterations <= 30
+    assert len(dc_rem) >= 1
+    assert float(np.min(dc_res.x[: dc_est.n_voltage])) > 0.5
+
+    # 2. AC：极端支路无功坏数据触发贴墙后，BDR 剔除坏数据后应恢复健康电压且无须空磨百步
+    ac_dir = tmp_path / "ac_bdr_pin"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(18, ac_dir, seed=2072)
+    ac_lines = ac_m.read_text(encoding="utf-8").splitlines()
+    ac_edited = []
+    ac_inj = 0
+    for ln in ac_lines:
+        if ln.startswith("#") and " ACBranch " in ln and " Q_FROM " in ln and ac_inj < 2:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) - 2500.0:.6f}"
+            ac_edited.append(" ".join(parts))
+            ac_inj += 1
+        else:
+            ac_edited.append(ln)
+    ac_m.write_text("\n".join(ac_edited) + "\n", encoding="utf-8")
+
+    ac_est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(max_iter=100, bad_threshold=4.0), flat_start=True)
+    ac_est.prepare()
+    ac_res, ac_rem = ac_est.estimate_with_bad_data_removal(verbose=False)
+    assert ac_res.converged
+    assert ac_res.iterations <= 30
+    assert len(ac_rem) >= 1
+    v_ac = ac_res.x[ac_est.n_angle : ac_est.base_switch_re]
+    assert float(np.min(v_ac)) > 0.5
+
+
+def test_fluid_and_me_smooth_damping_release_avoids_high_damp_stall(tmp_path):
+    """验证流体与多能联合在高阻尼提示起步下，连续满步单调改善时可平滑释放阻尼并快速收敛，无高阻尼焊死。"""
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    # 1. 蒸汽网以 _hint_lm_damping=10.0（模拟高阻尼切入）起步，验证不会焊死高阻尼且步数紧凑、max_correction 健康
+    lines = [
+        "<SteamMedium>",
+        "@ density compressibility molar_mass temperature heat_capacity ambient_enthalpy reference_temperature reference_enthalpy feedwater_enthalpy flow_factor",
+        "# 4.0 1.0 0.018 473.15 2.08 419.0 100.0 2676.0 419.0 1.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name pressure enthalpy temperature run_stat",
+    ]
+    for i in range(1, 11):
+        lines.append(f"# {i} sn_{i} {10.0 - 0.03 * i:.4f} 3000.0 255.76923 1")
+    lines.append("</SteamNode>")
+    lines.append("<SteamSource>\n@ idx name node control_type pressure_set flow_set alpha flow_min flow_max enthalpy_set run_stat\n# 1 ssrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 5.0 3000.0 1\n</SteamSource>")
+    lines.append("<SteamLoad>\n@ idx name node flow_set condensate_enthalpy run_stat")
+    for idx_l, nd in enumerate(range(6, 11), start=1):
+        lines.append(f"# {idx_l} sld_{nd} {nd} 0.2 419.0 1")
+    lines.append("</SteamLoad>")
+    lines.append("<SteamPipe>\n@ idx name i_node j_node conductance heat_loss run_stat")
+    for pid, child in enumerate(range(2, 11), start=1):
+        lines.append(f"# {pid} sp_{child // 2}_{child} {child // 2} {child} 1.0 1e-5 1")
+    lines.append("</SteamPipe>")
+    se = tmp_path / "steam_damp_release.e"
+    se.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    meas_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 1
+    for i in range(1, 11):
+        meas_rows.append(f"# {mid} m_{mid} SteamNode sn_{i} PRESSURE 100.0 1 {10.0 - 0.03 * i:.6f}")
+        mid += 1
+        meas_rows.append(f"# {mid} m_{mid} SteamNode sn_{i} ENTHALPY 1.0 1 3000.0")
+        mid += 1
+    for child in range(2, 11):
+        meas_rows.append(f"# {mid} m_{mid} SteamPipe sp_{child // 2}_{child} FLOW_FROM 100.0 1 0.2")
+        mid += 1
+    meas_rows.append("</Measurement>")
+    sm = tmp_path / "steam_damp_release.meas"
+    sm.write_text("\n".join(meas_rows) + "\n", encoding="utf-8")
+
+    net = load_steam_network_from_e_file(str(se))
+    est = SteamStateEstimator(net, str(sm), parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    est.prepare()
+    x0_shifted = est.initial_state().copy()
+    x0_shifted[: est.n_potential] *= np.linspace(0.65, 0.55, est.n_potential)
+    res = est.estimate(x0=x0_shifted, _hint_lm_damping=10.0)
+    assert res.converged
+    assert res.iterations < 50
+    assert res.max_correction < 1e-2
+    assert float(getattr(res, "_final_lm_damping", 0.0)) < 1.0
+
+
+def test_mkl_pardiso_windows_2thread_guard():
+    """验证 Windows 平台自动规避 Intel oneMKL PARDISO 2 线程 phase=22 访问违例，且不影响 1/4/8 线程及 Linux。"""
+    from secore.mkl_pardiso import _sanitize_mkl_threads
+
+    assert _sanitize_mkl_threads(1, platform_name="win32") == 1
+    assert _sanitize_mkl_threads(2, platform_name="win32") == 1
+    assert _sanitize_mkl_threads(4, platform_name="win32") == 4
+    assert _sanitize_mkl_threads(8, platform_name="win32") == 8
+    assert _sanitize_mkl_threads(2, platform_name="linux") == 2
+    assert _sanitize_mkl_threads(0, platform_name="win32") == 1
+
+
+def test_marquardt_jacobi_scaling_continuous_below_005_damping():
+    """验证极端异构对角元矩阵（diag_ratio > 5e7）在低阻尼 (<0.05) 下仍连续启用 Jacobi 相对阻尼，无阶跃断崖。"""
+    from scipy.sparse import csc_matrix
+    from secore.se_math import CholmodAAtNormalEquationSolver
+
+    # 构造 4x4 极端异构对角元 A，使 G = A A^T 对角元跨度为 1e10 (> 5e7)
+    d = np.array([1.0, 100.0, 1e3, 1e5], dtype=np.float64)
+    A = csc_matrix(np.diag(d))
+    rhs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+    solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=False)
+    dx, _ = solver.solve(A, rhs, damping=0.01)
+    assert solver._last_factor_scaled is True
+    # 相对阻尼 (G + 0.01 * diag(G)) dx = rhs => dx_i = rhs_i / (1.01 * d_i^2)
+    expected = rhs / (1.01 * d * d)
+    assert np.allclose(dx, expected, rtol=1e-10, atol=1e-12)
+
+
+def test_ac_dc_hybrid_curvature_damping_hint_smooth_release(tmp_path):
+    """验证 AC/DC/Hybrid 携带高初始曲率阻尼进入平滑区后，可温和释放阻尼并在低迭代数内精确收敛。"""
+    ac_dir = tmp_path / "ac_rel"
+    dc_dir = tmp_path / "dc_rel"
+    hyb_dir = tmp_path / "hyb_rel"
+    for d in (ac_dir, dc_dir, hyb_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    ac_e, ac_m = _generate_ac_case(10, ac_dir, seed=2061, inject_bad=False)
+    ac_est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    ac_res = ac_est.estimate(_hint_lm_damping=1.0)
+    assert ac_res.converged
+    assert ac_res.iterations < 50
+    assert float(getattr(ac_res, "_final_lm_damping", 0.0)) < 0.5
+
+    dc_e, dc_m = _generate_dc_case(10, dc_dir, seed=2062, inject_bad=False)
+    dc_est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    dc_res = dc_est.estimate(_hint_lm_damping=1.0)
+    assert dc_res.converged
+    assert dc_res.iterations < 50
+    assert float(getattr(dc_res, "_final_lm_damping", 0.0)) < 0.5
+
+    hyb_e, hyb_m = _generate_hybrid_case(8, 6, hyb_dir)
+    hyb_est = HybridStateEstimator(hyb_e, hyb_m, parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    hyb_res = hyb_est.estimate(_hint_lm_damping=1.0)
+    assert hyb_res.converged
+    assert hyb_res.iterations < 50
+    assert float(getattr(hyb_res, "_final_lm_damping", 0.0)) < 0.5
+
+
+
+
+
+
 
 
 

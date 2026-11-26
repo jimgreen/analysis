@@ -17,6 +17,7 @@ from scipy.sparse import coo_matrix as SP_COO_MATRIX
 from scipy.sparse import csc_matrix as SP_CSC_MATRIX
 from scipy.sparse import csr_matrix as SP_CSR_MATRIX
 from scipy.sparse import eye as SP_EYE
+from scipy.sparse import hstack as SP_HSTACK
 from scipy.sparse import issparse as SP_ISSPARSE
 from scipy.sparse import tril as SP_TRIL
 from scipy.sparse.csgraph import connected_components as SP_CONNECTED_COMPONENTS
@@ -69,7 +70,6 @@ except Exception:
 _PARDISO_MIN_STATE_COUNT = 2000
 
 
-ANGLE_MEASUREMENT_TYPES = frozenset(("ANGLE", "THETA", "ANGLE_DIFF", "THETA_DIFF"))
 _NORMAL_EQUATION_PATTERN_CACHE = {}
 _NORMAL_EQUATION_PATTERN_IDENTITY_CACHE = []
 _SPARSE_PATTERN_EXPANSION_CACHE = {}
@@ -275,34 +275,12 @@ def _as_array_dtype(values, dtype):
     return np.asarray(values, dtype=dtype)
 
 
-def angle_residual_mask(measurements: Sequence[object]) -> np.ndarray:
-    """Mark measurement rows whose residual lives on the circular angle domain."""
-    return np.fromiter(
-        (getattr(meas, "meas_type", None) in ANGLE_MEASUREMENT_TYPES for meas in measurements),
-        dtype=bool,
-        count=len(measurements),
-    )
-
-
-def wrap_angle_residual(residual: np.ndarray) -> np.ndarray:
-    """Map angle residuals to [-pi, pi) so 2*pi-equivalent angles stay close."""
-    return (residual + np.pi) % (2.0 * np.pi) - np.pi
-
-
 def measurement_residual(
     z: np.ndarray,
     z_est: np.ndarray,
-    angle_mask: np.ndarray = None,
-    has_angle_residuals: Optional[bool] = None,
 ) -> np.ndarray:
-    """Return z - h(x), wrapping only rows that represent angle measurements."""
-    residual = np.asarray(z, dtype=np.float64) - np.asarray(z_est, dtype=np.float64)
-    if has_angle_residuals is None:
-        has_angle_residuals = bool(angle_mask is not None and np.any(angle_mask))
-    if has_angle_residuals:
-        residual = residual.copy()
-        residual[angle_mask] = wrap_angle_residual(residual[angle_mask])
-    return residual
+    """Return z - h(x)."""
+    return np.asarray(z, dtype=np.float64) - np.asarray(z_est, dtype=np.float64)
 
 
 class SparseJacobianBuilder:
@@ -1992,7 +1970,7 @@ class CholmodAAtNormalEquationSolver:
         A_solve = A_csc
         self._last_factor_scaled = False
         self._last_unscaled_diag = None
-        if float(damping) >= 0.05 and int(A_csc.shape[0]) > 0 and A_csc.nnz > 0:
+        if float(damping) > 0.0 and int(A_csc.shape[0]) > 0 and A_csc.nnz > 0:
             diag_g = np.bincount(
                 A_csc.indices,
                 weights=A_csc.data * A_csc.data,
@@ -5646,5 +5624,123 @@ def build_switch_current_curvature_columns(
     data[1::2] = val1
     indptr = np.arange(0, 2 * k + 1, 2, dtype=np.int32)
     return SP_CSC_MATRIX((data, indices, indptr), shape=(int(n_state), k)), True
+
+
+def detect_active_box_pinned_cols(
+    x: np.ndarray,
+    rhs: np.ndarray,
+    v_cols: np.ndarray,
+    v_min: float,
+    v_max: float,
+    *,
+    margin: float = 1e-4,
+) -> np.ndarray:
+    """识别已紧贴电压盒约束边界且无约束下降方向指向墙外的活跃约束列索引集合 A。"""
+    if v_cols.size == 0 or x.size == 0 or rhs.size == 0:
+        return np.empty(0, dtype=np.intp)
+    v_vals = x[v_cols]
+    r_vals = rhs[v_cols]
+    lo_thr = float(v_min) + float(margin)
+    hi_thr = float(v_max) - float(margin)
+    pin_mask = ((v_vals <= lo_thr) & (r_vals < 0.0)) | ((v_vals >= hi_thr) & (r_vals > 0.0))
+    if not np.any(pin_mask):
+        return np.empty(0, dtype=np.intp)
+    return np.asarray(v_cols[pin_mask], dtype=np.intp)
+
+
+def solve_box_pinned_normal_equations(
+    normal_operand,
+    gain,
+    rhs: np.ndarray,
+    pinned_cols: np.ndarray,
+    *,
+    damping: float = 0.0,
+    solver_cache: Optional[Dict] = None,
+) -> Tuple[np.ndarray, bool]:
+    """在活跃盒约束集合 A 上施加精确等式约束 dx[A] = 0，求解自由子空间约化牛顿步。
+
+    构造块解耦系统 A_pin = [A_zeroed, E_A]，令 A_pin A_pin^T = blkdiag(G_FF, I_A) 且 rhs_pin[A] = 0，
+    从而精确得到 dx_F = (G_FF + beta I)^{-1} g_F、dx_A = 0：
+    - 无大数罚项条件数劣化，无论 beta == 0 或 beta > 0 均严格对称正定；
+    - 使用独立局部 solver_cache 复用同活跃集符号分析，绝不污染外层 BDR 持久因子。
+    """
+    n_state = int(rhs.size)
+    rhs_pin = np.asarray(rhs, dtype=np.float64).copy()
+    if pinned_cols.size == 0 or n_state == 0:
+        return np.full(n_state, np.nan, dtype=np.float64), False
+    rhs_pin[pinned_cols] = 0.0
+    beta = float(damping)
+    k = int(pinned_cols.size)
+
+    if normal_operand is not None and SP_ISSPARSE(normal_operand):
+        A_csc = normal_operand if getattr(normal_operand, "format", None) == "csc" else normal_operand.tocsc()
+        pin_mask = np.zeros(n_state, dtype=bool)
+        pin_mask[pinned_cols] = True
+        a_data = A_csc.data.copy()
+        a_data[pin_mask[A_csc.indices]] = 0.0
+        A_zero = SP_CSC_MATRIX((a_data, A_csc.indices, A_csc.indptr), shape=A_csc.shape, copy=False)
+        e_cols = np.arange(k + 1, dtype=np.int32)
+        e_rows = pinned_cols.astype(np.int32, copy=False)
+        e_data = np.ones(k, dtype=np.float64)
+        E_pin = SP_CSC_MATRIX((e_data, e_rows, e_cols), shape=(n_state, k))
+        A_pin = SP_HSTACK([A_zero, E_pin], format="csc")
+
+        pin_key = (tuple(int(c) for c in pinned_cols.tolist()), A_csc.shape, int(A_csc.nnz))
+        pin_solver = None
+        if solver_cache is not None:
+            if solver_cache.get("key") == pin_key and solver_cache.get("solver") is not None:
+                pin_solver = solver_cache["solver"]
+            else:
+                prev_s = solver_cache.get("solver")
+                if prev_s is not None and hasattr(prev_s, "_reset_pardiso"):
+                    try:
+                        prev_s._reset_pardiso()
+                    except Exception:
+                        pass
+                pin_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True, ordering_method="amd")
+                pin_solver._pardiso_disabled = True
+                solver_cache["key"] = pin_key
+                solver_cache["solver"] = pin_solver
+        else:
+            pin_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=False, ordering_method="amd")
+            pin_solver._pardiso_disabled = True
+
+        dx, _ = pin_solver.solve(
+            A_pin,
+            rhs_pin,
+            return_factor_diag=False,
+            damping=beta,
+            allow_slow_fallback=(n_state < 500 or beta >= 10.0),
+        )
+        if dx.size == n_state and np.all(np.isfinite(dx)):
+            dx[pinned_cols] = 0.0
+            return dx, True
+        return np.full(n_state, np.nan, dtype=np.float64), False
+
+    if gain is not None:
+        if SP_ISSPARSE(gain):
+            G_coo = gain.tocoo()
+            pin_mask = np.zeros(n_state, dtype=bool)
+            pin_mask[pinned_cols] = True
+            keep = (~pin_mask[G_coo.row]) & (~pin_mask[G_coo.col])
+            rows = np.concatenate([G_coo.row[keep], pinned_cols])
+            cols = np.concatenate([G_coo.col[keep], pinned_cols])
+            vals = np.concatenate([G_coo.data[keep], np.ones(k, dtype=np.float64)])
+            G_pin = SP_CSC_MATRIX((vals, (rows, cols)), shape=(n_state, n_state))
+            if beta > 0.0:
+                G_pin = G_pin + SP_EYE(n_state, format="csc", dtype=np.float64) * beta
+        else:
+            G_pin = np.array(gain, dtype=np.float64, copy=True)
+            G_pin[pinned_cols, :] = 0.0
+            G_pin[:, pinned_cols] = 0.0
+            G_pin[pinned_cols, pinned_cols] = 1.0
+            if beta > 0.0:
+                G_pin[np.diag_indices_from(G_pin)] += beta
+        dx, _ = NormalEquationSolver().solve(G_pin, rhs_pin, return_factor_diag=False)
+        if dx.size == n_state and np.all(np.isfinite(dx)):
+            dx[pinned_cols] = 0.0
+            return dx, True
+    return np.full(n_state, np.nan, dtype=np.float64), False
+
 
 

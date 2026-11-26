@@ -146,8 +146,6 @@ class StateEstimationParameters:
     prefilter_dead_island_zero_tol: float = 1e-3
     prefilter_voltage_min_pu: Optional[float] = 0.1
     prefilter_voltage_max_pu: Optional[float] = 1.9
-    prefilter_angle_min_deg: Optional[float] = -270.0
-    prefilter_angle_max_deg: Optional[float] = 270.0
     prefilter_power_min_pu: Optional[float] = -1e4
     prefilter_power_max_pu: Optional[float] = 1e4
     prefilter_ac_current_min_pu: Optional[float] = -1e-6
@@ -191,8 +189,6 @@ class StateEstimationParameters:
         prefilter_dead_island_zero_tol: Optional[float] = None,
         prefilter_voltage_min_pu: Any = _UNSET,
         prefilter_voltage_max_pu: Any = _UNSET,
-        prefilter_angle_min_deg: Any = _UNSET,
-        prefilter_angle_max_deg: Any = _UNSET,
         prefilter_power_min_pu: Any = _UNSET,
         prefilter_power_max_pu: Any = _UNSET,
         prefilter_ac_current_min_pu: Any = _UNSET,
@@ -263,8 +259,6 @@ class StateEstimationParameters:
             ),
             prefilter_voltage_min_pu=_opt_float(self.prefilter_voltage_min_pu, prefilter_voltage_min_pu),
             prefilter_voltage_max_pu=_opt_float(self.prefilter_voltage_max_pu, prefilter_voltage_max_pu),
-            prefilter_angle_min_deg=_opt_float(self.prefilter_angle_min_deg, prefilter_angle_min_deg),
-            prefilter_angle_max_deg=_opt_float(self.prefilter_angle_max_deg, prefilter_angle_max_deg),
             prefilter_power_min_pu=_opt_float(self.prefilter_power_min_pu, prefilter_power_min_pu),
             prefilter_power_max_pu=_opt_float(self.prefilter_power_max_pu, prefilter_power_max_pu),
             prefilter_ac_current_min_pu=_opt_float(self.prefilter_ac_current_min_pu, prefilter_ac_current_min_pu),
@@ -360,12 +354,6 @@ def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters
         ),
         prefilter_voltage_max_pu=_parse_opt_float(
             "prefilter_voltage_max_pu", float(values.get("voltage_max", "1.9"))
-        ),
-        prefilter_angle_min_deg=_parse_opt_float(
-            "prefilter_angle_min_deg", float(values.get("angle_min_deg", "-270.0"))
-        ),
-        prefilter_angle_max_deg=_parse_opt_float(
-            "prefilter_angle_max_deg", float(values.get("angle_max_deg", "270.0"))
         ),
         prefilter_power_min_pu=_parse_opt_float(
             "prefilter_power_min_pu", None if power_max is None else -abs(power_max)

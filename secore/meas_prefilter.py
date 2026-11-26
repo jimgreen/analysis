@@ -34,7 +34,6 @@ from model.meas_type import (
     DEVICE_TYPE_DCSwitchConstraint,
     DEVICE_TYPE_DCZeroBranch,
     DEVICE_TYPE_DCZeroBranchConstraint,
-    MEAS_TYPE_ANGLE,
     MEAS_TYPE_CODES,
     MEAS_TYPE_I_AC,
     MEAS_TYPE_I_DC,
@@ -77,7 +76,6 @@ REASON_INVALID = "invalid"
 REASON_DEAD_ISLAND_NONZERO = "dead_island_nonzero"
 REASON_DEAD_ISLAND = "dead_island"
 REASON_VOLTAGE_OUT_OF_RANGE = "voltage_out_of_range"
-REASON_ANGLE_OUT_OF_RANGE = "angle_out_of_range"
 REASON_POWER_OUT_OF_RANGE = "power_out_of_range"
 REASON_CURRENT_OUT_OF_RANGE = "current_out_of_range"
 REASON_PRESSURE_OUT_OF_RANGE = "pressure_out_of_range"
@@ -294,7 +292,6 @@ def prefilter_electric_measurements(
     dead_row_mask: Optional[np.ndarray] = None,
     dead_power_scale: float = 1.0,
     side: str = "ac",
-    angle_in_radians: bool = False,
     row_subset_mask: Optional[np.ndarray] = None,
     reasons: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -447,26 +444,6 @@ def prefilter_electric_measurements(
                 bad_mask = np.zeros(n_rows, dtype=bool)
                 bad_mask[bad_rows] = True
                 set_prefilter_reasons(reasons, bad_mask, REASON_VOLTAGE_OUT_OF_RANGE)
-                processable[bad_rows] = False
-
-    ang_min_deg = _opt_finite_limit(params, "prefilter_angle_min_deg")
-    ang_max_deg = _opt_finite_limit(params, "prefilter_angle_max_deg")
-    if ang_min_deg is not None or ang_max_deg is not None:
-        ang_mask = processable & (mt_code == MEAS_TYPE_ANGLE)
-        if np.any(ang_mask):
-            ang_rows = np.flatnonzero(ang_mask)
-            scale_factor = (math.pi / 180.0) if angle_in_radians else 1.0
-            a_min = None if ang_min_deg is None else ang_min_deg * scale_factor
-            a_max = None if ang_max_deg is None else ang_max_deg * scale_factor
-            a_bad = _check_bounds_violation(value[ang_rows], a_min, a_max)
-            if np.any(a_bad):
-                bad_rows = ang_rows[a_bad]
-                valid[bad_rows] = False
-                status[bad_rows] = MEAS_STATUS_INVALID
-                invalidated[bad_rows] = True
-                bad_mask = np.zeros(n_rows, dtype=bool)
-                bad_mask[bad_rows] = True
-                set_prefilter_reasons(reasons, bad_mask, REASON_ANGLE_OUT_OF_RANGE)
                 processable[bad_rows] = False
 
     p_min = _opt_finite_limit(params, "prefilter_power_min_pu")

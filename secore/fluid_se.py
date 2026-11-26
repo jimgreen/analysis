@@ -54,6 +54,7 @@ from secore.se_math import (
     filter_batch_preserving_column_coverage,
     measurement_leverage_for_bad_data,
     select_independent_bad_data_batch,
+    solve_box_pinned_normal_equations,
 )
 from secore.se_result import SEResult
 
@@ -507,9 +508,16 @@ class FluidStateEstimator:
         x = np.empty(self.state_count, dtype=np.float64)
         x[: self.n_potential] = pressure ** int(net.potential_power)
         if self.n_regulated:
-            x[self.base_regulated_flow : self.base_supply_temperature] = net.edge_flow_set[
-                net.regulated_edge_pos
-            ]
+            reg_edges = net.regulated_edge_pos
+            reg_flow = np.asarray(net.edge_flow_set[reg_edges], dtype=np.float64).copy()
+            # 显式调节支路（如 RATIO 模式 SteamPressureReducer，flow_set=0）若以精确 0 流量起步，
+            # 会恰好骑在热损/焓值上游追踪 flow=0 阶跃不连续悬崖上；按端点压差方向给予小非零物理初值
+            zero_mask = np.abs(reg_flow) < 1e-3
+            if np.any(zero_mask):
+                z_edges = reg_edges[zero_mask]
+                dp = pressure[net.edge_i[z_edges]] - pressure[net.edge_j[z_edges]]
+                reg_flow[zero_mask] = np.where(dp >= 0.0, 0.1, -0.1)
+            x[self.base_regulated_flow : self.base_supply_temperature] = reg_flow
         if net.thermal:
             if use_flat:
                 source_rows = np.flatnonzero(net.source_supply_temperature > 0.0)
@@ -2533,10 +2541,13 @@ class FluidStateEstimator:
         stagnation_streak = 0
         high_damp_stagnation_streak = 0
         high_damp_slow_streak = 0
+        low_progress_streak = 0
         fullstep_osc_streak = 0
+        smooth_fullstep_streak = 0
         curvature_damping_active = False
         prev_max_correction = np.inf
         tried_undamped_escape = False
+        pre_escape_max_correction = np.inf
         last_used_damping = 0.0
         self._last_aat_solver = None
         self._last_weight_used = weight
@@ -2568,29 +2579,50 @@ class FluidStateEstimator:
                     minlength=self.state_count,
                 )
                 diag_g = diag_pu / np.maximum(state_scales * state_scales, 1e-24)
+                pinned_pot = (
+                    np.flatnonzero((x[: self.n_potential] <= minimum + 1e-9) & (rhs_vec[: self.n_potential] < 0.0))
+                    if self.n_potential > 0
+                    else np.empty(0, dtype=np.intp)
+                )
                 if damping_val > 0.0:
                     # 在标幺正规方程上叠加 Jacobi 列均衡 Marquardt 相对阻尼
                     col_scale = 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12))
                     A_scaled = A_pu.copy()
                     A_scaled.data = A_pu.data * col_scale[A_pu.indices]
                     rhs_scaled = rhs_pu * col_scale
-                    dx_scaled, _ = aat_solver.solve(
-                        A_scaled,
-                        rhs_scaled,
-                        return_factor_diag=False,
-                        damping=damping_val,
-                    )
+                    if pinned_pot.size > 0:
+                        dx_scaled, ok_pin = solve_box_pinned_normal_equations(
+                            A_scaled, None, rhs_scaled, pinned_pot, damping=damping_val
+                        )
+                        if not ok_pin:
+                            raise RuntimeError("Pinned fluid AAt solve failed")
+                    else:
+                        dx_scaled, _ = aat_solver.solve(
+                            A_scaled,
+                            rhs_scaled,
+                            return_factor_diag=False,
+                            damping=damping_val,
+                        )
                     dx_pu = np.asarray(dx_scaled, dtype=np.float64) * col_scale
                 else:
-                    dx_raw, _ = aat_solver.solve(
-                        A_pu,
-                        rhs_pu,
-                        return_factor_diag=False,
-                        damping=0.0,
-                    )
+                    if pinned_pot.size > 0:
+                        dx_raw, ok_pin = solve_box_pinned_normal_equations(
+                            A_pu, None, rhs_pu, pinned_pot, damping=0.0
+                        )
+                        if not ok_pin:
+                            raise RuntimeError("Pinned fluid AAt solve failed")
+                    else:
+                        dx_raw, _ = aat_solver.solve(
+                            A_pu,
+                            rhs_pu,
+                            return_factor_diag=False,
+                            damping=0.0,
+                        )
                     dx_pu = np.asarray(dx_raw, dtype=np.float64)
+                if pinned_pot.size > 0:
+                    dx_pu[pinned_pot] = 0.0
                 dx_out = dx_pu * state_scales
-                return dx_out, rhs_vec, diag_g
+                return dx_out, rhs_vec, diag_g, pinned_pot
             # 中小规模路径同样在标幺状态空间 H_pu = H * D_x 组装良态正规方程
             H_pu = H_cur.copy()
             if H_pu.nnz > 0:
@@ -2601,6 +2633,11 @@ class FluidStateEstimator:
             rhs_vec = rhs_pu / np.maximum(state_scales, 1e-12)
             diag_pu = np.asarray(gain_pu.diagonal(), dtype=np.float64)
             diag_g = diag_pu / np.maximum(state_scales * state_scales, 1e-24)
+            pinned_pot = (
+                np.flatnonzero((x[: self.n_potential] <= minimum + 1e-9) & (rhs_vec[: self.n_potential] < 0.0))
+                if self.n_potential > 0
+                else np.empty(0, dtype=np.intp)
+            )
             zero_diag_mask = diag_pu <= 1e-12
             if damping_val > 0.0 or bool(np.any(zero_diag_mask)):
                 col_scale = np.where(zero_diag_mask, 1.0, 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12)))
@@ -2610,13 +2647,29 @@ class FluidStateEstimator:
                 diag_add = np.where(zero_diag_mask, 1.0 + eff_damp, eff_damp)
                 gain_reg = (scaled_g + diags(diag_add, format="csc")).tocsc()
                 rhs_scaled = np.where(zero_diag_mask, 0.0, rhs_pu * col_scale)
-                dx_scaled, _ = normal_solver.solve(gain_reg, rhs_scaled, return_factor_diag=False)
+                if pinned_pot.size > 0:
+                    dx_scaled, ok_pin = solve_box_pinned_normal_equations(
+                        None, gain_reg, rhs_scaled, pinned_pot, damping=0.0
+                    )
+                    if not ok_pin:
+                        raise RuntimeError("Pinned fluid normal solve failed")
+                else:
+                    dx_scaled, _ = normal_solver.solve(gain_reg, rhs_scaled, return_factor_diag=False)
                 dx_pu = np.where(zero_diag_mask, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
             else:
-                dx_pu, _ = normal_solver.solve(gain_pu, rhs_pu, return_factor_diag=False)
+                if pinned_pot.size > 0:
+                    dx_pu, ok_pin = solve_box_pinned_normal_equations(
+                        None, gain_pu, rhs_pu, pinned_pot, damping=0.0
+                    )
+                    if not ok_pin:
+                        raise RuntimeError("Pinned fluid normal solve failed")
+                else:
+                    dx_pu, _ = normal_solver.solve(gain_pu, rhs_pu, return_factor_diag=False)
+            if pinned_pot.size > 0:
+                dx_pu[pinned_pot] = 0.0
             dx_raw = np.asarray(dx_pu, dtype=np.float64) * state_scales
             gain = None
-            return dx_raw, rhs_vec, diag_g
+            return dx_raw, rhs_vec, diag_g, pinned_pot
 
         for iteration in range(1, self.max_iter + 1):
             if cached_z_est is not None:
@@ -2633,9 +2686,10 @@ class FluidStateEstimator:
             dx = None
             rhs = None
             diag_g = None
+            pinned_pot = np.empty(0, dtype=np.intp)
             step_damping = lm_damping
             try:
-                dx, rhs, diag_g = _solve_step(H, residual, step_damping)
+                dx, rhs, diag_g, pinned_pot = _solve_step(H, residual, step_damping)
             except (MatrixRankWarning, RuntimeError, ValueError):
                 dx = None
             if dx is None or (dx.size and not np.all(np.isfinite(dx))):
@@ -2644,9 +2698,9 @@ class FluidStateEstimator:
                     if beta_try <= step_damping:
                         continue
                     try:
-                        dx_try, rhs_try, diag_try = _solve_step(H, residual, beta_try)
+                        dx_try, rhs_try, diag_try, pin_try = _solve_step(H, residual, beta_try)
                         if dx_try.size == self.state_count and np.all(np.isfinite(dx_try)):
-                            dx, rhs, diag_g = dx_try, rhs_try, diag_try
+                            dx, rhs, diag_g, pinned_pot = dx_try, rhs_try, diag_try, pin_try
                             step_damping = beta_try
                             lm_damping = beta_try
                             break
@@ -2666,11 +2720,13 @@ class FluidStateEstimator:
                     f"max_dx={max_correction:.6e}, rel_dx={rel_correction:.3e}, "
                     f"damp={step_damping:.2e}, residual={np.linalg.norm(residual, np.inf):.6e}"
                 )
-            kkt_inf = (
-                float(np.max(np.abs(rhs) / np.maximum(diag_g, 1e-12)))
-                if (rhs is not None and diag_g is not None and rhs.size > 0)
-                else np.inf
-            )
+            if rhs is not None and diag_g is not None and rhs.size > 0:
+                rhs_kkt = rhs.copy() if pinned_pot.size > 0 else rhs
+                if pinned_pot.size > 0:
+                    rhs_kkt[pinned_pot] = 0.0
+                kkt_inf = float(np.max(np.abs(rhs_kkt) / np.maximum(diag_g, 1e-12)))
+            else:
+                kkt_inf = np.inf
             if step_damping == 0.0 and (
                 max_correction < self.tol
                 or (rel_correction < self.tol and max_correction < 1e-3)
@@ -2694,9 +2750,16 @@ class FluidStateEstimator:
             # J = sum(w * r^2) 的梯度为 -2 * H^T W r = -2 * rhs
             ls_slope = -2.0 * float(np.dot(rhs, dx)) if (rhs is not None and rhs.size == dx.size) else 0.0
             obj_tol = max(1e-14, 1e-11 * (abs(objective) + 1.0))
+            # 可压缩流体（potential_power > 1.0，如蒸汽/天然气 u = P^2）采用内点法防穿零保正下界：
+            # 单步压势最多缩减至当前的 1/4，避免高压平启动首步将下游多压级节点拍入 1e-12 真空奇点（dP/du -> ∞）
+            pot_floor = (
+                np.maximum(minimum, 0.25 * x[: self.n_potential])
+                if (self.n_potential > 0 and float(self.network.potential_power) > 1.0)
+                else minimum
+            )
             for _ in range(20):
                 candidate = x + step * dx
-                candidate[: self.n_potential] = np.maximum(candidate[: self.n_potential], minimum)
+                candidate[: self.n_potential] = np.maximum(candidate[: self.n_potential], pot_floor)
                 candidate_z_est = self.evaluate(candidate)
                 candidate_residual = z - candidate_z_est
                 candidate_objective = float(np.dot(weight, candidate_residual * candidate_residual))
@@ -2717,9 +2780,43 @@ class FluidStateEstimator:
                         step *= 0.5
                 else:
                     step *= 0.5
+            if not accepted and self.n_regulated > 0:
+                # 若热/汽显式调节支路恰好跨越 flow=0 上游追踪阶跃悬崖导致全部线搜索失败，
+                # 试探一次同侧锁止步（防止微步跨零触发焓值/温度阶跃暴涨）
+                reg_s = self.base_regulated_flow
+                reg_e = self.base_supply_temperature
+                x_reg = x[reg_s:reg_e]
+                dx_reg = dx[reg_s:reg_e]
+                cross_mask = ((x_reg >= 0.0) & (x_reg + dx_reg < 0.0)) | ((x_reg < 0.0) & (x_reg + dx_reg >= 0.0))
+                if np.any(cross_mask):
+                    clamp_step = 1.0
+                    for _ in range(8):
+                        cand_c = x + clamp_step * dx
+                        cand_c[: self.n_potential] = np.maximum(cand_c[: self.n_potential], pot_floor)
+                        reg_c = cand_c[reg_s:reg_e]
+                        pos_cross = (x_reg >= 0.0) & (reg_c < 1e-4)
+                        neg_cross = (x_reg < 0.0) & (reg_c > -1e-4)
+                        if np.any(pos_cross):
+                            reg_c[pos_cross] = 1e-4
+                        if np.any(neg_cross):
+                            reg_c[neg_cross] = -1e-4
+                        cand_c_z = self.evaluate(cand_c)
+                        cand_c_r = z - cand_c_z
+                        cand_c_obj = float(np.dot(weight, cand_c_r * cand_c_r))
+                        if np.isfinite(cand_c_obj) and cand_c_obj <= objective + obj_tol:
+                            x = cand_c
+                            cached_z_est = cand_c_z
+                            cached_residual = cand_c_r
+                            cached_objective = cand_c_obj
+                            accepted_step = clamp_step
+                            accepted = True
+                            break
+                        clamp_step *= 0.5
             if not accepted:
                 if tried_undamped_escape:
-                    # 连续停滞后尝试无阻尼脱困仍无法下降，确认已到达非光滑边界局部极小驻点
+                    # 连续停滞后尝试无阻尼脱困仍无法下降，确认已到达非光滑边界局部极小驻点并还原脱困前有效步长
+                    if np.isfinite(pre_escape_max_correction):
+                        max_correction = min(max_correction, pre_escape_max_correction)
                     converged = True
                     evaluated_at_final_x = True
                     break
@@ -2739,7 +2836,10 @@ class FluidStateEstimator:
                 backtrack_streak = max(0, backtrack_streak - 1)
                 if (
                     max_correction > max(self.tol, 1e-5)
-                    and max_correction >= 0.95 * prev_max_correction
+                    and (
+                        max_correction >= 0.95 * prev_max_correction
+                        or obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
+                    )
                     and obj_change <= 1e-4 * (abs(prev_objective) + 1.0)
                 ):
                     fullstep_osc_streak += 1
@@ -2752,20 +2852,39 @@ class FluidStateEstimator:
                     fullstep_osc_streak = 0
                 if lm_damping > 0.0:
                     if curvature_damping_active:
-                        if max_correction < 0.5 * prev_max_correction:
+                        if max_correction < prev_max_correction and cached_objective < prev_objective:
+                            smooth_fullstep_streak += 1
+                        else:
+                            smooth_fullstep_streak = 0
+                        if max_correction < 0.5 * prev_max_correction or smooth_fullstep_streak >= 3:
                             lm_damping = lm_damping * 0.5
+                            smooth_fullstep_streak = 0
                             if lm_damping < 1e-4:
                                 lm_damping = 0.0
                                 curvature_damping_active = False
                     else:
-                        lm_damping = lm_damping * 0.25
+                        smooth_fullstep_streak = 0
+                        # 高阻尼区 (>=0.5) 温和减半，避免 10 <-> 2.5 剧烈抖动；中低阻尼区快速释放
+                        lm_damping = lm_damping * (0.5 if lm_damping >= 0.5 else 0.25)
                         if lm_damping < 1e-6:
                             lm_damping = 0.0
             else:
-                fullstep_osc_streak = 0
+                smooth_fullstep_streak = 0
+                if (
+                    max_correction > max(self.tol, 1e-5)
+                    and obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
+                ):
+                    fullstep_osc_streak += 1
+                    if fullstep_osc_streak >= 4:
+                        lm_damping = min(100.0, max(lm_damping * 5.0, 0.1))
+                        curvature_damping_active = True
+                        fullstep_osc_streak = 0
+                else:
+                    fullstep_osc_streak = 0
                 backtrack_streak += 1
                 if backtrack_streak >= 2 or accepted_step < 1e-2:
-                    lm_damping = min(10.0, max(lm_damping * 10.0, 1e-3))
+                    bump = 3.0 if lm_damping >= 0.5 else 10.0
+                    lm_damping = min(10.0, max(lm_damping * bump, 1e-3))
                     backtrack_streak = 0
             prev_max_correction = max_correction
 
@@ -2785,14 +2904,23 @@ class FluidStateEstimator:
             #    先做 1 次无阻尼脱困试探，试探后仍停滞则优雅收敛，释放外层坏数据剔除流程。
             rel_obj_tol_high_damp = max(1e-12, 1e-5 * (abs(prev_objective) + 1.0))
             rel_obj_tol_slow = max(1e-12, 5e-4 * (abs(prev_objective) + 1.0))
+            rel_obj_tol_flat = max(1e-12, 1e-6 * (abs(prev_objective) + 1.0))
+            if obj_change <= rel_obj_tol_flat:
+                low_progress_streak += 1
+            else:
+                low_progress_streak = 0
             if tried_undamped_escape:
                 if obj_change <= max(1e-10, 5e-4 * (abs(prev_objective) + 1.0)):
+                    if np.isfinite(pre_escape_max_correction):
+                        max_correction = min(max_correction, pre_escape_max_correction)
                     converged = True
                     break
                 tried_undamped_escape = False
+                pre_escape_max_correction = np.inf
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak = 0
+                low_progress_streak = 0
             elif (
                 obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
                 and actual_rel_dx <= max(1e-6, self.tol)
@@ -2803,6 +2931,7 @@ class FluidStateEstimator:
                         lm_damping = 0.0
                         curvature_damping_active = False
                         tried_undamped_escape = True
+                        pre_escape_max_correction = max_correction
                         stagnation_streak = 0
                         high_damp_stagnation_streak = 0
                         high_damp_slow_streak = 0
@@ -2817,6 +2946,7 @@ class FluidStateEstimator:
                     lm_damping = 0.0
                     curvature_damping_active = False
                     tried_undamped_escape = True
+                    pre_escape_max_correction = max_correction
                     high_damp_stagnation_streak = 0
                     high_damp_slow_streak = 0
             elif step_damping >= 1.0 and obj_change <= rel_obj_tol_slow:
@@ -2827,7 +2957,22 @@ class FluidStateEstimator:
                     lm_damping = 0.0
                     curvature_damping_active = False
                     tried_undamped_escape = True
+                    pre_escape_max_correction = max_correction
                     high_damp_slow_streak = 0
+            elif low_progress_streak >= 12:
+                # 中低阻尼非光滑脊线微幅抖动（连续 12 步目标 6 位无实质进展）：触发无阻尼脱困确认，释放外层 BDR 剔坏
+                low_progress_streak = 0
+                stagnation_streak = 0
+                high_damp_stagnation_streak = 0
+                high_damp_slow_streak = 0
+                if step_damping > 0.0:
+                    lm_damping = 0.0
+                    curvature_damping_active = False
+                    tried_undamped_escape = True
+                    pre_escape_max_correction = max_correction
+                else:
+                    converged = True
+                    break
             else:
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
@@ -3031,6 +3176,18 @@ class FluidStateEstimator:
             blocked_rows_set = set()
 
             res = self.estimate(observability=obs, _weight_override=cur_weight)
+            if not res.converged and not self.params.flat_start:
+                flat_init_res = self.estimate(
+                    x0=self.initial_state(flat_start=True),
+                    observability=obs,
+                    _weight_override=cur_weight,
+                    _hint_lm_damping=0.0,
+                )
+                if flat_init_res.converged or (
+                    np.isfinite(flat_init_res.objective)
+                    and (not np.isfinite(res.objective) or flat_init_res.objective < res.objective)
+                ):
+                    res = flat_init_res
             if total_cap <= 0 or (not res.converged and not (obs.observable and np.isfinite(res.objective))):
                 self.identify_bad_data(res, threshold=threshold_value, weight_override=cur_weight)
                 return res, removed_items
@@ -3135,7 +3292,7 @@ class FluidStateEstimator:
                     # 热启动未能收敛时自动以平启动重试一次，避免被高阻尼坏初值锁死
                     if not trial_res.converged:
                         flat_res = self.estimate(
-                            x0=None,
+                            x0=self.initial_state(flat_start=True),
                             observability=obs,
                             _weight_override=t_weight,
                             _hint_lm_damping=0.0,

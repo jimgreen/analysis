@@ -37,20 +37,8 @@ MEAS_COLS = {
     "source_row": 9,
 }
 
-ANGLE_MEASUREMENT_TYPE_CODES = np.asarray(
-    [
-        MEAS_TYPE_CODES["ANGLE"],
-        MEAS_TYPE_CODES["THETA"],
-        MEAS_TYPE_CODES["ANGLE_DIFF"],
-        MEAS_TYPE_CODES["THETA_DIFF"],
-    ],
-    dtype=np.int16,
-)
-ANGLE_MEASUREMENT_TYPES = frozenset(MEAS_TYPE_NAMES[int(code)] for code in ANGLE_MEASUREMENT_TYPE_CODES)
-
 _DEVICE_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in DEVICE_TYPE_CODES.items()}
 _MEAS_TYPE_CODES_BYTES = {name.encode("utf8"): int(code) for name, code in MEAS_TYPE_CODES.items()}
-_ANGLE_CODE_SET = frozenset(int(code) for code in ANGLE_MEASUREMENT_TYPE_CODES.tolist())
 _STATUS_BYTES_FAST_MAP = {
     b"0": MEAS_STATUS_NORMAL,
     b"NORMAL": MEAS_STATUS_NORMAL,
@@ -194,7 +182,7 @@ def _build_ppc(
             zip(device_names.astype(object, copy=False).tolist(), range(int(device_names.size)))
         )
     if angle_mask is None:
-        angle_mask = np.isin(meas_type_code, ANGLE_MEASUREMENT_TYPE_CODES)
+        angle_mask = np.zeros(count, dtype=bool)
     if include_matrix:
         meas = np.zeros((count, len(MEAS_COLS)), dtype=np.float64, order="F")
         if count:
@@ -689,7 +677,6 @@ def _try_parse_meas_ppc_bulk_bytes(
     mt_code_map = dict(_MEAS_TYPE_CODES_BYTES)
     name_to_id: Dict[bytes, int] = {}
     unique_name_bytes = []
-    has_angle_meas = False
 
     # 非字符串数组模式优先调用 C++17 单遍 std::from_chars 高速解析核，失败自动回退下方分块路径
     native_unique_names = None
@@ -730,15 +717,6 @@ def _try_parse_meas_ppc_bulk_bytes(
         name_to_id = dict(zip(uniq_bytes_list, range(len(uniq_bytes_list))))
         device_names_list = native_unique_names.decode("utf8").split("\n") if native_unique_names else []
         device_names_arr = np.asarray(device_names_list, dtype=object)
-        c0, c1, c2, c3 = (int(c) for c in ANGLE_MEASUREMENT_TYPE_CODES.tolist())
-        has_angle_meas = bool(
-            np.any(
-                (meas_type_code_array == c0)
-                | (meas_type_code_array == c1)
-                | (meas_type_code_array == c2)
-                | (meas_type_code_array == c3)
-            )
-        )
         name_arr = device_type_arr = device_name_arr = meas_type_arr = None
         device_name_id_by_name = None
     else:
@@ -867,8 +845,6 @@ def _try_parse_meas_ppc_bulk_bytes(
                 if code is None:
                     code = _MEAS_TYPE_CODES_BYTES.get(tok.upper(), 0)
                     mt_code_map[tok] = code
-                if not has_angle_meas and code in _ANGLE_CODE_SET:
-                    has_angle_meas = True
             meas_type_code_array[row_off:row_end] = np.fromiter(
                 map(mt_code_map.__getitem__, meas_toks), dtype=np.int16, count=c_rows
             )
@@ -941,7 +917,7 @@ def _try_parse_meas_ppc_bulk_bytes(
         else:
             rows_by_code = _rows_by_device_type_code_fast(device_type_code_array)
 
-    angle_mask = None if has_angle_meas else np.zeros(n_rows, dtype=bool)
+    angle_mask = np.zeros(n_rows, dtype=bool)
     return _build_ppc(
         source=source,
         idx=idx_array,
