@@ -4320,8 +4320,15 @@ class HybridPowerFlowCalc:
                     plan.power_scale,
                 )
                 status = "balanced" if abs(residual) <= max(self.tol, 1e-9) else "mismatch"
-            elif coupling.active and coupling.supports_energy_balance:
+            elif coupling.active and (
+                coupling.is_electric_heat_control
+                or coupling.is_gas_heat_control
+                or coupling.is_steam_electric_control
+            ):
+                status = "unavailable"
+            elif coupling.active and coupling.supports_energy_balance and coupling.energy_factor is not None:
                 factor = float(coupling.energy_factor)
+                eff = 1.0 if coupling.efficiency is None else float(coupling.efficiency)
                 t1_energy = (
                     abs(t1_value) * self.network.p_base_kW
                     if t1_unit == "pu"
@@ -4332,8 +4339,10 @@ class HybridPowerFlowCalc:
                     if t2_unit == "pu"
                     else abs(t2_value) * factor
                 )
-                residual = t2_energy - t1_energy * float(coupling.efficiency)
+                residual = t2_energy - t1_energy * eff
                 status = "balanced" if abs(residual) <= max(self.tol, 1e-9) else "mismatch"
+            elif coupling.active:
+                status = "unavailable"
             results.append(
                 SimpleNamespace(
                     coupling=coupling,

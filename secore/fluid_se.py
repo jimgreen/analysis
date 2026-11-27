@@ -22,6 +22,7 @@ from algorithm_parameters import (
     DEFAULT_SE_PARAMETER_FILE,
     StateEstimationParameters,
     load_se_parameters,
+    resolve_auto_extreme_bad_data_caps,
     resolve_bad_data_limits,
 )
 from lfcore.common import allocate_limited_residual
@@ -40,10 +41,12 @@ from model.meas_model import (
     ObservabilityResult,
     TableBackedMeasurementList,
     measurement_from_table_row,
+    measurement_table_bad_data_protected_mask,
     measurement_table_from_measurements,
     measurement_table_status_code,
 )
 from model.meas_type import DEVICE_TYPE_CODES, DEVICE_TYPE_NAMES, MEAS_TYPE_CODES, MEAS_TYPE_NAMES
+from secore.se_array_plan import concat_measurement_tables
 from secore.se_math import (
     AndersonAccelerator,
     NielsenTrustRegionController,
@@ -84,6 +87,7 @@ SUPPORTED_MEASUREMENT_TYPES = frozenset(
         "H_TO",
         "T_FROM",
         "T_TO",
+        "FLOW_BALANCE",
     }
 )
 _DEVICE_TYPE_ALIASES = {
@@ -179,6 +183,7 @@ class FluidStateEstimator:
         if net.steam:
             self.state_labels.extend(f"SteamNode:{name}:ENTHALPY" for name in net.node_name.tolist())
         self.measurements = self._load_measurements()
+        self._zi_constraints_checked = False
         self._install_measurement_runtime()
         self.prepared = True
         return self
@@ -761,6 +766,9 @@ class FluidStateEstimator:
         # 常量通道（如固定 Load FLOW / 非显式回水 HeatLoad HEAT）
         const_rows: List[int] = []
         const_vals: List[float] = []
+        # 零注入汇流节点质量流量守恒通道: (incidence @ flow)[zi_nodes] = 0
+        zi_rows: List[int] = []
+        zi_nodes: List[int] = []
 
         fallback_items = []
         has_source_meas = False
@@ -824,6 +832,7 @@ class FluidStateEstimator:
             mt_hf = int(MEAS_TYPE_CODES.get("H_FROM", -1))
             mt_ht = int(MEAS_TYPE_CODES.get("H_TO", -1))
             mt_heat = int(MEAS_TYPE_CODES.get("HEAT", -1))
+            mt_fbal = int(MEAS_TYPE_CODES.get("FLOW_BALANCE", -1))
 
             p_rows_chunks: List[np.ndarray] = []
             p_nodes_chunks: List[np.ndarray] = []
@@ -853,6 +862,8 @@ class FluidStateEstimator:
             is_load = dt_arr == load_dtc
 
             # 1. Node 量测
+            zi_rows_arr = np.empty(0, dtype=np.int32)
+            zi_nodes_arr = np.empty(0, dtype=np.int64)
             if np.any(is_node):
                 m = is_node & (mt_arr == mt_p)
                 if np.any(m):
@@ -860,6 +871,13 @@ class FluidStateEstimator:
                     p_rows_chunks.append(r.astype(np.int32))
                     p_nodes_chunks.append(pos_arr[r].astype(np.int32))
                     handled[r] = True
+                if mt_fbal >= 0:
+                    m_zb = is_node & (mt_arr == mt_fbal)
+                    if np.any(m_zb):
+                        r_zb = np.flatnonzero(m_zb)
+                        zi_rows_arr = r_zb.astype(np.int32)
+                        zi_nodes_arr = pos_arr[r_zb].astype(np.int64)
+                        handled[r_zb] = True
                 if net.thermal:
                     m = is_node & ((mt_arr == mt_ts) | (mt_arr == mt_temp))
                     if np.any(m):
@@ -1188,6 +1206,8 @@ class FluidStateEstimator:
                 "adv_reg_col": _cat(adv_rc_chunks, np.int32),
                 "const_rows": _cat(const_rows_chunks, np.int32),
                 "const_vals": _cat(const_vals_chunks, np.float64),
+                "zi_rows": zi_rows_arr,
+                "zi_incidence": net.incidence[zi_nodes_arr].tocsr() if zi_rows_arr.size else None,
                 "fallback_items": fallback_items,
                 "has_source_meas": has_source_meas,
                 "fallback_needs_flow_deriv": fallback_needs_flow_deriv,
@@ -1205,6 +1225,9 @@ class FluidStateEstimator:
                 if meas_type == "PRESSURE":
                     p_rows.append(row)
                     p_nodes.append(pos)
+                elif meas_type == "FLOW_BALANCE":
+                    zi_rows.append(row)
+                    zi_nodes.append(pos)
                 elif net.thermal and meas_type in ("T_SUPPLY", "TEMPERATURE"):
                     lin_rows.append(row)
                     lin_cols.append(self.base_temperature + int(net.supply_temperature_state_by_node[pos]))
@@ -1405,6 +1428,8 @@ class FluidStateEstimator:
             "adv_reg_col": np.asarray(adv_reg_col, dtype=np.int32),
             "const_rows": np.asarray(const_rows, dtype=np.int32),
             "const_vals": np.asarray(const_vals, dtype=np.float64),
+            "zi_rows": np.asarray(zi_rows, dtype=np.int32),
+            "zi_incidence": net.incidence[np.asarray(zi_nodes, dtype=np.int64)].tocsr() if zi_rows else None,
             "fallback_items": fallback_items,
             "has_source_meas": has_source_meas,
             "fallback_needs_flow_deriv": fallback_needs_flow_deriv,
@@ -1435,6 +1460,9 @@ class FluidStateEstimator:
         const_rows = plan["const_rows"]
         if const_rows.size:
             values[const_rows] = plan["const_vals"]
+        zi_rows = plan["zi_rows"]
+        if zi_rows.size:
+            values[zi_rows] = np.asarray(plan["zi_incidence"] @ flow, dtype=np.float64)
         adv_rows = plan["adv_rows"]
         if adv_rows.size:
             f_val = flow[plan["adv_pos"]]
@@ -1770,6 +1798,16 @@ class FluidStateEstimator:
                     col_parts.append(reg_dn[rm])
                     data_parts.append(flow_scale[rm])
 
+        zi_rows = plan["zi_rows"]
+        flow_derivative = None
+        if zi_rows.size:
+            flow_derivative = self._build_flow_derivative_csr(passive_deriv)
+            zi_jac = (plan["zi_incidence"] @ flow_derivative).tocoo()
+            if zi_jac.nnz > 0:
+                row_parts.append(zi_rows[zi_jac.row].astype(np.int32, copy=False))
+                col_parts.append(zi_jac.col.astype(np.int32, copy=False))
+                data_parts.append(np.asarray(zi_jac.data, dtype=np.float64))
+
         fallback_items = plan["fallback_items"]
         if not fallback_items:
             if not row_parts:
@@ -1779,11 +1817,8 @@ class FluidStateEstimator:
                 shape=(len(active), self.state_count),
             ).tocsr()
 
-        flow_derivative = (
-            self._build_flow_derivative_csr(passive_deriv)
-            if plan["fallback_needs_flow_deriv"]
-            else None
-        )
+        if flow_derivative is None and plan["fallback_needs_flow_deriv"]:
+            flow_derivative = self._build_flow_derivative_csr(passive_deriv)
         source_flow, source_derivatives = (
             self._source_flow_and_derivative(x, flow, flow_derivative, need_derivative=True)
             if plan["has_source_meas"]
@@ -2327,25 +2362,397 @@ class FluidStateEstimator:
                 )
         return None
 
+    def _zero_injection_node_positions(self) -> np.ndarray:
+        """识别无源（含储能）、无荷、无换热器连接且关联活跃管段的纯中间汇流零注入节点。"""
+        net = self.network
+        n_node = len(net.nodes)
+        if n_node == 0 or net.incidence.shape != (n_node, len(net.edges)):
+            return np.empty(0, dtype=np.int64)
+        edge_deg = np.diff(net.incidence.indptr)
+        has_ext = (np.abs(net.demand) > 1e-12) | (np.abs(net.fixed_injection) > 1e-12)
+        for attr in (
+            "source_supply_node_pos",
+            "source_return_node_pos",
+            "source_node_pos",
+            "load_supply_node_pos",
+            "load_return_node_pos",
+            "load_node_pos",
+            "exchanger_primary_supply",
+            "exchanger_primary_return",
+            "exchanger_secondary_supply",
+            "exchanger_secondary_return",
+            "exchanger_i",
+            "exchanger_j",
+        ):
+            arr = np.asarray(getattr(net, attr, ()), dtype=np.int64)
+            valid = arr[(arr >= 0) & (arr < n_node)]
+            if valid.size:
+                has_ext[valid] = True
+        return np.flatnonzero((~has_ext) & (edge_deg > 0)).astype(np.int64)
+
+    def _ensure_zero_injection_flow_balance_constraints(self) -> None:
+        """为纯中间汇流零注入节点追加行均衡紧质量流量守恒约束 (incidence @ flow)[zi] = 0。"""
+        if getattr(self, "_zi_constraints_checked", False):
+            return
+        self._zi_constraints_checked = True
+        net = self.network
+        zi_nodes = self._zero_injection_node_positions()
+        if zi_nodes.size == 0 or len(self.active_measurements) == 0:
+            return
+
+        node_dt_name = f"{net.prefix}Node"
+        node_dtc = int(DEVICE_TYPE_CODES.get(node_dt_name, 0))
+        fbal_mtc = int(MEAS_TYPE_CODES.get("FLOW_BALANCE", 0))
+        act_tbl = getattr(self.active_measurements, "table", None)
+        if (
+            act_tbl is not None
+            and int(act_tbl.idx.size) == len(self.active_measurements)
+            and getattr(act_tbl, "device_pos", None) is not None
+            and getattr(act_tbl, "meas_type_code", None) is not None
+        ):
+            mt_arr = np.asarray(act_tbl.meas_type_code, dtype=np.int16)
+            dt_arr = np.asarray(act_tbl.device_type_code, dtype=np.int16)
+            dp_arr = np.asarray(act_tbl.device_pos, dtype=np.int64)
+            already = dp_arr[(dt_arr == node_dtc) & (mt_arr == fbal_mtc)]
+            if already.size:
+                zi_nodes = zi_nodes[~np.isin(zi_nodes, already)]
+            base_z = np.asarray(act_tbl.value, dtype=np.float64)
+            base_w = np.asarray(act_tbl.weight, dtype=np.float64)
+        else:
+            already_set = {
+                int(m.device_pos)
+                for m in self.active_measurements
+                if str(m.device_type) == node_dt_name and str(m.meas_type) == "FLOW_BALANCE"
+            }
+            if already_set:
+                zi_nodes = np.asarray([p for p in zi_nodes.tolist() if p not in already_set], dtype=np.int64)
+            base_z = np.asarray([float(m.value) for m in self.active_measurements], dtype=np.float64)
+            base_w = np.asarray([float(m.weight) for m in self.active_measurements], dtype=np.float64)
+        if zi_nodes.size == 0:
+            return
+
+        # 特征流量尺度 f_base
+        f_samples = []
+        for arr in (
+            getattr(net, "edge_flow_set", None),
+            getattr(net, "source_flow_set", None),
+            getattr(net, "demand", None),
+            np.abs(getattr(net, "fixed_injection", ())),
+        ):
+            if arr is not None:
+                a = np.abs(np.asarray(arr, dtype=np.float64))
+                a = a[np.isfinite(a) & (a > 1e-6)]
+                if a.size:
+                    f_samples.append(a)
+        f_base = max(float(np.median(np.concatenate(f_samples))) if f_samples else 1.0, 1e-3)
+
+        # 检测外部测点是否直接由人工手写非守恒状态生成：
+        # 仅当外部测点在无权重相对物理偏差与加权残差上均紧贴模型初值（免疫异构低权重干扰），
+        # 且即便自由调节受控支路流量 q_reg 后非源非换热节点仍严重违背质量守恒时豁免紧约束。
+        x_model = self.initial_state(flat_start=False)
+        z_model = self.evaluate(x_model)
+        pos_w_mask = np.isfinite(base_w) & (base_w > 0.0) & np.isfinite(base_z) & np.isfinite(z_model)
+        if np.count_nonzero(pos_w_mask) >= 4:
+            z_obs_v = base_z[pos_w_mask]
+            z_mod_v = z_model[pos_w_mask]
+            w_res = np.sqrt(base_w[pos_w_mask]) * np.abs(z_obs_v - z_mod_v)
+            rel_scale = np.maximum(np.abs(z_mod_v), max(f_base, 1.0))
+            rel_diff = np.abs(z_obs_v - z_mod_v) / rel_scale
+            if (
+                float(np.percentile(rel_diff, 65)) <= 3.0e-3
+                and float(np.median(w_res)) <= 0.8
+                and float(np.percentile(w_res, 75)) <= 1.5
+            ):
+                chk_mask = np.ones(len(net.nodes), dtype=bool)
+                psrc_mask = np.asarray(net.source_is_pressure_controlled, dtype=bool)
+                if np.any(psrc_mask):
+                    psrc_nodes = np.asarray(net.source_supply_node_pos, dtype=np.int64)[psrc_mask]
+                    psrc_nodes = psrc_nodes[(psrc_nodes >= 0) & (psrc_nodes < len(net.nodes))]
+                    chk_mask[psrc_nodes] = False
+                for ex_attr in (
+                    "exchanger_primary_supply",
+                    "exchanger_primary_return",
+                    "exchanger_secondary_supply",
+                    "exchanger_secondary_return",
+                    "exchanger_i",
+                    "exchanger_j",
+                ):
+                    ex_arr = np.asarray(getattr(net, ex_attr, ()), dtype=np.int64)
+                    ex_arr = ex_arr[(ex_arr >= 0) & (ex_arr < len(net.nodes))]
+                    if ex_arr.size:
+                        chk_mask[ex_arr] = False
+                chk_nodes = np.flatnonzero(chk_mask)
+                if chk_nodes.size > 0:
+                    _, flow_m, _ = self._flow_state_arrays(x_model, need_derivative=False)
+                    flow_passive_only = flow_m.copy()
+                    if net.regulated_edge_pos.size:
+                        flow_passive_only[net.regulated_edge_pos] = 0.0
+                    rhs_mis = (
+                        np.asarray(net.incidence[chk_nodes] @ flow_passive_only, dtype=np.float64)
+                        + np.asarray(net.fixed_injection[chk_nodes], dtype=np.float64)
+                        - np.asarray(net.demand[chk_nodes], dtype=np.float64)
+                    )
+                    if net.regulated_edge_pos.size:
+                        from scipy.sparse.linalg import lsqr as sp_lsqr
+
+                        B_reg = net.incidence[chk_nodes][:, net.regulated_edge_pos]
+                        q_opt = sp_lsqr(B_reg, -rhs_mis, iter_lim=100)[0]
+                        min_mis = float(np.max(np.abs(B_reg @ q_opt + rhs_mis)))
+                    else:
+                        min_mis = float(np.max(np.abs(rhs_mis)))
+                    f_scale_chk = max(f_base, float(np.median(np.abs(flow_m))) if flow_m.size else 1.0, 1e-3)
+                    if min_mis > 0.15 * f_scale_chk:
+                        return
+
+        # 行均衡紧约束定权：避开平启动 delta=0 奇异导数虚高，按高分位真实测点标幺行刚度赋紧权重
+        state_scales = self.state_base_scales()
+        pot_base = float(state_scales[0]) if self.n_potential > 0 else 1.0
+        pot_model = np.asarray(x_model[: self.n_potential], dtype=np.float64)
+        passive = net.passive_edge_pos
+        if passive.size:
+            pi = net.edge_i[passive]
+            pj = net.edge_j[passive]
+            cond_p = np.maximum(np.asarray(net.edge_conductance[passive], dtype=np.float64), 1e-6)
+            typ_delta = np.maximum(
+                np.abs(pot_model[pi] - pot_model[pj]),
+                np.maximum((f_base / cond_p) ** 2, 1.0e-3 * pot_base),
+            )
+            typ_passive_deriv = 0.5 * np.asarray(net.edge_conductance[passive], dtype=np.float64) / np.sqrt(
+                np.maximum(typ_delta, 1e-8)
+            )
+        else:
+            typ_passive_deriv = None
+
+        H_real = self.jacobian_sparse(x_model)
+        H_real_pu = H_real.copy()
+        if H_real_pu.nnz > 0:
+            H_real_pu.data = H_real.data * state_scales[H_real.indices]
+        row_sq = np.asarray(H_real_pu.power(2).sum(axis=1)).reshape(-1)
+        row_e = base_w * row_sq
+        valid_e = row_e[np.isfinite(row_e) & (row_e > 1e-12) & (row_e < 1e14)]
+        med_e = float(np.median(valid_e)) if valid_e.size else 100.0
+        ref_e = (
+            max(float(np.percentile(valid_e, 85)), 0.25 * float(np.max(valid_e)))
+            if valid_e.size
+            else 100.0
+        )
+        cap_e = max(6.0e6 * max(med_e, 1.0), 8.0e4 * ref_e)
+        target_e = min(max(5.0e4 * ref_e, 5.0e5), cap_e)
+
+        flow_deriv = self._build_flow_derivative_csr(typ_passive_deriv)
+        zi_jac = (net.incidence[zi_nodes] @ flow_deriv).tocsr()
+        zi_jac_pu = zi_jac.copy()
+        if zi_jac_pu.nnz > 0:
+            zi_jac_pu.data = zi_jac.data * state_scales[zi_jac.indices]
+        zi_row_sq = np.asarray(zi_jac_pu.power(2).sum(axis=1)).reshape(-1)
+        min_row_sq = max(f_base * f_base * 1e-4, 1e-8)
+        fin_pos_w = base_w[np.isfinite(base_w) & (base_w > 0.0)]
+        max_real_w = float(np.max(fin_pos_w)) if fin_pos_w.size else 100.0
+        max_zi_w = min(max(1.5e7, 200.0 * max_real_w), 1.0e8)
+        zi_weights = np.clip(target_e / np.maximum(zi_row_sq, min_row_sq), 100.0, max_zi_w)
+
+        all_tbl = getattr(self.measurements, "table", None)
+        if all_tbl is not None and int(all_tbl.idx.size) > 0:
+            next_idx = int(np.max(all_tbl.idx)) + 1
+            if len(self.measurements) > int(all_tbl.idx.size):
+                for tpos in range(int(all_tbl.idx.size), len(self.measurements)):
+                    next_idx = max(next_idx, int(self.measurements[tpos].idx) + 1)
+        else:
+            next_idx = max((int(item.idx) for item in self.measurements), default=0) + 1
+
+        n_zi = int(zi_nodes.size)
+        if (
+            isinstance(self.active_measurements, TableBackedMeasurementList)
+            and act_tbl is not None
+            and int(act_tbl.idx.size) == len(self.active_measurements)
+        ):
+            zi_idx = np.arange(next_idx, next_idx + n_zi, dtype=np.int64)
+            has_str_cols = int(act_tbl.name.size) == int(act_tbl.idx.size)
+            if has_str_cols:
+                zi_names = np.asarray([f"constraint_flow_balance_{net.node_name[p]}" for p in zi_nodes.tolist()], dtype=object)
+                zi_dtypes = np.full(n_zi, node_dt_name, dtype=object)
+                zi_dnames = np.asarray([str(net.node_name[p]) for p in zi_nodes.tolist()], dtype=object)
+                zi_mtypes = np.full(n_zi, "FLOW_BALANCE", dtype=object)
+            else:
+                zi_names = np.empty(0, dtype=object)
+                zi_dtypes = np.empty(0, dtype=object)
+                zi_dnames = np.empty(0, dtype=object)
+                zi_mtypes = np.empty(0, dtype=object)
+            dev_names_dict = getattr(act_tbl, "device_names", None)
+            zi_dn_id = None
+            if dev_names_dict is not None and getattr(act_tbl, "device_name_id", None) is not None:
+                dn_list = [str(x) for x in np.asarray(dev_names_dict, dtype=object).tolist()]
+                dn_map = {nm: idx_n for idx_n, nm in enumerate(dn_list)}
+                zi_dn_id = np.empty(n_zi, dtype=np.int64)
+                for k_i, p_node in enumerate(zi_nodes.tolist()):
+                    nm_node = str(net.node_name[p_node])
+                    if nm_node not in dn_map:
+                        dn_map[nm_node] = len(dn_list)
+                        dn_list.append(nm_node)
+                    zi_dn_id[k_i] = dn_map[nm_node]
+                dev_names_dict = np.asarray(dn_list, dtype=object)
+                act_tbl.device_names = dev_names_dict
+
+            zi_tbl = MeasurementTable(
+                idx=zi_idx,
+                name=zi_names,
+                device_type=zi_dtypes,
+                device_name=zi_dnames,
+                meas_type=zi_mtypes,
+                weight=zi_weights,
+                valid=np.ones(n_zi, dtype=bool),
+                value=np.zeros(n_zi, dtype=np.float64),
+                device_type_code=np.full(n_zi, node_dtc, dtype=np.int16),
+                angle_mask=np.zeros(n_zi, dtype=bool),
+                status_code=np.full(n_zi, MEAS_STATUS_NORMAL, dtype=np.int16),
+                meas_type_code=np.full(n_zi, fbal_mtc, dtype=np.int16),
+                device_pos=zi_nodes.copy(),
+                device_name_id=zi_dn_id,
+                device_names=dev_names_dict,
+            )
+            merged_act = concat_measurement_tables(act_tbl, zi_tbl)
+            merged_act.device_names = dev_names_dict
+            self.active_measurements = TableBackedMeasurementList(merged_act, normalized=True)
+            if isinstance(self.measurements, TableBackedMeasurementList) and all_tbl is not None and int(all_tbl.idx.size) == len(self.measurements):
+                merged_all = concat_measurement_tables(all_tbl, zi_tbl)
+                merged_all.device_names = dev_names_dict
+                self.measurements = TableBackedMeasurementList(merged_all, normalized=self.measurements.normalized)
+            self._rebuild_measurement_groups()
+            return
+
+        zi_objs = [
+            Measurement(
+                next_idx + k_i,
+                f"constraint_flow_balance_{net.node_name[p_node]}",
+                node_dt_name,
+                str(net.node_name[p_node]),
+                "FLOW_BALANCE",
+                float(zi_weights[k_i]),
+                True,
+                0.0,
+                status=MEAS_STATUS_NORMAL,
+                device_type_code=node_dtc,
+                meas_type_code=fbal_mtc,
+                device_pos=int(p_node),
+            )
+            for k_i, p_node in enumerate(zi_nodes.tolist())
+        ]
+        self.measurements.extend(zi_objs)
+        self.active_measurements.extend(zi_objs)
+        self._rebuild_measurement_groups()
+
     def analyze_observability(self, *, add_pseudo: bool = True) -> ObservabilityResult:
         if not self.prepared:
             self.prepare()
         x = self.initial_state()
+        # 在挂载零注入约束前，先基于纯外部真实量测检查显式受控支路是否缺乏直接流量测点支撑（仅靠 1e-10 热损导数）
+        weak_reg_cols = np.empty(0, dtype=np.int64)
+        fragile_upwind_h_cols = np.empty(0, dtype=np.int64)
+        max_add = int(self.params.targeted_pseudo_measurement_max)
+        if add_pseudo and self.n_regulated > 0:
+            H_ext = self.jacobian_sparse(x)
+            state_scales = self.state_base_scales()
+            reg_cols = np.arange(self.base_regulated_flow, self.base_supply_temperature, dtype=np.int64)
+            H_ext_csc = H_ext.tocsc()
+            weak_list = []
+            for rc in reg_cols.tolist():
+                c_slice = H_ext_csc.data[H_ext_csc.indptr[rc] : H_ext_csc.indptr[rc + 1]]
+                col_norm_pu = float(np.linalg.norm(c_slice)) * float(state_scales[rc]) if c_slice.size else 0.0
+                if col_norm_pu < 1e-2:
+                    weak_list.append(rc)
+            if weak_list:
+                weak_reg_cols = np.asarray(weak_list, dtype=np.int64)
+
+        # 蒸汽管网硬迎风防翻转盲区锚定：识别缺乏节点/源/荷流向无关直接热力测点支撑的比焓状态列，
+        # 避免平启动 flow=0 默认首端上游掩盖纯汇点盲区，导致收敛流向反转后比焓列退化为全零奇异列
+        if add_pseudo and max_add > 0 and self.network.steam and self.state_count > self.base_enthalpy:
+            net_s = self.network
+            n_nodes_s = len(net_s.nodes)
+            direct_h_anchored = np.zeros(n_nodes_s, dtype=bool)
+            h_mt_codes = {int(MEAS_TYPE_CODES[k]) for k in ("ENTHALPY", "TEMPERATURE") if k in MEAS_TYPE_CODES}
+            heat_mt_code = int(MEAS_TYPE_CODES.get("HEAT", -1))
+            node_dtc_s = int(DEVICE_TYPE_CODES.get(f"{net_s.prefix}Node", -2))
+            src_dtc_s = int(DEVICE_TYPE_CODES.get(f"{net_s.prefix}Source", -2))
+            ld_dtc_s = int(DEVICE_TYPE_CODES.get(f"{net_s.prefix}Load", -2))
+            act_tbl_s = getattr(self.active_measurements, "table", None)
+            if (
+                act_tbl_s is not None
+                and int(act_tbl_s.idx.size) == len(self.active_measurements)
+                and getattr(act_tbl_s, "device_pos", None) is not None
+                and getattr(act_tbl_s, "meas_type_code", None) is not None
+            ):
+                dt_a = np.asarray(act_tbl_s.device_type_code, dtype=np.int16)
+                mt_a = np.asarray(act_tbl_s.meas_type_code, dtype=np.int16)
+                dp_a = np.asarray(act_tbl_s.device_pos, dtype=np.int64)
+                w_a = np.asarray(act_tbl_s.weight, dtype=np.float64)
+                v_a = np.asarray(act_tbl_s.valid, dtype=bool)
+                ok_m = v_a & np.isfinite(w_a) & (w_a > 0.0) & (dp_a >= 0)
+                is_ht = np.isin(mt_a, list(h_mt_codes))
+                nd_pos = dp_a[ok_m & (dt_a == node_dtc_s) & is_ht]
+                nd_pos = nd_pos[nd_pos < n_nodes_s]
+                if nd_pos.size:
+                    direct_h_anchored[nd_pos] = True
+                sr_pos = dp_a[ok_m & (dt_a == src_dtc_s) & is_ht]
+                sr_pos = sr_pos[sr_pos < len(net_s.source_supply_node_pos)]
+                if sr_pos.size:
+                    s_nd = np.asarray(net_s.source_supply_node_pos, dtype=np.int64)[sr_pos]
+                    direct_h_anchored[s_nd[(s_nd >= 0) & (s_nd < n_nodes_s)]] = True
+                ld_mask = ok_m & (dt_a == ld_dtc_s) & (is_ht | (mt_a == heat_mt_code))
+                for r_i in np.flatnonzero(ld_mask).tolist():
+                    lp = int(dp_a[r_i])
+                    if 0 <= lp < len(net_s.load_supply_node_pos):
+                        if int(mt_a[r_i]) == heat_mt_code and abs(float(net_s.load_flow_set[lp])) <= 1e-9:
+                            continue
+                        l_nd = int(net_s.load_supply_node_pos[lp])
+                        if 0 <= l_nd < n_nodes_s:
+                            direct_h_anchored[l_nd] = True
+            else:
+                for m_it in self.active_measurements:
+                    if not getattr(m_it, "valid", True) or float(getattr(m_it, "weight", 0.0)) <= 0.0:
+                        continue
+                    dt_s = str(m_it.device_type)
+                    mt_s = str(m_it.meas_type)
+                    pos_i = int(getattr(m_it, "device_pos", -1))
+                    if dt_s == f"{net_s.prefix}Node" and mt_s in ("ENTHALPY", "TEMPERATURE") and 0 <= pos_i < n_nodes_s:
+                        direct_h_anchored[pos_i] = True
+                    elif dt_s == f"{net_s.prefix}Source" and mt_s in ("ENTHALPY", "TEMPERATURE") and 0 <= pos_i < len(net_s.source_supply_node_pos):
+                        s_nd = int(net_s.source_supply_node_pos[pos_i])
+                        if 0 <= s_nd < n_nodes_s:
+                            direct_h_anchored[s_nd] = True
+                    elif dt_s == f"{net_s.prefix}Load" and pos_i >= 0 and pos_i < len(net_s.load_supply_node_pos):
+                        if mt_s in ("ENTHALPY", "TEMPERATURE") or (mt_s == "HEAT" and abs(float(net_s.load_flow_set[pos_i])) > 1e-9):
+                            l_nd = int(net_s.load_supply_node_pos[pos_i])
+                            if 0 <= l_nd < n_nodes_s:
+                                direct_h_anchored[l_nd] = True
+            unanchored_nodes = np.flatnonzero(~direct_h_anchored)
+            if unanchored_nodes.size > 0:
+                fragile_upwind_h_cols = (self.base_enthalpy + unanchored_nodes).astype(np.int64)
+
+        if add_pseudo:
+            self._ensure_zero_injection_flow_balance_constraints()
         H = self.jacobian_sparse(x)
         result = self._observability_result(H)
-        if result.observable or not add_pseudo:
+
+        if (result.observable and weak_reg_cols.size == 0 and fragile_upwind_h_cols.size == 0) or not add_pseudo:
             self.observability = result
             return result
 
-        max_add = int(self.params.targeted_pseudo_measurement_max)
         added = 0
         # 1. O(nnz) 二分图最大匹配一次性定位全部结构亏秩列并定向批量补齐，彻底消除 O(N^2) 重建 H 瓶颈
         H_nz = H.copy()
         H_nz.eliminate_zeros()
         match_cols = maximum_bipartite_matching(H_nz, perm_type="row")
         unmatched_cols = np.flatnonzero(match_cols < 0)
+        if weak_reg_cols.size > 0:
+            unmatched_cols = np.unique(np.concatenate((unmatched_cols, weak_reg_cols)))
+        primary_unmatched_set = set(unmatched_cols.tolist())
+        fragile_only_cols = (
+            np.asarray([c for c in fragile_upwind_h_cols.tolist() if c not in primary_unmatched_set], dtype=np.int64)
+            if fragile_upwind_h_cols.size > 0
+            else np.empty(0, dtype=np.int64)
+        )
 
-        if unmatched_cols.size > 0 and max_add > 0:
+        if (unmatched_cols.size > 0 or fragile_only_cols.size > 0) and max_add > 0:
             net = self.network
             act_tbl = getattr(self.active_measurements, "table", None)
             all_tbl = getattr(self.measurements, "table", None)
@@ -2412,6 +2819,27 @@ class FluidStateEstimator:
                 new_pseudos.append(cand)
                 next_idx += 1
                 added += 1
+
+            # 为初值单向迎风匹配但流向反转会退化为零列的蒸汽盲区节点补充 1e-7 极弱比焓防翻转先验
+            for col in fragile_only_cols.tolist():
+                cand = self._build_pseudo_measurement_for_state_col(
+                    int(col),
+                    next_idx,
+                    existing,
+                    temp_state_to_spec=temp_state_to_spec,
+                )
+                if cand is None:
+                    continue
+                if existing_codes is not None:
+                    ck = (int(cand.device_type_code), int(cand.device_pos), int(cand.meas_type_code))
+                    if ck in existing_codes:
+                        continue
+                    existing_codes.add(ck)
+                else:
+                    existing.add((str(cand.device_type), str(cand.device_name), str(cand.meas_type)))
+                cand.weight = min(float(cand.weight), 1.0e-7)
+                new_pseudos.append(cand)
+                next_idx += 1
 
             if new_pseudos:
                 self.measurements.extend(new_pseudos)
@@ -2497,6 +2925,88 @@ class FluidStateEstimator:
         self._cached_state_base_scales = (cache_key, scales)
         return scales
 
+    def state_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """构造流体状态向量的物理合理防发散上下界 (lo, hi)，同步供单能域与多能联合求解器复用。"""
+        cached = getattr(self, "_cached_state_bounds", None)
+        net = self.network
+        cache_key = (id(net), int(self.state_count), len(self.active_measurements))
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        lo = np.full(int(self.state_count), -np.inf, dtype=np.float64)
+        hi = np.full(int(self.state_count), np.inf, dtype=np.float64)
+        if self.state_count <= 0:
+            self._cached_state_bounds = (cache_key, (lo, hi))
+            return lo, hi
+
+        scales = self.state_base_scales()
+        # 1. 节点压力势能防发散上下界
+        if self.n_potential > 0:
+            lo[: self.n_potential] = 1e-12
+            p_max_ref = 10.0
+            for arr in (getattr(net, "node_pressure", None), getattr(net, "source_pressure_set", None)):
+                if arr is not None:
+                    a = np.asarray(arr, dtype=np.float64)
+                    a = a[np.isfinite(a) & (a > 0.0)]
+                    if a.size:
+                        p_max_ref = max(p_max_ref, float(np.max(a)))
+            act_tbl = getattr(self.active_measurements, "table", None)
+            if act_tbl is not None and getattr(act_tbl, "meas_type_code", None) is not None and int(act_tbl.value.size) == len(self.active_measurements):
+                mt_arr = np.asarray(act_tbl.meas_type_code, dtype=np.int16)
+                p_codes = np.asarray(
+                    [int(MEAS_TYPE_CODES[k]) for k in ("PRESSURE", "PRESSURE_FROM", "PRESSURE_TO") if k in MEAS_TYPE_CODES],
+                    dtype=np.int16,
+                )
+                pv = np.asarray(act_tbl.value, dtype=np.float64)[np.isin(mt_arr, p_codes)]
+                pv = pv[np.isfinite(pv) & (pv > 0.0)]
+                if pv.size:
+                    p_max_ref = max(p_max_ref, min(float(np.max(pv)), 1e4))
+            pot_upper = max(25.0 * p_max_ref, 500.0) ** int(net.potential_power)
+            hi[: self.n_potential] = pot_upper
+
+        # 2. 显式受控支路流量防逃逸对称盒约束
+        if self.n_regulated > 0:
+            f_base = float(scales[self.base_regulated_flow])
+            f_max_ref = max(10.0 * f_base, 100.0)
+            for arr in (
+                getattr(net, "edge_flow_set", None),
+                getattr(net, "source_flow_set", None),
+                getattr(net, "demand", None),
+            ):
+                if arr is not None:
+                    a = np.abs(np.asarray(arr, dtype=np.float64))
+                    a = a[np.isfinite(a)]
+                    if a.size:
+                        f_max_ref = max(f_max_ref, float(np.max(a)))
+            f_bound = 30.0 * f_max_ref
+            lo[self.base_regulated_flow : self.base_supply_temperature] = -f_bound
+            hi[self.base_regulated_flow : self.base_supply_temperature] = f_bound
+
+        # 3. 热网温度状态防发散边界
+        if net.thermal and self.base_enthalpy > self.base_temperature:
+            t_arr = np.asarray(net.initial_temperature_state, dtype=np.float64)
+            t_fin = t_arr[np.isfinite(t_arr)]
+            t_hi = max(5.0 * float(np.max(np.abs(t_fin))) if t_fin.size else 500.0, 600.0)
+            lo[self.base_temperature : self.base_enthalpy] = -50.0
+            hi[self.base_temperature : self.base_enthalpy] = t_hi
+
+        # 4. 蒸汽网比焓防发散边界
+        if net.steam and self.state_count > self.base_enthalpy:
+            min_h = max(
+                float(net.medium.feedwater_enthalpy),
+                float(np.max(net.load_condensate_enthalpy)) if net.load_condensate_enthalpy.size else -np.inf,
+            ) + 1e-6
+            max_h = max(
+                float(np.max(net.source_enthalpy_set)) if net.source_enthalpy_set.size else -np.inf,
+                float(np.max(net.node_enthalpy)) if net.node_enthalpy.size else -np.inf,
+            )
+            upper_h = max(max_h * 2.5, min_h + 2000.0) if np.isfinite(max_h) else 1e5
+            lo[self.base_enthalpy :] = min_h
+            hi[self.base_enthalpy :] = upper_h
+
+        self._cached_state_bounds = (cache_key, (lo, hi))
+        return lo, hi
+
     def estimate(
         self,
         *,
@@ -2557,11 +3067,69 @@ class FluidStateEstimator:
         tr_ctrl = NielsenTrustRegionController()
         prev_max_correction = np.inf
         tried_undamped_escape = False
+        undamped_escape_count = 0
         pre_escape_max_correction = np.inf
         last_used_damping = 0.0
         self._last_aat_solver = None
-        self._last_weight_used = weight
+        target_weight = weight.copy()
+        self._last_weight_used = target_weight
         state_scales = self.state_base_scales()
+        state_lo, state_hi = self.state_bounds()
+        if x.size == self.state_count:
+            x = np.clip(x, state_lo, state_hi)
+        zi_plan_rows = np.asarray(self._get_compiled_meas_plan(self.active_measurements).get("zi_rows", ()), dtype=np.int64)
+        zi_active_rows = zi_plan_rows[(zi_plan_rows >= 0) & (zi_plan_rows < weight.size) & (target_weight[zi_plan_rows] > 100.0)]
+        zi_softened = bool(zi_active_rows.size > 0)
+        if zi_softened:
+            # 按初值真实标幺雅可比行范数动态归一化软启动权重：消除平启动 delta=0 处 5e4*c 奇异导数虚高导致的等压胶水陷阱，
+            # 同时为纯靠零注入可观测的盲汇流节点与受控支路提供良态插值刚度
+            H_init = self.jacobian_sparse(x)
+            H_init_pu = H_init.copy()
+            if H_init_pu.nnz > 0:
+                H_init_pu.data = H_init.data * state_scales[H_init.indices]
+            init_row_sq = np.asarray(H_init_pu.power(2).sum(axis=1)).reshape(-1)
+            real_mask = np.ones(target_weight.size, dtype=bool)
+            real_mask[zi_active_rows] = False
+            init_real_e = target_weight[real_mask] * init_row_sq[real_mask]
+            valid_init_e = init_real_e[np.isfinite(init_real_e) & (init_real_e > 1e-12) & (init_real_e < 1e13)]
+            soft_ref_e = (
+                max(float(np.percentile(valid_init_e, 85)), 0.25 * float(np.max(valid_init_e)))
+                if valid_init_e.size
+                else 100.0
+            )
+            zi_init_sq = np.maximum(init_row_sq[zi_active_rows], 1e-12)
+            soft_scale = 0.05 if lm_damping > 0.0 else 0.15
+            weight = target_weight.copy()
+            weight[zi_active_rows] = np.minimum(
+                target_weight[zi_active_rows],
+                np.maximum(1e-12, (soft_scale * soft_ref_e) / zi_init_sq),
+            )
+
+        def _activate_tight_zi() -> None:
+            """从软启动阶段切换至目标零注入紧权重，并重置二阶加速与停滞计数器。"""
+            nonlocal weight, zi_softened, tr_ctrl, lm_damping, curvature_damping_active
+            nonlocal backtrack_streak, fullstep_osc_streak, stagnation_streak, low_progress_streak
+            nonlocal high_damp_stagnation_streak, high_damp_slow_streak, damped_slow_progress_streak
+            nonlocal damped_window_steps, damped_window_ref_obj, tried_undamped_escape, pre_escape_max_correction
+            nonlocal cached_z_est, cached_residual, cached_objective
+            weight = target_weight
+            zi_softened = False
+            aa_accel.reset()
+            tr_ctrl = NielsenTrustRegionController()
+            lm_damping = 0.0
+            curvature_damping_active = False
+            backtrack_streak = 0
+            fullstep_osc_streak = 0
+            stagnation_streak = 0
+            low_progress_streak = 0
+            high_damp_stagnation_streak = 0
+            high_damp_slow_streak = 0
+            damped_slow_progress_streak = 0
+            damped_window_steps = 0
+            damped_window_ref_obj = np.inf
+            tried_undamped_escape = False
+            pre_escape_max_correction = np.inf
+            cached_z_est = cached_residual = cached_objective = None
 
         def _solve_step(H_cur: csr_matrix, res_cur: np.ndarray, damping_val: float):
             """在无量纲标幺状态空间 x_pu = x / D_x 下组装并求解正规方程，再还原物理增量 dx = D_x * dx_pu。"""
@@ -2594,15 +3162,19 @@ class FluidStateEstimator:
                     if self.n_potential > 0
                     else np.empty(0, dtype=np.intp)
                 )
-                if damping_val > 0.0:
+                eff_aat_damp = damping_val
+                if eff_aat_damp <= 0.0 and bool(np.any(diag_pu <= 1e-10)):
+                    eff_aat_damp = 1e-4
+                if eff_aat_damp > 0.0:
                     # 在标幺正规方程上叠加 Jacobi 列均衡 Marquardt 相对阻尼
-                    col_scale = 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12))
+                    zero_mask_aat = diag_pu <= 1e-12
+                    col_scale = np.where(zero_mask_aat, 1.0, 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12)))
                     A_scaled = A_pu.copy()
                     A_scaled.data = A_pu.data * col_scale[A_pu.indices]
-                    rhs_scaled = rhs_pu * col_scale
+                    rhs_scaled = np.where(zero_mask_aat, 0.0, rhs_pu * col_scale)
                     if pinned_pot.size > 0:
                         dx_scaled, ok_pin = solve_box_pinned_normal_equations(
-                            A_scaled, None, rhs_scaled, pinned_pot, damping=damping_val
+                            A_scaled, None, rhs_scaled, pinned_pot, damping=eff_aat_damp
                         )
                         if not ok_pin:
                             raise RuntimeError("Pinned fluid AAt solve failed")
@@ -2611,9 +3183,9 @@ class FluidStateEstimator:
                             A_scaled,
                             rhs_scaled,
                             return_factor_diag=False,
-                            damping=damping_val,
+                            damping=eff_aat_damp,
                         )
-                    dx_pu = np.asarray(dx_scaled, dtype=np.float64) * col_scale
+                    dx_pu = np.where(zero_mask_aat, 0.0, np.asarray(dx_scaled, dtype=np.float64) * col_scale)
                 else:
                     if pinned_pot.size > 0:
                         dx_raw, ok_pin = solve_box_pinned_normal_equations(
@@ -2629,6 +3201,26 @@ class FluidStateEstimator:
                             damping=0.0,
                         )
                     dx_pu = np.asarray(dx_raw, dtype=np.float64)
+                    if dx_pu.size and float(np.max(np.abs(dx_pu))) > 200.0:
+                        # 无阻尼步出现超巨幅标幺跳变（近奇异方向）：自动启用微幅阻尼重算安全方向
+                        col_scale = 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12))
+                        A_scaled = A_pu.copy()
+                        A_scaled.data = A_pu.data * col_scale[A_pu.indices]
+                        rhs_scaled = rhs_pu * col_scale
+                        if pinned_pot.size > 0:
+                            dx_scaled, ok_pin = solve_box_pinned_normal_equations(
+                                A_scaled, None, rhs_scaled, pinned_pot, damping=1e-3
+                            )
+                            if ok_pin:
+                                dx_pu = np.asarray(dx_scaled, dtype=np.float64) * col_scale
+                        else:
+                            dx_scaled, _ = aat_solver.solve(
+                                A_scaled,
+                                rhs_scaled,
+                                return_factor_diag=False,
+                                damping=1e-3,
+                            )
+                            dx_pu = np.asarray(dx_scaled, dtype=np.float64) * col_scale
                 if pinned_pot.size > 0:
                     dx_pu[pinned_pot] = 0.0
                 dx_out = dx_pu * state_scales
@@ -2726,8 +3318,9 @@ class FluidStateEstimator:
 
             last_used_damping = step_damping
             max_correction = float(np.max(np.abs(dx))) if dx.size else 0.0
+            fixed_scale = np.maximum(state_scales, 1.0)
             rel_correction = (
-                float(np.max(np.abs(dx) / np.maximum(np.abs(x), 1.0))) if dx.size else 0.0
+                float(np.max(np.abs(dx) / fixed_scale)) if dx.size else 0.0
             )
             if self.verbose:
                 print(
@@ -2739,16 +3332,30 @@ class FluidStateEstimator:
                 rhs_kkt = rhs.copy() if pinned_pot.size > 0 else rhs
                 if pinned_pot.size > 0:
                     rhs_kkt[pinned_pot] = 0.0
-                # 流体状态含高压/高焓等大尺度物理量，按 max(|x_i|, 1.0) 归一化得到无量纲相对 KKT 残差
+                # 按固定物理特征尺度 max(state_scales, 1.0) 归一化相对 KKT 残差，杜绝发散态分母膨胀导致伪收敛
                 kkt_inf = float(
-                    np.max(np.abs(rhs_kkt) / (np.maximum(diag_g, 1e-12) * np.maximum(np.abs(x), 1.0)))
+                    np.max(np.abs(rhs_kkt) / (np.maximum(diag_g, 1e-12) * fixed_scale))
                 )
             else:
                 kkt_inf = np.inf
+            if zi_softened and iteration >= 2 and (
+                rel_correction < max(1.0e-5, 10.0 * self.tol)
+                or (step_damping == 0.0 and max_correction < 10.0 * self.tol)
+                or (
+                    step_damping > 0.0
+                    and rel_correction < max(5e-5, 50.0 * self.tol)
+                    and kkt_inf <= max(1e-3, 500.0 * self.tol)
+                )
+            ):
+                _activate_tight_zi()
+                continue
             if step_damping == 0.0 and (
                 max_correction < self.tol
-                or (rel_correction < self.tol and max_correction < 1e-3)
+                or rel_correction < self.tol
             ):
+                if zi_softened and iteration < self.max_iter:
+                    _activate_tight_zi()
+                    continue
                 converged = True
                 evaluated_at_final_x = True
                 break
@@ -2757,6 +3364,9 @@ class FluidStateEstimator:
                 and rel_correction < max(1e-5, 10.0 * self.tol)
                 and kkt_inf <= max(1e-4, 100.0 * self.tol)
             ):
+                if zi_softened and iteration < self.max_iter:
+                    _activate_tight_zi()
+                    continue
                 converged = True
                 evaluated_at_final_x = True
                 break
@@ -2777,7 +3387,7 @@ class FluidStateEstimator:
                 else minimum
             )
             for _ in range(20):
-                candidate = x + step * dx
+                candidate = np.clip(x + step * dx, state_lo, state_hi)
                 candidate[: self.n_potential] = np.maximum(candidate[: self.n_potential], pot_floor)
                 candidate_z_est = self.evaluate(candidate)
                 candidate_residual = z - candidate_z_est
@@ -2810,7 +3420,7 @@ class FluidStateEstimator:
                 if np.any(cross_mask):
                     clamp_step = 1.0
                     for _ in range(8):
-                        cand_c = x + clamp_step * dx
+                        cand_c = np.clip(x + clamp_step * dx, state_lo, state_hi)
                         cand_c[: self.n_potential] = np.maximum(cand_c[: self.n_potential], pot_floor)
                         reg_c = cand_c[reg_s:reg_e]
                         pos_cross = (x_reg >= 0.0) & (reg_c < 1e-4)
@@ -2833,6 +3443,9 @@ class FluidStateEstimator:
                         clamp_step *= 0.5
             if not accepted:
                 if tried_undamped_escape:
+                    if zi_softened and iteration < self.max_iter:
+                        _activate_tight_zi()
+                        continue
                     # 连续停滞后尝试无阻尼脱困仍无法下降，确认已到达非光滑边界局部极小驻点并还原脱困前有效步长
                     if np.isfinite(pre_escape_max_correction):
                         max_correction = min(max_correction, pre_escape_max_correction)
@@ -2842,6 +3455,9 @@ class FluidStateEstimator:
                 if lm_damping < 100.0:
                     lm_damping = min(100.0, max(lm_damping * 10.0, 1e-2))
                     backtrack_streak = 0
+                    continue
+                if zi_softened and iteration < self.max_iter:
+                    _activate_tight_zi()
                     continue
                 if kkt_inf <= max(1e-3, 1000.0 * self.tol) and rel_correction < 1e-3:
                     converged = True
@@ -2865,14 +3481,14 @@ class FluidStateEstimator:
                     damping=step_damping,
                     allow_propose=(rel_correction < 0.5 and step_damping < 10.0),
                 )
-                if x_aa is not None and (
+                if x_aa is not None and bool(np.all((x_aa >= state_lo) & (x_aa <= state_hi))) and (
                     self.n_potential == 0 or bool(np.all(x_aa[: self.n_potential] >= minimum))
                 ):
                     aa_z = self.evaluate(x_aa)
                     aa_r = z - aa_z
                     aa_obj = float(np.dot(weight, aa_r * aa_r))
                     if np.isfinite(aa_obj) and aa_obj < cached_objective - max(1e-12, 1e-10 * (abs(cached_objective) + 1.0)):
-                        aa_jump = float(np.max(np.abs(x_aa - x) / np.maximum(np.abs(x), 1.0))) if x_aa.size else 0.0
+                        aa_jump = float(np.max(np.abs(x_aa - x) / fixed_scale)) if x_aa.size else 0.0
                         x = x_aa
                         cached_z_est = aa_z
                         cached_residual = aa_r
@@ -2950,14 +3566,19 @@ class FluidStateEstimator:
             prev_max_correction = max_correction
 
             # 带阻尼且已达稳态停滞（KKT 梯度与目标函数 7 位双满足）提前优雅收敛
+            early_stationary = False
             if (
                 step_damping > 0.0
                 and rel_correction < 1e-3
                 and kkt_inf <= max(1e-4, 100.0 * self.tol)
                 and obj_change <= max(1e-12, 1e-7 * (abs(prev_objective) + 1.0))
             ):
-                converged = True
-                break
+                early_stationary = True
+                if not (zi_softened and iteration < self.max_iter):
+                    converged = True
+                    break
+                _activate_tight_zi()
+                continue
 
             # 非光滑边界（如零流量管段上游追踪热损/焓值翻转台阶）局部极小驻点与高阻尼锁死脱困检测：
             # 1) 若上一步刚做完无阻尼脱困试探但目标函数未见实质下降，确认已到达非光滑边界极小驻点并优雅退出；
@@ -2974,7 +3595,7 @@ class FluidStateEstimator:
                 damped_slow_progress_streak += 1
             else:
                 damped_slow_progress_streak = 0
-            if step_damping > 0.0 and obj_change <= max(1e-12, 3e-3 * (abs(prev_objective) + 1.0)):
+            if obj_change <= max(1e-12, 3e-3 * (abs(prev_objective) + 1.0)):
                 if damped_window_steps == 0:
                     damped_window_ref_obj = prev_objective
                 damped_window_steps += 1
@@ -2982,26 +3603,25 @@ class FluidStateEstimator:
                 damped_window_steps = 0
                 damped_window_ref_obj = np.inf
             damped_window_stalled = (
-                step_damping > 0.0
-                and damped_window_steps >= 24
+                damped_window_steps >= (16 if step_damping == 0.0 else 24)
                 and np.isfinite(damped_window_ref_obj)
-                and (damped_window_ref_obj - objective) <= 0.05 * (abs(damped_window_ref_obj) + 1.0)
+                and (damped_window_ref_obj - cached_objective) <= (0.01 if step_damping == 0.0 else 0.05) * (abs(damped_window_ref_obj) + 1.0)
             )
             if tried_undamped_escape:
                 if obj_change <= max(1e-10, 5e-4 * (abs(prev_objective) + 1.0)):
                     if np.isfinite(pre_escape_max_correction):
                         max_correction = min(max_correction, pre_escape_max_correction)
-                    converged = True
-                    break
-                tried_undamped_escape = False
-                pre_escape_max_correction = np.inf
-                stagnation_streak = 0
-                high_damp_stagnation_streak = 0
-                high_damp_slow_streak = 0
-                low_progress_streak = 0
-                damped_slow_progress_streak = 0
-                damped_window_steps = 0
-                damped_window_ref_obj = np.inf
+                    early_stationary = True
+                else:
+                    tried_undamped_escape = False
+                    pre_escape_max_correction = np.inf
+                    stagnation_streak = 0
+                    high_damp_stagnation_streak = 0
+                    high_damp_slow_streak = 0
+                    low_progress_streak = 0
+                    damped_slow_progress_streak = 0
+                    damped_window_steps = 0
+                    damped_window_ref_obj = np.inf
             elif (
                 obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
                 and actual_rel_dx <= max(1e-6, self.tol)
@@ -3018,8 +3638,7 @@ class FluidStateEstimator:
                         high_damp_stagnation_streak = 0
                         high_damp_slow_streak = 0
                     else:
-                        converged = True
-                        break
+                        early_stationary = True
             elif step_damping >= 1.0 and obj_change <= rel_obj_tol_high_damp:
                 stagnation_streak = 0
                 high_damp_stagnation_streak += 1
@@ -3031,13 +3650,17 @@ class FluidStateEstimator:
                     and (0.90 <= rho_lm <= 1.10)
                 )
                 if high_damp_stagnation_streak >= (4 if is_cliff_locked else 6):
-                    lm_damping = 0.0
-                    curvature_damping_active = False
-                    tr_ctrl.reset()
-                    tried_undamped_escape = True
-                    pre_escape_max_correction = max_correction
-                    high_damp_stagnation_streak = 0
-                    high_damp_slow_streak = 0
+                    if undamped_escape_count >= 2:
+                        early_stationary = True
+                    else:
+                        lm_damping = 0.0
+                        curvature_damping_active = False
+                        tr_ctrl.reset()
+                        tried_undamped_escape = True
+                        undamped_escape_count += 1
+                        pre_escape_max_correction = max_correction
+                        high_damp_stagnation_streak = 0
+                        high_damp_slow_streak = 0
             elif (
                 step_damping >= 1.0
                 and obj_change <= (
@@ -3056,12 +3679,16 @@ class FluidStateEstimator:
                     and (0.90 <= rho_lm <= 1.10)
                 )
                 if high_damp_slow_streak >= (4 if is_cliff_locked else 12):
-                    lm_damping = 0.0
-                    curvature_damping_active = False
-                    tr_ctrl.reset()
-                    tried_undamped_escape = True
-                    pre_escape_max_correction = max_correction
-                    high_damp_slow_streak = 0
+                    if undamped_escape_count >= 2:
+                        early_stationary = True
+                    else:
+                        lm_damping = 0.0
+                        curvature_damping_active = False
+                        tr_ctrl.reset()
+                        tried_undamped_escape = True
+                        undamped_escape_count += 1
+                        pre_escape_max_correction = max_correction
+                        high_damp_slow_streak = 0
             elif low_progress_streak >= 12 or damped_slow_progress_streak >= 20 or damped_window_stalled:
                 # 中低阻尼非光滑脊线微幅抖动或长尾极慢进展（连续 12 步目标 6 位不变、带阻尼连续 20 步单步降幅 <= 5e-4、
                 # 或连续 24 步带阻尼滑窗累计降幅 <= 5%）：触发无阻尼脱困确认，打破中低阻尼擦边慢爬并释放外层 BDR 剔坏
@@ -3073,19 +3700,40 @@ class FluidStateEstimator:
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak = 0
                 if step_damping > 0.0:
-                    lm_damping = 0.0
-                    curvature_damping_active = False
-                    tr_ctrl.reset()
-                    tried_undamped_escape = True
-                    pre_escape_max_correction = max_correction
+                    if undamped_escape_count >= 2:
+                        early_stationary = True
+                    else:
+                        lm_damping = 0.0
+                        curvature_damping_active = False
+                        tr_ctrl.reset()
+                        tried_undamped_escape = True
+                        undamped_escape_count += 1
+                        pre_escape_max_correction = max_correction
+                elif rel_correction > 1e-3 and undamped_escape_count < 2:
+                    # 无阻尼步发生近零流量迎风方向乒乓翻转极限环（目标停滞但步长仍在跳跃）：启用阻尼压制迎风翻转
+                    lm_damping = 0.1
+                    curvature_damping_active = True
+                    tr_ctrl.notify_damping_activated(lm_damping, cached_objective)
+                    undamped_escape_count += 1
                 else:
-                    converged = True
-                    break
+                    early_stationary = True
             else:
                 stagnation_streak = 0
                 high_damp_stagnation_streak = 0
                 high_damp_slow_streak = 0
 
+            if early_stationary:
+                if zi_softened and iteration < self.max_iter:
+                    _activate_tight_zi()
+                    continue
+                converged = True
+                break
+
+        if zi_softened:
+            weight = target_weight
+            evaluated_at_final_x = False
+            cached_z_est = cached_residual = cached_objective = None
+            last_used_damping = max(last_used_damping, 1e-6)
         if not evaluated_at_final_x:
             if cached_z_est is not None:
                 z_est = cached_z_est
@@ -3158,8 +3806,14 @@ class FluidStateEstimator:
         else:
             weights = np.asarray([item.weight for item in result.measurements], dtype=np.float64)
 
-        # 伪量测（MEAS_STATUS_PSEUDO）允许参与坏数据辨识与排除；唯一补盲的临界量测由相对冗余度保护自动拦护
-        is_protected = np.zeros(n_meas, dtype=bool)
+        # 零注入质量守恒约束受不可删保护；伪量测（MEAS_STATUS_PSEUDO）允许参与坏数据辨识与排除
+        if table is not None and int(table.idx.size) == n_meas:
+            is_protected = measurement_table_bad_data_protected_mask(table)
+        else:
+            is_protected = np.asarray(
+                [str(getattr(item, "meas_type", "")) == "FLOW_BALANCE" for item in result.measurements],
+                dtype=bool,
+            )
 
         # 使用精确杠杆 h_ii = diag(H G^-1 H^T) = diag(H_pu G_pu^-1 H_pu^T) 在标幺良态空间计算标准化残差
         leverage = None
@@ -3208,6 +3862,25 @@ class FluidStateEstimator:
             )
 
         n_eff = int(np.count_nonzero((weights > 0.0) & (~is_protected) & (~critical_mask)))
+        # 按流体物理量纲（压力/流量/温度/比焓/热功率）构造分组标识，避免跨量纲混桶将未标幺比焓/温度正常偏差误判为粗差
+        mt_codes = getattr(table, "meas_type_code", None) if table is not None else None
+        if mt_codes is not None and int(np.asarray(mt_codes).size) == n_meas:
+            mt_c = np.asarray(mt_codes, dtype=np.int16)
+            p_codes = tuple(int(MEAS_TYPE_CODES[k]) for k in ("PRESSURE", "PRESSURE_FROM", "PRESSURE_TO") if k in MEAS_TYPE_CODES)
+            f_codes = tuple(int(MEAS_TYPE_CODES[k]) for k in ("FLOW", "FLOW_FROM", "FLOW_TO") if k in MEAS_TYPE_CODES)
+            h_codes = tuple(int(MEAS_TYPE_CODES[k]) for k in ("ENTHALPY", "H_FROM", "H_TO") if k in MEAS_TYPE_CODES)
+            q_codes = tuple(int(MEAS_TYPE_CODES[k]) for k in ("HEAT", "HEAT_PRIMARY", "HEAT_SECONDARY") if k in MEAS_TYPE_CODES)
+            fluid_group_ids = np.full(n_meas, 3, dtype=np.int64)  # 默认温度类 3
+            if p_codes:
+                fluid_group_ids[np.isin(mt_c, p_codes)] = 1
+            if f_codes:
+                fluid_group_ids[np.isin(mt_c, f_codes)] = 2
+            if h_codes:
+                fluid_group_ids[np.isin(mt_c, h_codes)] = 4
+            if q_codes:
+                fluid_group_ids[np.isin(mt_c, q_codes)] = 5
+        else:
+            fluid_group_ids = None
         eff_threshold, per_row_thr = compute_adaptive_bad_threshold(
             threshold_value,
             n_eff if n_eff > 0 else int(np.count_nonzero(weights > 0.0)),
@@ -3216,6 +3889,8 @@ class FluidStateEstimator:
             active_mask=(weights > 0.0),
             protected_mask=is_protected,
             critical_mask=critical_mask,
+            group_ids=fluid_group_ids,
+            min_bucket_size=8,
         )
         hit_pos = (
             np.flatnonzero(normalized > per_row_thr)
@@ -3266,7 +3941,13 @@ class FluidStateEstimator:
                 base_weight = np.asarray(table.weight, dtype=np.float64).copy()
             else:
                 base_weight = np.asarray([item.weight for item in self.active_measurements], dtype=np.float64)
-            is_protected = np.zeros(n_meas, dtype=bool)
+            if table is not None and int(table.idx.size) == n_meas:
+                is_protected = measurement_table_bad_data_protected_mask(table)
+            else:
+                is_protected = np.asarray(
+                    [str(getattr(item, "meas_type", "")) == "FLOW_BALANCE" for item in self.active_measurements],
+                    dtype=bool,
+                )
             n_real_valid = int(np.count_nonzero((base_weight > 0.0) & (~is_protected)))
             eff_max_remove = self.params.max_remove if max_remove is None else max_remove
             eff_max_per_round = (
@@ -3277,6 +3958,14 @@ class FluidStateEstimator:
                 max_remove=eff_max_remove,
                 max_remove_per_round=eff_max_per_round,
             )
+            ext_total_cap, ext_round_cap = resolve_auto_extreme_bad_data_caps(
+                n_real_valid,
+                max_remove=max_remove,
+                max_remove_per_round=max_remove_per_round,
+                param_max_remove=self.params.max_remove,
+                param_max_remove_per_round=self.params.max_remove_per_round,
+            )
+            ext_norm_floor = max(15.0, 4.0 * float(threshold_value))
 
             cur_weight = base_weight.copy()
             active_mask = cur_weight > 0.0
@@ -3309,7 +3998,7 @@ class FluidStateEstimator:
             norm_res = np.empty(0, dtype=np.float64)
             col_degrees: Optional[np.ndarray] = None
             row_to_item: Dict[int, BadDataItem] = {}
-            while len(removed_items) < total_cap:
+            while len(removed_items) < ext_total_cap:
                 if need_identify:
                     bad_list, norm_res = self.identify_bad_data(
                         res,
@@ -3321,18 +4010,22 @@ class FluidStateEstimator:
                     need_identify = False
                 if not bad_list:
                     break
+                extreme_only = len(removed_items) >= total_cap
                 cand_rows = [
                     int(it.row_pos)
                     for it in bad_list
                     if int(it.row_pos) not in removed_rows_set
                     and int(it.row_pos) not in blocked_rows_set
                     and not bool(is_protected[int(it.row_pos)])
+                    and (not extreme_only or float(it.normalized_residual) >= ext_norm_floor)
                 ]
                 if not cand_rows:
                     break
                 cand_norms = [float(norm_res[r]) for r in cand_rows]
-                remaining = total_cap - len(removed_items)
-                batch_limit = min(round_cap, remaining)
+                eff_total = ext_total_cap if extreme_only else total_cap
+                eff_round = ext_round_cap if extreme_only else round_cap
+                remaining = eff_total - len(removed_items)
+                batch_limit = min(eff_round, remaining)
                 # 选择图上相互独立的坏数据子批，避免单条坏数据连带邻域引发误报
                 selected_pos = select_independent_bad_data_batch(
                     res.H,
@@ -3504,12 +4197,29 @@ class FluidStateEstimator:
         )
         return self.se_result
 
-    def run(self) -> int:
+    def run(
+        self,
+        *,
+        remove_bad_data: bool = False,
+        bad_threshold: Optional[float] = None,
+        max_remove: Optional[int] = None,
+        max_remove_per_round: Optional[int] = None,
+        verbose: Optional[bool] = None,
+    ) -> int:
         if not self.prepared:
             self.prepare()
+        if remove_bad_data:
+            result, _removed = self.estimate_with_bad_data_removal(
+                threshold=bad_threshold,
+                max_remove=max_remove,
+                max_remove_per_round=max_remove_per_round,
+                verbose=verbose,
+            )
+            self.build_se_result(result)
+            return 0 if result.converged else 1
         observability = self.analyze_observability(add_pseudo=True)
         result = self.estimate(observability=observability)
-        self.identify_bad_data(result)
+        self.identify_bad_data(result, threshold=bad_threshold)
         self.build_se_result(result)
         return 0 if result.converged else 1
 

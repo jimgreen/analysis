@@ -6848,3 +6848,1450 @@ def test_trust_region_calm_streak_releases_bounce_floor_and_guard_ladder():
     assert ladder[-1] == pytest.approx(10.0)
 
 
+def test_hub_star_dense_column_routes_to_cholmod_in_auto_mode(monkeypatch):
+    """验证 auto 线性求解模式下，星型大度超稠密列自动路由至 CHOLMOD 隐式 AAt，而常规稀疏大网保持 PARDISO。"""
+    from scipy.sparse import csc_matrix
+    import secore.se_math as se_math_mod
+    from secore.se_math import CholmodAAtNormalEquationSolver
+
+    if se_math_mod.CHOLMOD_ANALYZE_AAT is None and se_math_mod.CHOLMOD_CHOLESKY_AAT is None:
+        pytest.skip("CHOLMOD unavailable")
+    if not se_math_mod.is_mkl_pardiso_available():
+        pytest.skip("MKL PARDISO unavailable")
+
+    monkeypatch.setenv("SE_LINEAR_SOLVER", "auto")
+    n_state = 3200
+
+    # 1. 常规低度稀疏网络（单列非零元 <= 4）：应优先选用多线程 MKL PARDISO
+    rows_reg, cols_reg, vals_reg = [], [], []
+    col_id = 0
+    for i in range(n_state):
+        rows_reg.append(i)
+        cols_reg.append(col_id)
+        vals_reg.append(2.0)
+        col_id += 1
+    for i in range(n_state - 1):
+        rows_reg.extend([i, i + 1])
+        cols_reg.extend([col_id, col_id])
+        vals_reg.extend([1.0, -1.0])
+        col_id += 1
+    A_regular = csc_matrix((vals_reg, (rows_reg, cols_reg)), shape=(n_state, col_id), dtype=np.float64)
+    solver_reg = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True)
+    assert solver_reg._should_use_pardiso(n_state, A_regular.nnz, A_regular) is True
+
+    # 2. 含单列 >= 256 非零元的星型枢纽超稠密团：auto 模式应自动避开显式 CSR 展开、路由至 CHOLMOD
+    hub_deg = 320
+    rows_hub = list(rows_reg) + list(range(hub_deg))
+    cols_hub = list(cols_reg) + [col_id] * hub_deg
+    vals_hub = list(vals_reg) + [0.25] * hub_deg
+    A_hub = csc_matrix((vals_hub, (rows_hub, cols_hub)), shape=(n_state, col_id + 1), dtype=np.float64)
+    solver_hub = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True)
+    assert solver_hub._should_use_pardiso(n_state, A_hub.nnz, A_hub) is False
+    rhs = np.ones(n_state, dtype=np.float64)
+    sol, _ = solver_hub.solve(A_hub, rhs)
+    assert solver_hub._active_backend == "cholmod"
+    assert np.all(np.isfinite(sol))
+
+    # 3. 极端异构列均衡加阻尼步后，refresh_unregularized_factor 能原位恢复无阻尼精确因子
+    A_hetero = A_hub.copy()
+    A_hetero.data[0] = 1e5
+    solver_hub.solve(A_hetero, rhs, damping=1.0)
+    assert solver_hub._last_factor_scaled is True
+    assert solver_hub.last_cholmod_factor is None
+    assert solver_hub.refresh_unregularized_factor(A_hetero) is True
+    assert solver_hub._last_factor_scaled is False
+    assert solver_hub.last_cholmod_factor is not None
+
+    # 4. 星型超稠密聚合行不会导致拓扑批选把独立辐射支路坏数据锁死为仅选 1 条
+    from secore.se_math import select_independent_bad_data_batch
+
+    H_star = A_hub.T.tocsr()
+    cand_rows = [10, 80, 150, 220, 290]
+    cand_norms = [15.0, 14.0, 13.0, 12.0, 11.0]
+    picked = select_independent_bad_data_batch(H_star, cand_rows, cand_norms, 4.0, max_batch=10, min_hops=3)
+    assert len(picked) >= 4
+
+
+def test_meas_missing_trailing_value_downgrades_to_invalid_and_strict_malformed(tmp_path):
+    """验证 .meas 数据行仅缺失最末 value 列时安全降级为无效量测，而严重缺列行仍严格抛错。"""
+    from model.meas_array_model import (
+        MEAS_STATUS_INVALID,
+        MEAS_STATUS_NORMAL,
+        build_meas_ppc_from_e_file,
+        build_meas_ppc_from_efile_rows,
+        meas_ppc_active_mask,
+    )
+
+    meas_file = tmp_path / "missing_trailing_val.meas"
+    meas_file.write_text(
+        "<Measurement>\n"
+        "@ idx name dev_type dev_name meas_type weight valid value\n"
+        "# 1 m_1 GasNode n1 PRESSURE 100.0 1 10.5\n"
+        "# 2 m_2 GasNode n2 PRESSURE 100.0 1\n"
+        "# 3 m_3 GasNode n3 PRESSURE 50.0 1e7\n"
+        "</Measurement>\n",
+        encoding="utf-8",
+    )
+
+    for inc_str in (False, True):
+        ppc = build_meas_ppc_from_e_file(meas_file, include_strings=inc_str)
+        assert list(ppc["idx_array"]) == [1, 2, 3]
+        assert list(ppc["valid_array"]) == [True, False, False]
+        assert list(ppc["status_array"]) == [MEAS_STATUS_NORMAL, MEAS_STATUS_INVALID, MEAS_STATUS_INVALID]
+        assert ppc["value_array"][0] == pytest.approx(10.5)
+        assert np.isnan(ppc["value_array"][1]) and np.isnan(ppc["value_array"][2])
+        assert list(meas_ppc_active_mask(ppc)) == [True, False, False]
+
+    rows_dict = {
+        "Measurement": {
+            "header_list": ["idx", "name", "dev_type", "dev_name", "meas_type", "weight", "valid", "value"],
+            "rows": [
+                ["1", "m_1", "GasNode", "n1", "PRESSURE", "100.0", "1", "10.5"],
+                ["2", "m_2", "GasNode", "n2", "PRESSURE", "100.0", "1"],
+            ],
+        }
+    }
+    ppc_rows = build_meas_ppc_from_efile_rows(meas_file, rows_dict)
+    assert list(ppc_rows["valid_array"]) == [True, False]
+    assert np.isnan(ppc_rows["value_array"][1])
+
+    # 缺失前序必需列（仅 6 列）的严重残缺行仍必须抛出 RuntimeError
+    bad_file = tmp_path / "severely_malformed.meas"
+    bad_file.write_text(
+        "<Measurement>\n"
+        "@ idx name dev_type dev_name meas_type weight valid value\n"
+        "# 1 m_1 GasNode n1 PRESSURE 100.0\n"
+        "</Measurement>\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="Malformed Measurement row"):
+        build_meas_ppc_from_e_file(bad_file, include_strings=False)
+    with pytest.raises(RuntimeError, match="Malformed Measurement row"):
+        build_meas_ppc_from_e_file(bad_file, include_strings=True)
+
+
+def test_dc_line_search_rejection_activates_trust_region_no_even_odd_loop(tmp_path):
+    """验证线搜索完全拒绝 (step_scale=0) 时信赖域控制器正确记录 bounce_floor，且 DC 求解器不陷入无阻尼奇偶步死循环。"""
+    from secore.se_math import NielsenTrustRegionController
+
+    ctrl = NielsenTrustRegionController()
+    rhs = np.array([2.0, -1.0], dtype=np.float64)
+    dx = np.array([0.2, -0.1], dtype=np.float64)
+    # 模拟阻尼从 0.8 缩减到 0.27 后下一步线搜索完全拒绝 (step_scale=0.0)，连续 2 次缩减碰壁必须锁定 bounce_floor
+    ctrl.notify_damping_activated(0.8, 50.0)
+    pred1 = 0.5 * (float(np.dot(rhs, dx)) + 0.8 * float(np.dot(dx, dx)))
+    d_reduced, _ = ctrl.update(0.8, rhs, dx, pred1, 1.0, current_obj=45.0, half_obj=True)
+    assert d_reduced < 0.8
+    d_up1, _ = ctrl.update(d_reduced, rhs, dx, 0.0, 0.0, current_obj=45.0, half_obj=True)
+    assert d_up1 > d_reduced
+    assert ctrl.bounce_count == 1
+
+    pred2 = 0.5 * (float(np.dot(rhs, dx)) + d_up1 * float(np.dot(dx, dx)))
+    d_reduced2, _ = ctrl.update(d_up1, rhs, dx, pred2, 1.0, current_obj=44.0, half_obj=True)
+    assert d_reduced2 < d_up1
+    d_up2, _ = ctrl.update(d_reduced2, rhs, dx, 0.0, 0.0, current_obj=44.0, half_obj=True)
+    assert ctrl.bounce_count >= 2
+    assert ctrl.bounce_floor >= 1.25 * d_reduced2
+    assert d_up2 >= ctrl.bounce_floor
+
+
+def test_converter_current_curvature_columns_exact_hessian_and_aat_shape_guard():
+    """验证换流器 I_AC 负残差二阶曲率列与精确二阶海森完全一致，且 assume_fixed_pattern 下追加曲率列不抛异常。"""
+    from scipy.sparse import csc_matrix, hstack
+    from secore.se_math import (
+        CholmodAAtNormalEquationSolver,
+        build_converter_current_curvature_columns,
+    )
+
+    p_val = -0.10136
+    q_val = -0.00116
+    v_val = 1.0004
+    s_val = float(np.hypot(p_val, q_val))
+    z_i = 0.01407
+    i_est = s_val / v_val
+    res = np.array([z_i - i_est], dtype=np.float64)
+    w = np.array([100.0], dtype=np.float64)
+
+    V_curv, has_curv = build_converter_current_curvature_columns(
+        4,
+        np.array([0], dtype=np.int64),
+        np.array([1], dtype=np.int32),
+        np.array([3], dtype=np.int32),
+        np.array([v_val], dtype=np.float64),
+        np.array([p_val], dtype=np.float64),
+        np.array([q_val], dtype=np.float64),
+        res,
+        w,
+    )
+    assert has_curv and V_curv is not None
+    H2_mat = (V_curv @ V_curv.T).toarray()
+    # 精确解析二阶导：-w * r * d^2(hypot(P,Q)/V)/d(P,Q)^2
+    scale = float(w[0] * (-res[0])) / (v_val * (s_val ** 3))
+    expected_sub = scale * np.array(
+        [[q_val * q_val, -p_val * q_val], [-p_val * q_val, p_val * p_val]],
+        dtype=np.float64,
+    )
+    assert np.allclose(H2_mat[np.ix_([1, 3], [1, 3])], expected_sub, rtol=1e-12, atol=1e-12)
+    assert H2_mat[3, 3] > 80.0  # Q 过零处恢复百量级正交曲率
+
+    # 正残差时不应注入非正定曲率
+    _, has_pos = build_converter_current_curvature_columns(
+        4,
+        np.array([0], dtype=np.int64),
+        np.array([1], dtype=np.int32),
+        np.array([3], dtype=np.int32),
+        np.array([v_val], dtype=np.float64),
+        np.array([p_val], dtype=np.float64),
+        np.array([q_val], dtype=np.float64),
+        np.array([0.05], dtype=np.float64),
+        w,
+    )
+    assert has_pos is False
+
+    # 验证 assume_fixed_pattern=True 的求解器在动态追加曲率列改变列数时不崩溃且求解精确
+    A_base = csc_matrix(np.eye(4, dtype=np.float64) * 2.0)
+    rhs = np.array([1.0, 2.0, -1.0, 0.5], dtype=np.float64)
+    solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True)
+    x1, _ = solver.solve(A_base, rhs)
+    assert np.allclose(x1, rhs / 4.0)
+    A_aug = hstack([A_base, V_curv], format="csc")
+    x2, _ = solver.solve(A_aug, rhs)
+    G_aug = (A_aug @ A_aug.T).toarray()
+    assert np.allclose(G_aug @ x2, rhs, rtol=1e-10, atol=1e-10)
+
+
+def test_zero_injection_tight_conservation_across_ac_dc_hybrid_and_fluid(tmp_path):
+    """验证 AC、DC、Hybrid（含 DCAC 单侧盲区有功损耗守恒）与 Fluid 在带噪盲区下纯零注入节点残差均严格 < 1e-4 p.u.。"""
+    from lfcore.gas_lf import GasPowerFlowCalc
+    from model.gas_model import load_gas_network_from_e_file
+    from secore.gas_se import GasStateEstimator
+
+    rng = np.random.default_rng(20261127)
+
+    # 1. AC 纯零注入联络母线紧守恒（带高斯噪声 + 部分支路盲区）
+    ac_dir = tmp_path / "zi_ac"
+    ac_dir.mkdir()
+    ac_e, ac_tpl = _generate_ac_case(12, ac_dir, seed=811)
+    ppc_ac = build_ac_ppc_from_e_file(ac_e)
+    lf_ac = ACPowerFlowCalc(ppc_ac, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_ac.prepare()
+    assert lf_ac.run(result_mode="array") == 0
+    bus_ac, br_ac = lf_ac.result["bus"], lf_ac.result["branch"]
+    p_base = float(lf_ac.ppc["base"]["p_base"])
+    ac_mlines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 0
+    for i in range(12):
+        mid += 1
+        v_noisy = float(bus_ac[i, 2] * bus_ac[i, 1]) + float(rng.normal(0.0, 0.08))
+        ac_mlines.append(f"# {mid} m_{mid} ACNode bus_{i + 1} V 100.0 1 {v_noisy:.6f}")
+    for i in range(br_ac.shape[0]):
+        if i % 4 == 3:
+            continue  # 25% 支路置盲
+        for mtype, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
+            mid += 1
+            pq_noisy = float(br_ac[i, col] * p_base) + float(rng.normal(0.0, 0.25))
+            ac_mlines.append(f"# {mid} m_{mid} ACBranch br_{i + 1} {mtype} 25.0 1 {pq_noisy:.6f}")
+    ac_mlines.append("</Measurement>")
+    ac_tpl.write_text("\n".join(ac_mlines) + "\n", encoding="utf-8")
+
+    est_ac = ACStateEstimator(ac_e, ac_tpl, parameters=SE_PARAMS, flat_start=True)
+    est_ac.prepare()
+    assert est_ac.observability_analysis().observable
+    res_ac = est_ac.estimate()
+    assert res_ac.converged
+    th_ac, v_ac = est_ac._unpack_state(res_ac.x)
+    vc_ac = est_ac._complex_voltage(th_ac, v_ac)
+    p_bal_ac, q_bal_ac = est_ac._power_balance_totals(res_ac.x, vc_ac, est_ac._switch_current_from_state(res_ac.x))
+    # bus_3, bus_6, bus_9, bus_12 (pos 2, 5, 8, 11) 为无源无荷纯零注入母线
+    zi_pos_ac = [2, 5, 8, 11]
+    assert float(np.max(np.abs(p_bal_ac[zi_pos_ac]))) < 1e-4
+    assert float(np.max(np.abs(q_bal_ac[zi_pos_ac]))) < 1e-4
+
+    # 2. DC 纯零注入母线紧守恒（带高斯噪声 + 部分支路盲区）
+    dc_dir = tmp_path / "zi_dc"
+    dc_dir.mkdir()
+    dc_e, dc_tpl = _generate_dc_case(12, dc_dir, seed=812)
+    ppc_dc = build_dc_ppc_from_e_file(dc_e)
+    lf_dc = DCPowerFlowCalc(ppc_dc, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_dc.prepare()
+    assert lf_dc.run(result_mode="array") == 0
+    bus_dc, br_dc = lf_dc.result["bus"], lf_dc.result["branch"]
+    dc_mlines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 0
+    for i in range(12):
+        mid += 1
+        v_noisy = float(bus_dc[i, 2] * bus_dc[i, 1]) + float(rng.normal(0.0, 0.08))
+        dc_mlines.append(f"# {mid} m_{mid} DCNode dcbus_{i + 1} V 100.0 1 {v_noisy:.6f}")
+    for i in range(br_dc.shape[0]):
+        if i % 4 == 2:
+            continue
+        for mtype, col in (("P_FROM", 5), ("P_TO", 6)):
+            mid += 1
+            p_noisy = float(br_dc[i, col] * p_base) + float(rng.normal(0.0, 0.25))
+            dc_mlines.append(f"# {mid} m_{mid} DCBranch dcbr_{i + 1} {mtype} 25.0 1 {p_noisy:.6f}")
+    dc_mlines.append("</Measurement>")
+    dc_tpl.write_text("\n".join(dc_mlines) + "\n", encoding="utf-8")
+
+    est_dc = DCStateEstimator(dc_e, dc_tpl, parameters=SE_PARAMS, flat_start=True)
+    est_dc.prepare()
+    assert est_dc.observability_analysis().observable
+    res_dc = est_dc.estimate()
+    assert res_dc.converged
+    v_dc, _, _, _ = est_dc._unpack_state(res_dc.x)
+    i_bal_dc = est_dc._dc_kcl_g_csr.dot(v_dc)
+    zi_pos_dc = [2, 5, 8, 11]
+    assert float(np.max(np.abs(v_dc[zi_pos_dc] * i_bal_dc[zi_pos_dc]))) < 1e-4
+
+    # 3. Hybrid 交直流零注入紧守恒 + DCACConverter 直流功率盲区有功损耗守恒紧约束
+    hyb_dir = tmp_path / "zi_hyb"
+    hyb_dir.mkdir()
+    hyb_e, hyb_m = _generate_hybrid_case(12, 12, hyb_dir)
+    hcalc = HybridPowerFlowCalc.from_file_fast(hyb_e, parameters=LF_PARAMS, verbose=False)
+    hcalc.prepare()
+    assert hcalc.run(result_mode="array") == 0
+    ac_r, dc_r = hcalc.ac_calc.result, hcalc.dc_calc.result
+    conv_true = hcalc.network.dcac_converters[0]
+    p_dc_true = float(conv_true.dc_p)
+    p_ac_true = float(conv_true.ac_p)
+    q_ac_true = float(conv_true.ac_q)
+
+    h_mlines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 0
+    for i in range(12):
+        mid += 1
+        h_mlines.append(f"# {mid} m_{mid} ACNode bus_{i + 1} V 100.0 1 {float(ac_r['bus'][i, 2] * ac_r['bus'][i, 1]) + float(rng.normal(0.0, 0.05)):.6f}")
+    for i in range(ac_r["branch"].shape[0]):
+        for mtype, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
+            mid += 1
+            h_mlines.append(f"# {mid} m_{mid} ACBranch br_{i + 1} {mtype} 25.0 1 {float(ac_r['branch'][i, col] * p_base) + float(rng.normal(0.0, 0.15)):.6f}")
+    for i in range(12):
+        mid += 1
+        h_mlines.append(f"# {mid} m_{mid} DCNode dcbus_{i + 1} V 100.0 1 {float(dc_r['bus'][i, 2] * dc_r['bus'][i, 1]) + float(rng.normal(0.0, 0.05)):.6f}")
+    for i in range(dc_r["branch"].shape[0]):
+        # 将与耦合母线 dcbus_3 相连的部分支路置盲，考验 DCAC P_LOSS_BALANCE 跨侧紧约束恢复能力
+        if int(round(dc_r["branch"][i, 1])) == 3 or int(round(dc_r["branch"][i, 2])) == 3:
+            continue
+        for mtype, col in (("P_FROM", 5), ("P_TO", 6)):
+            mid += 1
+            h_mlines.append(f"# {mid} m_{mid} DCBranch dcbr_{i + 1} {mtype} 25.0 1 {float(dc_r['branch'][i, col] * p_base) + float(rng.normal(0.0, 0.15)):.6f}")
+    # 故意不提供 DCACConverter 的 P_DC / I_DC 测点（直流侧完全盲区），仅提供交流侧 P_AC / Q_AC
+    mid += 1
+    h_mlines.append(f"# {mid} m_{mid} DCACConverter dcac_1 P_AC 100.0 1 {p_ac_true * p_base:.6f}")
+    mid += 1
+    h_mlines.append(f"# {mid} m_{mid} DCACConverter dcac_1 Q_AC 100.0 1 {q_ac_true * p_base:.6f}")
+    h_mlines.append("</Measurement>")
+    hyb_m.write_text("\n".join(h_mlines) + "\n", encoding="utf-8")
+
+    est_hyb = HybridStateEstimator(hyb_e, hyb_m, parameters=SE_PARAMS, flat_start=True)
+    est_hyb.prepare()
+    assert est_hyb.observability_analysis().observable
+    res_hyb = est_hyb.estimate()
+    assert res_hyb.converged
+    ac_x_h, dc_x_h, hyb_x_h = est_hyb._split_state(res_hyb.x)
+    # 校验 DCAC 有功损耗守恒残差与跨侧 P_DC 恢复精度
+    p_dc_est, p_ac_est, q_ac_est = float(hyb_x_h[0]), float(hyb_x_h[1]), float(hyb_x_h[2])
+    vd_est = float(dc_x_h[2])
+    _, va_vec = est_hyb._ac_sub_estimator._unpack_state(ac_x_h)
+    va_est = float(va_vec[2])
+    loss_res = abs(
+        (p_dc_est + p_ac_est)
+        - 0.005 * (p_dc_est / vd_est) ** 2
+        - 0.005 * (p_ac_est**2 + q_ac_est**2) / (va_est**2)
+    )
+    assert loss_res < 1e-6
+    assert abs(p_dc_est - p_dc_true) < 1e-3
+    # 校验 AC/DC 纯零注入母线 (pos 5, 8, 11；pos 2 为换流器耦合母线已自动豁免)
+    th_h, v_h = est_hyb._ac_sub_estimator._unpack_state(ac_x_h)
+    vc_h = est_hyb._ac_sub_estimator._complex_voltage(th_h, v_h)
+    pb_h, qb_h = est_hyb._ac_sub_estimator._power_balance_totals(ac_x_h, vc_h, est_hyb._ac_sub_estimator._switch_current_from_state(ac_x_h))
+    assert float(np.max(np.abs(pb_h[[5, 8, 11]]))) < 1e-4
+    assert float(np.max(np.abs(qb_h[[5, 8, 11]]))) < 1e-4
+    v_dc_h, _, _, _ = est_hyb._dc_sub_estimator._unpack_state(dc_x_h)
+    ib_dc_h = est_hyb._dc_sub_estimator._dc_kcl_g_csr.dot(v_dc_h)
+    assert float(np.max(np.abs(v_dc_h[[5, 8, 11]] * ib_dc_h[[5, 8, 11]]))) < 1e-4
+
+    # 4. Fluid (Gas) 纯汇流节点质量流量紧守恒（带量测噪声）
+    gas_e = tmp_path / "gas_zi.e"
+    gas_e.write_text(
+        "\n".join(
+            [
+                "<GasMedium>",
+                "@ density compressibility molar_mass temperature flow_factor",
+                "# 0.8 1.0 0.018 288.15 1.0",
+                "</GasMedium>",
+                "<GasNode>",
+                "@ idx name pressure run_stat",
+                "# 1 gn_1 60.0 1",
+                "# 2 gn_2 58.0 1",
+                "# 3 gn_3 55.0 1",
+                "# 4 gn_4 54.0 1",
+                "</GasNode>",
+                "<GasSource>",
+                "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+                "# 1 gs_1 1 PRESSURE 60.0 0.0 1.0 0.0 200.0 1",
+                "</GasSource>",
+                "<GasLoad>",
+                "@ idx name node flow_set run_stat",
+                "# 1 gl_3 3 4.0 1",
+                "# 2 gl_4 4 6.0 1",
+                "</GasLoad>",
+                "<GasPipe>",
+                "@ idx name i_node j_node conductance run_stat",
+                "# 1 gp_1 1 2 1.2 1",
+                "# 2 gp_2 2 3 0.8 1",
+                "# 3 gp_3 2 4 1.0 1",
+                "</GasPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    net_gas_lf = load_gas_network_from_e_file(gas_e)
+    lf_gas = GasPowerFlowCalc(net_gas_lf, parameters=LF_PARAMS)
+    lf_gas.prepare()
+    assert lf_gas.run() == 0
+    # 用精确潮流解构造带噪量测（gn_2 为无源无荷纯汇流节点）
+    p_true_g = [float(nd.pressure) for nd in net_gas_lf.nodes]
+    gas_m = tmp_path / "gas_zi.meas"
+    g_rows = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value",
+        f"# 1 gm1 GasNode gn_1 PRESSURE 100.0 1 {p_true_g[0] + 0.05:.6f}",
+        f"# 2 gm2 GasNode gn_2 PRESSURE 100.0 1 {p_true_g[1] - 0.08:.6f}",
+        f"# 3 gm3 GasNode gn_3 PRESSURE 100.0 1 {p_true_g[2] + 0.06:.6f}",
+        f"# 4 gm4 GasNode gn_4 PRESSURE 100.0 1 {p_true_g[3] - 0.04:.6f}",
+        "# 5 gm5 GasPipe gp_1 FLOW_FROM 25.0 1 10.25",
+        "# 6 gm6 GasPipe gp_2 FLOW_TO 25.0 1 -4.15",
+        "</Measurement>",
+    ]
+    gas_m.write_text("\n".join(g_rows) + "\n", encoding="utf-8")
+    est_gas = GasStateEstimator(load_gas_network_from_e_file(gas_e), str(gas_m), parameters=SE_PARAMS, flat_start=True)
+    assert est_gas.run() == 0
+    assert est_gas.result is not None and est_gas.result.converged
+    _, flow_g, _ = est_gas._flow_state_arrays(est_gas.result.x, need_derivative=False)
+    zi_imb_gas = abs(float((est_gas.network.incidence @ flow_g)[1]))
+    assert zi_imb_gas / max(float(np.max(np.abs(flow_g))), 1.0) < 1e-4
+
+
+def test_steam_prv_blind_regulated_flow_anti_runaway_and_no_false_bdr(tmp_path):
+    """复现减压阀 SteamPressureReducer 流量盲区场景 (#2913 机理)：验证受控流量不逃逸、零误删健康量测且快速收敛。"""
+    from lfcore.steam_lf import SteamPowerFlowCalc
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.steam_se import SteamStateEstimator
+
+    e_file = tmp_path / "steam_prv_blind.e"
+    e_file.write_text(
+        "\n".join(
+            [
+                "<SteamMedium>",
+                "@ gas_constant enthalpy_ref specific_heat_p ambient_temperature",
+                "# 461.5 2500.0 2.1 20.0",
+                "</SteamMedium>",
+                "<SteamNode>",
+                "@ idx name pressure enthalpy run_stat",
+                "# 1 sn_1 12.0 2950.0 1",
+                "# 2 sn_2 6.0 2945.0 1",
+                "# 3 sn_3 5.6 2935.0 1",
+                "# 4 sn_4 5.5 2930.0 1",
+                "</SteamNode>",
+                "<SteamSource>",
+                "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+                "# 1 ss_1 1 PRESSURE 12.0 0.0 2950.0 1.0 0.0 500.0 1",
+                "</SteamSource>",
+                "<SteamLoad>",
+                "@ idx name node flow_set condensate_enthalpy run_stat",
+                "# 1 sl_3 3 2.0 419.0 1",
+                "# 2 sl_4 4 3.0 419.0 1",
+                "</SteamLoad>",
+                "<SteamPressureReducer>",
+                "@ idx name i_node j_node control_type ratio flow_set heat_loss run_stat",
+                "# 1 sprv_1 1 2 RATIO 0.5 0.0 0.0001 1",
+                "</SteamPressureReducer>",
+                "<SteamPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat",
+                "# 1 sp_1 2 3 1.5 0.00002 1",
+                "# 2 sp_2 2 4 2.0 0.00002 1",
+                "</SteamPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    net_lf = load_steam_network_from_e_file(e_file)
+    lf = SteamPowerFlowCalc(net_lf, parameters=LF_PARAMS)
+    lf.prepare()
+    assert lf.run() == 0
+    net_lf.node_pressure[:] = lf.pressure
+    net_lf.node_enthalpy[:] = lf.enthalpy
+
+    # 用潮流真解生成量测：故意将 sprv_1 流量完全置盲，并在 sp_1 FLOW_FROM 注入 1 条大幅坏数据
+    tpl_m = tmp_path / "steam_prv_tpl.meas"
+    tpl_rows = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value",
+        "# 1 m1 SteamNode sn_1 PRESSURE 200.0 1 12.0",
+        "# 2 m2 SteamNode sn_2 PRESSURE 200.0 1 6.0",
+        "# 3 m3 SteamNode sn_3 PRESSURE 200.0 1 5.6",
+        "# 4 m4 SteamNode sn_4 PRESSURE 200.0 1 5.5",
+        "# 5 m5 SteamNode sn_1 ENTHALPY 10.0 1 2950.0",
+        "# 6 m6 SteamNode sn_2 ENTHALPY 10.0 1 2945.0",
+        "# 7 m7 SteamNode sn_3 ENTHALPY 10.0 1 2935.0",
+        "# 8 m8 SteamNode sn_4 ENTHALPY 10.0 1 2930.0",
+        "# 9 m9 SteamPressureReducer sprv_1 PRESSURE_TO 200.0 1 6.0",
+        "# 10 m10 SteamPressureReducer sprv_1 H_TO 10.0 1 2945.0",
+        "# 11 m11 SteamPipe sp_1 FLOW_FROM 100.0 1 2.0",
+        "# 12 m12 SteamPipe sp_1 FLOW_TO 100.0 1 -2.0",
+        "# 13 m13 SteamPipe sp_2 FLOW_FROM 100.0 1 3.0",
+        "# 14 m14 SteamPipe sp_2 FLOW_TO 100.0 1 -3.0",
+        "</Measurement>",
+    ]
+    tpl_m.write_text("\n".join(tpl_rows) + "\n", encoding="utf-8")
+
+    ref_est = SteamStateEstimator(net_lf, str(tpl_m), parameters=SE_PARAMS, flat_start=False)
+    ref_est.prepare()
+    x_true = ref_est.initial_state(flat_start=False)
+    reg_col_idx = int(ref_est.regulated_state_by_edge[ref_est.network.regulated_edge_pos[0]])
+    true_reg_flow = float(lf.edge_flow[ref_est.network.regulated_edge_pos[0]])
+    x_true[reg_col_idx] = true_reg_flow
+    z_true = ref_est.evaluate(x_true, ref_est.active_measurements)
+
+    m_file = tmp_path / "steam_prv_blind.meas"
+    m_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    for pos, m_obj in enumerate(ref_est.active_measurements):
+        val = float(z_true[pos])
+        if m_obj.name == "m11":
+            val += 35.0  # 强坏数据
+        m_rows.append(
+            f"# {int(m_obj.idx)} {m_obj.name} {m_obj.device_type} {m_obj.device_name} "
+            f"{m_obj.meas_type} {float(m_obj.weight):.1f} 1 {val:.6f}"
+        )
+    m_rows.append("</Measurement>")
+    m_file.write_text("\n".join(m_rows) + "\n", encoding="utf-8")
+
+    est = SteamStateEstimator(
+        net_lf,
+        str(m_file),
+        parameters=SE_PARAMS.with_overrides(max_iter=80, max_remove=None),
+        flat_start=True,
+    )
+    assert est.run(remove_bad_data=True) == 0
+    assert est.result is not None and est.result.converged
+    assert est.result.iterations <= 35
+    assert [str(it.measurement.name) for it in est.bad_data] == ["m11"]
+    _, flow_e, _ = est._flow_state_arrays(est.result.x, need_derivative=False)
+    est_reg_col = int(est.regulated_state_by_edge[est.network.regulated_edge_pos[0]])
+    assert float(est.result.x[est_reg_col]) == pytest.approx(true_reg_flow, abs=0.2)
+    # 纯汇流节点 sn_2 (pos 1) 守恒残差 < 1e-3
+    assert abs(float((est.network.incidence @ flow_e)[1])) < 1e-3
+
+
+def test_multi_energy_state_bounds_fixed_scale_and_bad_data_removal(tmp_path):
+    """验证多能联合状态估计 (ME) 的流体状态盒边界防无界逃逸、固定尺度防伪收敛及 run(remove_bad_data=True) 跨能域剔除。"""
+    from lfcore.gas_lf import GasPowerFlowCalc
+    from model.gas_model import load_gas_network_from_e_file
+
+    me_e = tmp_path / "me_bounds_zi.e"
+    me_e.write_text(
+        "\n".join(
+            [
+                "<Model>",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100.0 kV MW kA",
+                "</Model>",
+                "<ACNode>",
+                "@ idx name vbase voltage angle isl run_stat",
+                "# 1 ac_1 110.0 110.0 0.0 1 1",
+                "# 2 ac_2 110.0 110.0 0.0 1 1",
+                "# 3 ac_3 110.0 110.0 0.0 1 1",
+                "</ACNode>",
+                "<ACBranch>",
+                "@ idx name i_node j_node r x b run_stat",
+                "# 1 br_1_2 1 2 0.01 0.04 0.002 1",
+                "# 2 br_2_3 2 3 0.01 0.04 0.002 1",
+                "</ACBranch>",
+                "<ACGenerator>",
+                "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                "# 1 g1 1 SLACK 0.0 0.0 110.0 1.0 1",
+                "</ACGenerator>",
+                "<ACLoad>",
+                "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                "# 1 ld3 3 0.25 1.0 0.0 0.0 0.06 1.0 0.0 0.0 1",
+                "</ACLoad>",
+                "<GasMedium>",
+                "@ density compressibility molar_mass temperature flow_factor",
+                "# 0.8 1.0 0.018 288.15 1.0",
+                "</GasMedium>",
+                "<GasNode>",
+                "@ idx name pressure run_stat",
+                "# 1 gn_1 50.0 1",
+                "# 2 gn_2 48.0 1",
+                "# 3 gn_3 45.0 1",
+                "</GasNode>",
+                "<GasSource>",
+                "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+                "# 1 gs_1 1 PRESSURE 50.0 0.0 1.0 0.0 100.0 1",
+                "</GasSource>",
+                "<GasLoad>",
+                "@ idx name node flow_set run_stat",
+                "# 1 gl_3 3 5.0 1",
+                "</GasLoad>",
+                "<GasPipe>",
+                "@ idx name i_node j_node conductance run_stat",
+                "# 1 gp_1_2 1 2 1.2 1",
+                "# 2 gp_2_3 2 3 1.2 1",
+                "</GasPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ppc_ac = build_ac_ppc_from_e_file(me_e)
+    lf_ac = ACPowerFlowCalc(ppc_ac, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_ac.prepare()
+    assert lf_ac.run(result_mode="array") == 0
+    net_g = load_gas_network_from_e_file(me_e)
+    lf_g = GasPowerFlowCalc(net_g, parameters=LF_PARAMS)
+    lf_g.prepare()
+    assert lf_g.run() == 0
+
+    bus_ac, br_ac = lf_ac.result["bus"], lf_ac.result["branch"]
+    p_g = [float(nd.pressure) for nd in net_g.nodes]
+    me_m = tmp_path / "me_bounds_zi.meas"
+    me_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value",
+                f"# 1 m1 ACNode ac_1 V 100.0 1 {bus_ac[0, 2] * bus_ac[0, 1]:.6f}",
+                f"# 2 m2 ACNode ac_2 V 100.0 1 {bus_ac[1, 2] * bus_ac[1, 1]:.6f}",
+                f"# 3 m3 ACNode ac_3 V 100.0 1 {bus_ac[2, 2] * bus_ac[2, 1]:.6f}",
+                f"# 4 m4 ACBranch br_1_2 P_FROM 100.0 1 {br_ac[0, 7] * 100.0:.6f}",
+                f"# 5 m5 ACBranch br_1_2 Q_FROM 100.0 1 {br_ac[0, 8] * 100.0:.6f}",
+                f"# 6 m6 ACBranch br_2_3 P_FROM 100.0 1 {br_ac[1, 7] * 100.0 + 350.0:.6f}",  # 电侧极端强粗差 (|r_N| > 25)
+                f"# 7 m7 ACBranch br_2_3 P_TO 100.0 1 {br_ac[1, 10] * 100.0:.6f}",
+                f"# 8 m8 ACBranch br_2_3 Q_FROM 100.0 1 {br_ac[1, 8] * 100.0:.6f}",
+                f"# 9 m9 ACBranch br_2_3 Q_TO 100.0 1 {br_ac[1, 11] * 100.0:.6f}",
+                f"# 10 m10 GasNode gn_1 PRESSURE 200.0 1 {p_g[0]:.6f}",
+                f"# 11 m11 GasNode gn_2 PRESSURE 200.0 1 {p_g[1]:.6f}",
+                f"# 12 m12 GasNode gn_3 PRESSURE 200.0 1 {p_g[2] + 30.0:.6f}",  # 气侧强坏数据
+                f"# 13 m13 GasNode gn_3 PRESSURE 200.0 1 {p_g[2]:.6f}",
+                "# 14 m14 GasPipe gp_1_2 FLOW_FROM 100.0 1 5.0",
+                "# 15 m15 GasPipe gp_2_3 FLOW_TO 100.0 1 -5.0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    me_est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS.with_overrides(max_remove=5), flat_start=True)
+    me_est.prepare()
+    # 1. 验证流体状态防逃逸盒边界裁剪（根治 1e114 伪收敛）
+    gas_sl = me_est.fluid_state_slices["gas"]
+    x_wild = me_est._multi_energy_initial_state()
+    x_wild[gas_sl.start] = -999.0
+    x_wild[gas_sl.stop - 1] = 1.0e40
+    x_clipped = me_est._apply_multi_energy_state_bounds(x_wild)
+    assert float(np.min(x_clipped[gas_sl])) > 0.0
+    assert float(np.max(x_clipped[gas_sl])) < 1.0e12
+
+    # 2. 验证 run(remove_bad_data=True) 跨能域坏数据剔除与电/气零注入紧守恒 (ac_2 与 gn_2 均为纯零注入节点)
+    res_out = me_est.run(remove_bad_data=True)
+    assert res_out is not None
+    assert me_est.multi_energy_estimate_result is not None and me_est.multi_energy_estimate_result.converged
+    rem_names = {str(it.measurement.name) for it in me_est.removed_bad_data}
+    assert {"m6", "m12"}.issubset(rem_names)
+
+    ac_sub = me_est._ac_sub_estimator
+    ac_x = me_est.multi_energy_estimate_result.x[: ac_sub.n_state]
+    th_m, v_m = ac_sub._unpack_state(ac_x)
+    pb_m, qb_m = ac_sub._power_balance_totals(ac_x, ac_sub._complex_voltage(th_m, v_m), ac_sub._switch_current_from_state(ac_x))
+    assert abs(float(pb_m[1])) < 1e-4 and abs(float(qb_m[1])) < 1e-4
+
+    gas_sub = me_est.fluid_estimators["gas"]
+    _, flow_m, _ = gas_sub._flow_state_arrays(me_est.multi_energy_estimate_result.x[gas_sl], need_derivative=False)
+    assert abs(float((gas_sub.network.incidence @ flow_m)[1])) < 1e-4
+
+
+def test_auto_extreme_bad_data_caps_vs_explicit_max_remove(tmp_path):
+    """验证全自动模式下高显著性极端粗差弹性配额生效，且显式 max_remove 严格受控不突破。"""
+    # 1. 接口契约断言：200 测点常规上限为 (1, 1)，全自动极端粗差弹性上限为 (7, 1)；显式指定时完全不扩增
+    assert algorithm_parameters.resolve_bad_data_limits(200) == (1, 1)
+    assert algorithm_parameters.resolve_auto_extreme_bad_data_caps(200) == (7, 1)
+    assert algorithm_parameters.resolve_auto_extreme_bad_data_caps(2000) == (70, 8)
+    assert algorithm_parameters.resolve_auto_extreme_bad_data_caps(2000, max_remove=4, max_remove_per_round=2) == (4, 2)
+    assert algorithm_parameters.resolve_auto_extreme_bad_data_caps(2000, param_max_remove=5) == (5, 5)
+
+    # 2. 端到端验证：25 节点 AC 网络（~185 真实测点，常规自动上限仅 1 条）注入 4 条 |r_N| > 30 的极端强粗差
+    ac_dir = tmp_path / "ext_caps_ac"
+    ac_dir.mkdir()
+    ac_e, ac_m = _generate_ac_case(25, ac_dir, seed=909)
+    ppc_ac = build_ac_ppc_from_e_file(ac_e)
+    lf_ac = ACPowerFlowCalc(ppc_ac, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_ac.prepare()
+    assert lf_ac.run(result_mode="array") == 0
+    bus_ac, br_ac = lf_ac.result["bus"], lf_ac.result["branch"]
+    p_base = float(lf_ac.ppc["base"]["p_base"])
+
+    mlines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 0
+    for i in range(25):
+        mid += 1
+        mlines.append(f"# {mid} m_{mid} ACNode bus_{i + 1} V 100.0 1 {bus_ac[i, 2] * bus_ac[i, 1]:.6f}")
+    bad_br_indices = {0, 7, 15, 23}
+    for i in range(br_ac.shape[0]):
+        for mtype, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
+            mid += 1
+            val = float(br_ac[i, col] * p_base)
+            if i in bad_br_indices and mtype == "P_FROM":
+                val += 500.0  # 5.0 p.u. * sqrt(25) = 25 > 15，构成高显著性极端强粗差
+            mlines.append(f"# {mid} m_{mid} ACBranch br_{i + 1} {mtype} 25.0 1 {val:.6f}")
+    mlines.append("</Measurement>")
+    ac_m.write_text("\n".join(mlines) + "\n", encoding="utf-8")
+
+    # 2a. 全自动模式 (max_remove=None)：突破常规 1 条配额，将 4 条极端强粗差全部剔除干净
+    auto_params = SE_PARAMS.with_overrides(max_remove=None, bad_threshold=3.5)
+    est_auto = ACStateEstimator(ac_e, ac_m, parameters=auto_params, flat_start=True)
+    res_auto, rem_auto = est_auto.estimate_with_bad_data_removal(threshold=3.5, max_remove=None)
+    assert res_auto.converged
+    assert len(rem_auto) == 4
+    left_bad, _ = est_auto.identify_bad_data(res_auto, threshold=3.5)
+    assert len(left_bad) == 0
+
+    # 2b. 显式指定 max_remove=2：严格服从调用方限额，绝不突破为 >2 条
+    est_exp = ACStateEstimator(ac_e, ac_m, parameters=auto_params, flat_start=True)
+    res_exp, rem_exp = est_exp.estimate_with_bad_data_removal(threshold=3.5, max_remove=2)
+    assert len(rem_exp) == 2
+
+
+def test_fluid_hetero_zi_tight_conservation_and_me_coupling_prior_isolation(tmp_path):
+    """验证异构权重+高权重压力测点+等压初值下流体零注入不误豁免且残差 < 1e-4，且多能耦合先验权重不被紧约束污染。"""
+    from lfcore.gas_lf import GasPowerFlowCalc
+    from model.gas_model import load_gas_network_from_e_file
+    from model.meas_type import MEAS_TYPE_FLOW_BALANCE
+    from secore.gas_se import GasStateEstimator
+
+    # 1. 构造节点初始压力全部相同 (60.0 -> 初值 delta=0) 的气网 .e 文件，模拟 #2401 / #2462 异构权重场景
+    gas_e = tmp_path / "gas_hetero_flat_init.e"
+    gas_e.write_text(
+        "\n".join(
+            [
+                "<GasMedium>",
+                "@ density compressibility molar_mass temperature flow_factor",
+                "# 0.8 1.0 0.018 288.15 1.0",
+                "</GasMedium>",
+                "<GasNode>",
+                "@ idx name pressure run_stat",
+                "# 1 gn_1 60.0 1",
+                "# 2 gn_2 60.0 1",
+                "# 3 gn_3 60.0 1",
+                "# 4 gn_4 60.0 1",
+                "</GasNode>",
+                "<GasSource>",
+                "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+                "# 1 gs_1 1 PRESSURE 60.0 0.0 1.0 0.0 200.0 1",
+                "</GasSource>",
+                "<GasLoad>",
+                "@ idx name node flow_set run_stat",
+                "# 1 gl_3 3 4.5 1",
+                "# 2 gl_4 4 5.5 1",
+                "</GasLoad>",
+                "<GasPipe>",
+                "@ idx name i_node j_node conductance run_stat",
+                "# 1 gp_1 1 2 1.2 1",
+                "# 2 gp_2 2 3 0.9 1",
+                "# 3 gp_3 2 4 1.1 1",
+                "</GasPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    net_lf = load_gas_network_from_e_file(gas_e)
+    lf = GasPowerFlowCalc(net_lf, parameters=LF_PARAMS)
+    lf.prepare()
+    assert lf.run() == 0
+    p_true = [float(p) for p in lf.pressure]
+    f_true = [float(f) for f in lf.edge_flow]
+
+    # 压力测点赋高权重 5000.0，多条流量测点赋极低异构权重 0.01，叠加真实测量噪声
+    gas_m = tmp_path / "gas_hetero_flat_init.meas"
+    gas_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value",
+                f"# 1 gm1 GasNode gn_1 PRESSURE 5000.0 1 {p_true[0] + 0.02:.6f}",
+                f"# 2 gm2 GasNode gn_2 PRESSURE 5000.0 1 {p_true[1] - 0.03:.6f}",
+                f"# 3 gm3 GasNode gn_3 PRESSURE 5000.0 1 {p_true[2] + 0.02:.6f}",
+                f"# 4 gm4 GasNode gn_4 PRESSURE 5000.0 1 {p_true[3] - 0.02:.6f}",
+                f"# 5 gm5 GasPipe gp_1 FLOW_FROM 0.01 1 {f_true[0] + 0.3:.6f}",
+                f"# 6 gm6 GasPipe gp_1 FLOW_TO 0.01 1 {-f_true[0] - 0.2:.6f}",
+                f"# 7 gm7 GasPipe gp_2 FLOW_FROM 0.01 1 {f_true[1] - 0.25:.6f}",
+                f"# 8 gm8 GasPipe gp_3 FLOW_FROM 0.01 1 {f_true[2] + 0.25:.6f}",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # 故意从磁盘加载未更新等压初值的 gas_e
+    est = GasStateEstimator(load_gas_network_from_e_file(gas_e), str(gas_m), parameters=SE_PARAMS, flat_start=True)
+    assert est.run() == 0
+    assert est.result is not None and est.result.converged
+    tbl = est.active_measurements.table
+    fbal_mask = tbl.meas_type_code == MEAS_TYPE_FLOW_BALANCE
+    assert int(np.count_nonzero(fbal_mask)) == 1  # gn_2 未被误豁免
+    assert float(tbl.weight[fbal_mask][0]) > 5000.0  # 紧权重未被 delta=0 或低权重中位数压扁
+    _, flow_est, _ = est._flow_state_arrays(est.result.x, need_derivative=False)
+    zi_pu = abs(float((est.network.incidence @ flow_est)[1])) / max(float(np.max(np.abs(flow_est))), 1.0)
+    assert zi_pu < 1e-4
+
+    # 2. 验证多能联合估计耦合先验权重不被电/气零注入紧约束放大污染，且停运端耦合潮流汇总不抛 TypeError
+    me_e = tmp_path / "me_prior_iso.e"
+    me_e.write_text(
+        "\n".join(
+            [
+                "<Model>",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100.0 kV MW kA",
+                "</Model>",
+                "<ACNode>",
+                "@ idx name vbase voltage angle isl run_stat",
+                "# 1 ac_1 110.0 110.0 0.0 1 1",
+                "# 2 ac_2 110.0 110.0 0.0 1 1",
+                "# 3 ac_3 110.0 110.0 0.0 1 1",
+                "# 4 ac_dead 110.0 110.0 0.0 0 0",
+                "</ACNode>",
+                "<ACBranch>",
+                "@ idx name i_node j_node r x b run_stat",
+                "# 1 br_1_2 1 2 0.01 0.04 0.002 1",
+                "# 2 br_2_3 2 3 0.01 0.04 0.002 1",
+                "</ACBranch>",
+                "<ACGenerator>",
+                "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                "# 1 g1 1 SLACK 0.0 0.0 110.0 1.0 1",
+                "# 2 g_dead 4 PQ 0.1 0.0 110.0 1.0 0",
+                "</ACGenerator>",
+                "<ACLoad>",
+                "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                "# 1 ld3 3 0.20 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+                "</ACLoad>",
+            ]
+        )
+        + "\n"
+        + gas_e.read_text(encoding="utf-8")
+        + "\n".join(
+            [
+                "<GasElectricCoupling>",
+                "@ idx name ac_gen gas_load control_type g2e_coeff run_stat",
+                "# 1 gec_dead 2 1 P 0.2 1",
+                "</GasElectricCoupling>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    hcalc = HybridPowerFlowCalc.from_file_fast(me_e, parameters=LF_PARAMS, verbose=False)
+    hcalc.prepare()
+    assert hcalc.run(result_mode="array") == 0  # 不因停运端 plan=None 抛 TypeError: float(None)
+
+    me_m = tmp_path / "me_prior_iso.meas"
+    me_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value",
+                "# 1 m1 ACNode ac_1 V 100.0 1 110.0",
+                "# 2 m2 ACNode ac_2 V 100.0 1 109.8",
+                "# 3 m3 ACNode ac_3 V 100.0 1 109.6",
+                "# 4 m4 ACBranch br_1_2 P_FROM 50.0 1 20.0",
+                "# 5 m5 ACBranch br_1_2 Q_FROM 50.0 1 5.0",
+                "# 6 m6 ACBranch br_2_3 P_FROM 50.0 1 20.0",
+                "# 7 m7 ACBranch br_2_3 Q_FROM 50.0 1 5.0",
+                f"# 8 gm1 GasNode gn_1 PRESSURE 100.0 1 {p_true[0]:.6f}",
+                f"# 9 gm2 GasNode gn_2 PRESSURE 100.0 1 {p_true[1]:.6f}",
+                f"# 10 gm3 GasNode gn_3 PRESSURE 100.0 1 {p_true[2]:.6f}",
+                f"# 11 gm4 GasNode gn_4 PRESSURE 100.0 1 {p_true[3]:.6f}",
+                f"# 12 gm5 GasPipe gp_1 FLOW_FROM 50.0 1 {f_true[0]:.6f}",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    me_est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS, flat_start=True)
+    me_est.prepare()
+    assert me_est.run() is not None
+    assert me_est.multi_energy_coupling_prior_weight <= 200.0
+    gas_sub = me_est.fluid_estimators["gas"]
+    gas_sl = me_est.fluid_state_slices["gas"]
+    _, me_flow, _ = gas_sub._flow_state_arrays(me_est.multi_energy_estimate_result.x[gas_sl], need_derivative=False)
+    assert abs(float((gas_sub.network.incidence @ me_flow)[1])) / max(float(np.max(np.abs(me_flow))), 1.0) < 1e-4
+
+
+def test_dc_and_ac_low_impedance_hetero_zi_tight_conservation(tmp_path):
+    """验证极低阻抗支路 (高 jac_sq / y_row_sq) + 异构高权重 + 多粗差下 DC 与 AC 零注入母线紧权重不塌缩且残差 < 1e-4。"""
+    rng = np.random.default_rng(20261128)
+
+    # 1. DC 极低电阻网络 (R ~ 0.0015 p.u. -> G ~ 667 p.u., jac_sq > 1e6) + 异构高权重 (10.0 ~ 1e5) + 2 条强粗差
+    dc_dir = tmp_path / "low_r_dc"
+    dc_dir.mkdir()
+    dc_e, dc_m = _generate_dc_case(12, dc_dir, seed=928)
+    dc_lines = []
+    in_dc_br = False
+    for ln in dc_e.read_text(encoding="utf-8").splitlines():
+        if ln == "<DCBranch>":
+            in_dc_br = True
+            dc_lines.append(ln)
+            continue
+        if ln == "</DCBranch>":
+            in_dc_br = False
+            dc_lines.append(ln)
+            continue
+        if in_dc_br and ln.startswith("# "):
+            parts = ln.split()
+            parts[5] = "0.001500"  # 极小线路电阻使 jac_sq 超过 1e6，检验相对行刚度定权不被 2.5e7/jac_sq 压扁
+            dc_lines.append(" ".join(parts))
+        else:
+            dc_lines.append(ln)
+    dc_e.write_text("\n".join(dc_lines) + "\n", encoding="utf-8")
+
+    ppc_dc = build_dc_ppc_from_e_file(dc_e)
+    lf_dc = DCPowerFlowCalc(ppc_dc, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_dc.prepare()
+    assert lf_dc.run(result_mode="array") == 0
+    bus_dc, br_dc = lf_dc.result["bus"], lf_dc.result["branch"]
+    p_base = float(lf_dc.ppc["base"]["p_base"])
+
+    dc_mlines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 0
+    for i in range(12):
+        mid += 1
+        v_val = float(bus_dc[i, 2] * bus_dc[i, 1]) + float(rng.normal(0.0, 0.04))
+        dc_mlines.append(f"# {mid} m_{mid} DCNode dcbus_{i + 1} V 10.0 1 {v_val:.6f}")
+    bad_dc_ids = set()
+    for i in range(br_dc.shape[0]):
+        for mtype, col in (("P_FROM", 5), ("P_TO", 6)):
+            mid += 1
+            w_val = 1.0e5 if (i % 3 == 0) else 400.0
+            p_val = float(br_dc[i, col] * p_base) + float(rng.normal(0.0, 0.20 if w_val < 1e4 else 0.05))
+            if i in {1, 7} and mtype == "P_FROM":
+                p_val += 180.0
+                bad_dc_ids.add(mid)
+            dc_mlines.append(f"# {mid} m_{mid} DCBranch dcbr_{i + 1} {mtype} {w_val:.1f} 1 {p_val:.6f}")
+    dc_mlines.append("</Measurement>")
+    dc_m.write_text("\n".join(dc_mlines) + "\n", encoding="utf-8")
+
+    est_dc = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS, flat_start=True)
+    est_dc.prepare()
+    res_dc, rem_dc = est_dc.estimate_with_bad_data_removal(max_remove=4)
+    assert res_dc.converged
+    assert bad_dc_ids.issubset({int(it.measurement.idx) for it in rem_dc})
+    v_dc, _, _, _ = est_dc._unpack_state(res_dc.x)
+    i_bal_dc = est_dc._dc_kcl_g_csr.dot(v_dc)
+    zi_pos = [2, 5, 8, 11]
+    assert float(np.max(np.abs(v_dc[zi_pos] * i_bal_dc[zi_pos]))) < 1e-4
+    assert float(np.max(np.abs(i_bal_dc[zi_pos]))) < 1e-4
+
+    # 2. AC 极低阻抗短联络线 (R=0.001, X=0.003 p.u. -> y_row_sq > 2e5) + 异构高权重 (10.0 ~ 5e4)
+    ac_dir = tmp_path / "low_z_ac"
+    ac_dir.mkdir()
+    ac_e, ac_m = _generate_ac_case(12, ac_dir, seed=929)
+    ac_lines = []
+    in_ac_br = False
+    for ln in ac_e.read_text(encoding="utf-8").splitlines():
+        if ln == "<ACBranch>":
+            in_ac_br = True
+            ac_lines.append(ln)
+            continue
+        if ln == "</ACBranch>":
+            in_ac_br = False
+            ac_lines.append(ln)
+            continue
+        if in_ac_br and ln.startswith("# "):
+            parts = ln.split()
+            parts[5] = "0.001000"
+            parts[6] = "0.003000"
+            ac_lines.append(" ".join(parts))
+        else:
+            ac_lines.append(ln)
+    ac_e.write_text("\n".join(ac_lines) + "\n", encoding="utf-8")
+
+    ppc_ac = build_ac_ppc_from_e_file(ac_e)
+    lf_ac = ACPowerFlowCalc(ppc_ac, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_ac.prepare()
+    assert lf_ac.run(result_mode="array") == 0
+    bus_ac, br_ac = lf_ac.result["bus"], lf_ac.result["branch"]
+    p_base_ac = float(lf_ac.ppc["base"]["p_base"])
+
+    ac_mlines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 0
+    for i in range(12):
+        mid += 1
+        v_val = float(bus_ac[i, 2] * bus_ac[i, 1]) + float(rng.normal(0.0, 0.03))
+        ac_mlines.append(f"# {mid} m_{mid} ACNode bus_{i + 1} V 10.0 1 {v_val:.6f}")
+    for i in range(br_ac.shape[0]):
+        w_val = 5.0e4 if (i % 3 == 0) else 400.0
+        sig = 0.05 if w_val > 1e4 else 0.20
+        for mtype, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
+            mid += 1
+            val = float(br_ac[i, col] * p_base_ac) + float(rng.normal(0.0, sig))
+            ac_mlines.append(f"# {mid} m_{mid} ACBranch br_{i + 1} {mtype} {w_val:.1f} 1 {val:.6f}")
+    ac_mlines.append("</Measurement>")
+    ac_m.write_text("\n".join(ac_mlines) + "\n", encoding="utf-8")
+
+    est_ac = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS, flat_start=True)
+    est_ac.prepare()
+    res_ac, _ = est_ac.estimate_with_bad_data_removal()
+    assert res_ac.converged
+    th_ac, v_ac = est_ac._unpack_state(res_ac.x)
+    vc_ac = est_ac._complex_voltage(th_ac, v_ac)
+    p_bal_ac, q_bal_ac = est_ac._power_balance_totals(res_ac.x, vc_ac, est_ac._switch_current_from_state(res_ac.x))
+    assert float(np.max(np.abs(p_bal_ac[zi_pos]))) < 1e-4
+    assert float(np.max(np.abs(q_bal_ac[zi_pos]))) < 1e-4
+
+
+def test_fluid_dead_end_zero_injection_tight_and_device_names_preserved(tmp_path):
+    """验证高管导悬空死胡同零注入叶节点在 4% 压力偏差下严格守恒，且追加伪量测后表设备名不丢失。"""
+    from model.gas_model import load_gas_network_from_e_file
+    from secore.gas_se import GasStateEstimator
+
+    e_lines = [
+        "<GasMedium>",
+        "@ density compressibility molar_mass temperature flow_factor",
+        "# 0.72 0.92 0.016 288.15 1.0",
+        "</GasMedium>",
+        "<GasNode>",
+        "@ idx name pressure run_stat",
+        "# 1 gn_1 50.0000 1",
+        "# 2 gn_2 49.5000 1",
+        "# 3 gn_3 49.0000 1",
+        "# 4 gn_dead_end 49.5000 1",
+        "# 5 gn_blind 49.0000 1",
+        "</GasNode>",
+        "<GasSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+        "# 1 gsrc_1 1 PRESSURE 50.0 0.0 1.0 0.0 500.0 1",
+        "</GasSource>",
+        "<GasLoad>",
+        "@ idx name node flow_set run_stat",
+        "# 1 gld_3 3 12.0 1",
+        "# 2 gld_5 5 6.0 1",
+        "</GasLoad>",
+        "<GasPipe>",
+        "@ idx name i_node j_node conductance run_stat",
+        "# 1 gp_1_2 1 2 80.0 1",
+        "# 2 gp_2_3 2 3 80.0 1",
+        "# 3 gp_2_4 2 4 120.0 1",
+        "# 4 gp_3_5 3 5 80.0 1",
+        "</GasPipe>",
+    ]
+    ge = tmp_path / "gas_dead_end.e"
+    ge.write_text("\n".join(e_lines) + "\n", encoding="utf-8")
+
+    # 节点 4 为度数 1 无源无荷死胡同叶节点，施加 4% 压力偏差；节点 5 全盲触发伪量测追加
+    m_lines = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value status",
+        "# 1 m_1 GasNode gn_1 PRESSURE 400.0 1 50.0000 0",
+        "# 2 m_2 GasNode gn_2 PRESSURE 400.0 1 49.9700 0",
+        "# 3 m_3 GasNode gn_3 PRESSURE 400.0 1 49.9400 0",
+        "# 4 m_4 GasNode gn_dead_end PRESSURE 1000.0 1 47.9000 0",
+        "# 5 m_5 GasPipe gp_1_2 FLOW_FROM 100.0 1 18.0000 0",
+        "# 6 m_6 GasPipe gp_2_3 FLOW_FROM 100.0 1 18.0000 0",
+        "</Measurement>",
+    ]
+    gm = tmp_path / "gas_dead_end.meas"
+    gm.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    net = load_gas_network_from_e_file(ge)
+    est = GasStateEstimator(net, str(gm), parameters=SE_PARAMS, flat_start=True)
+    est.prepare()
+    rc = est.run(remove_bad_data=True, verbose=False)
+    assert rc == 0 and est.result.converged
+    _, flow, _ = est._flow_state_arrays(est.result.x, need_derivative=False)
+    node_bal = np.asarray(net.incidence @ flow, dtype=np.float64)
+    # gn_2 (pos=1) 与死胡同叶节点 gn_dead_end (pos=3) 均为零注入节点，相对特征流量 (18.0) 标幺残差严格 < 1e-4
+    f_base = 18.0
+    assert abs(float(node_bal[1])) / f_base < 1e-4
+    assert abs(float(node_bal[3])) / f_base < 1e-4
+    for item in est.active_measurements:
+        assert not str(item.device_name).startswith("pos:")
+
+
+def test_multi_energy_coupled_observability_and_cross_unit_bdr_no_false_unobs(tmp_path):
+    """验证 AC+Steam 多能耦合在 3% 全量测随机偏差与固定权重比焓量纲膨胀下不误删正常比焓测点，且耦合支撑子域不报假性 UNOBS。"""
+    e_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<ACNode>",
+        "@ idx name vbase voltage angle isl run_stat",
+        "# 1 bus_1 110.0 110.0 0.0 1 1",
+        "# 2 bus_2 110.0 109.5 -0.8 1 1",
+        "# 3 bus_3 110.0 109.2 -1.2 1 1",
+        "</ACNode>",
+        "<ACBranch>",
+        "@ idx name i_node j_node r x b run_stat",
+        "# 1 br_1_2 1 2 0.005 0.030 0.002 1",
+        "# 2 br_2_3 2 3 0.006 0.035 0.002 1",
+        "</ACBranch>",
+        "<ACGenerator>",
+        "@ idx name node control_type p_set q_set v_set v_gain run_stat",
+        "# 1 gen_1 1 SLACK 0.0 0.0 110.0 1.0 1",
+        "</ACGenerator>",
+        "<ACLoad>",
+        "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+        "# 1 ld_2 2 0.20 1.0 0.0 0.0 0.05 1.0 0.0 0.0 1",
+        "# 2 ld_3 3 0.15 1.0 0.0 0.0 0.04 1.0 0.0 0.0 1",
+        "</ACLoad>",
+        "<SteamMedium>",
+        "@ density compressibility molar_mass temperature heat_capacity ambient_enthalpy reference_temperature reference_enthalpy feedwater_enthalpy flow_factor",
+        "# 4.0 1.0 0.018 473.15 2.08 419.0 100.0 2676.0 419.0 1.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name pressure enthalpy temperature run_stat",
+        *[f"# {k} sn_{k} {10.0 - 0.02 * (k - 1):.4f} 3000.0 255.76923 1" for k in range(1, 11)],
+        "</SteamNode>",
+        "<SteamSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max enthalpy_set run_stat",
+        "# 1 ssrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 10.0 3000.0 1",
+        "# 2 sfsrc_2 2 FLOW 9.98 0.0684 1.0 0.0 5.0 3000.0 1",
+        "</SteamSource>",
+        "<SteamLoad>",
+        "@ idx name node flow_set condensate_enthalpy run_stat",
+        *[f"# {k - 2} sld_{k} {k} 0.0200 419.0 1" for k in range(3, 11)],
+        "</SteamLoad>",
+        "<SteamPipe>",
+        "@ idx name i_node j_node conductance heat_loss run_stat",
+        *[f"# {k - 1} sp_{k - 1}_{k} {k - 1} {k} 40.0 1.0e-6 1" for k in range(2, 11)],
+        "</SteamPipe>",
+        "<AcE2Steam>",
+        "@ idx name idx_ac_load_t1 idx_steam_source_t2 control_type e2s_coeff run_stat",
+        "# 1 es_1 1 2 P 0.88 1",
+        "</AcE2Steam>",
+    ]
+    me_e = tmp_path / "me_ac_steam_r6.e"
+    me_e.write_text("\n".join(e_lines) + "\n", encoding="utf-8")
+
+    # 先用耦合潮流求精确物理真解，再叠加 2%~3.5% 全量测随机偏差与 1 条巨幅粗差 + 局部缺测
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+    hc = HybridPowerFlowCalc.from_file_fast(me_e, parameters=LF_PARAMS, verbose=False)
+    hc.prepare()
+    assert hc.run(result_mode="array") == 0
+    bus_ac = hc.ac_calc.result["bus"]
+    br_ac = hc.ac_calc.result["branch"]
+    st_lf = hc.fluid_calcs["steam"]
+    clean_map = {}
+    for b in (1, 2, 3):
+        clean_map[("ACNode", f"bus_{b}", "V")] = float(bus_ac[b - 1, 2] * bus_ac[b - 1, 1])
+    for br in (1, 2):
+        for mt, col in (("P_FROM", 7), ("Q_FROM", 8), ("P_TO", 10), ("Q_TO", 11)):
+            clean_map[("ACBranch", f"br_{br}_{br+1}", mt)] = float(br_ac[br - 1, col] * 100.0)
+    for k in range(1, 10):
+        clean_map[("SteamNode", f"sn_{k}", "PRESSURE")] = float(st_lf.pressure[k - 1])
+        clean_map[("SteamNode", f"sn_{k}", "ENTHALPY")] = float(st_lf.enthalpy[k - 1])
+    for k in range(2, 9):
+        clean_map[("SteamPipe", f"sp_{k - 1}_{k}", "FLOW_FROM")] = float(st_lf.edge_flow[k - 2])
+
+    rng = np.random.default_rng(20261128)
+    noisy_rows = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value status"]
+    mid = 0
+    for (dt_s, dn_s, mt_s), base_v in clean_map.items():
+        mid += 1
+        val = base_v * (1.0 + float(rng.uniform(-0.03, 0.03)))
+        if dt_s == "SteamNode" and dn_s == "sn_4" and mt_s == "PRESSURE":
+            val = base_v * 1.75  # 注入 75% 压力大粗差
+        noisy_rows.append(f"# {mid} m_{mid} {dt_s} {dn_s} {mt_s} 100.0 1 {val:.6f} 0")
+    noisy_rows.append("</Measurement>")
+    me_m = tmp_path / "me_ac_steam_r6.meas"
+    me_m.write_text("\n".join(noisy_rows) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS, flat_start=True)
+    est.prepare()
+    est.run(remove_bad_data=True, verbose=False, result_mode="none")
+    assert est.multi_energy_result.observable is True
+    assert est.multi_energy_result.converged is True
+    rem_keys = {(str(it.measurement.device_name), str(it.measurement.meas_type)) for it in est.removed_bad_data}
+    assert ("sn_4", "PRESSURE") in rem_keys
+    # 9 条正常 3% 偏差蒸汽比焓测点绝不可被误屠杀
+    rem_enth = [it for it in est.removed_bad_data if str(it.measurement.meas_type) == "ENTHALPY"]
+    assert len(rem_enth) == 0
+
+
+def test_multi_energy_steam_reverse_upwind_blind_sink_no_false_unobs_and_bdr_unlocked(tmp_path):
+    """验证蒸汽管道首端连接盲区汇点（平启动 flow=0 假上游、收敛后 flow<0 反流）时不退化为零列、不报假性 UNOBS 且不锁死多能 BDR。"""
+    from lfcore.hybrid_lf import HybridPowerFlowCalc
+
+    # 特意令末端管道 sp_rev 的 i_node=4 (纯汇点负荷)、j_node=3 (上游干管)，真实流量 flow < 0
+    e_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<ACNode>",
+        "@ idx name vbase voltage angle isl run_stat",
+        "# 1 bus_1 110.0 110.0 0.0 1 1",
+        "# 2 bus_2 110.0 109.6 -0.6 1 1",
+        "</ACNode>",
+        "<ACBranch>",
+        "@ idx name i_node j_node r x b run_stat",
+        "# 1 br_1_2 1 2 0.005 0.030 0.002 1",
+        "</ACBranch>",
+        "<ACGenerator>",
+        "@ idx name node control_type p_set q_set v_set v_gain run_stat",
+        "# 1 gen_1 1 SLACK 0.0 0.0 110.0 1.0 1",
+        "</ACGenerator>",
+        "<ACLoad>",
+        "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+        "# 1 ld_2 2 0.18 1.0 0.0 0.0 0.04 1.0 0.0 0.0 1",
+        "</ACLoad>",
+        "<SteamMedium>",
+        "@ density compressibility molar_mass temperature heat_capacity ambient_enthalpy reference_temperature reference_enthalpy feedwater_enthalpy flow_factor",
+        "# 4.0 1.0 0.018 473.15 2.08 419.0 100.0 2676.0 419.0 1.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name pressure enthalpy temperature run_stat",
+        "# 1 sn_1 10.00 3000.0 255.76923 1",
+        "# 2 sn_2 9.96 2995.0 253.36538 1",
+        "# 3 sn_3 9.92 2990.0 250.96154 1",
+        "# 4 sn_4 9.86 2980.0 246.15385 1",
+        "</SteamNode>",
+        "<SteamSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max enthalpy_set run_stat",
+        "# 1 ssrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 10.0 3000.0 1",
+        "# 2 sfsrc_2 2 FLOW 9.96 0.0600 1.0 0.0 5.0 3000.0 1",
+        "</SteamSource>",
+        "<SteamLoad>",
+        "@ idx name node flow_set condensate_enthalpy run_stat",
+        "# 1 sld_3 3 0.0300 419.0 1",
+        "# 2 sld_4 4 0.0500 419.0 1",
+        "</SteamLoad>",
+        "<SteamPipe>",
+        "@ idx name i_node j_node conductance heat_loss run_stat",
+        "# 1 sp_1_2 1 2 40.0 1.0e-5 1",
+        "# 2 sp_2_3 2 3 40.0 1.0e-5 1",
+        "# 3 sp_rev_4_3 4 3 40.0 1.0e-5 1",
+        "</SteamPipe>",
+        "<AcE2Steam>",
+        "@ idx name idx_ac_load_t1 idx_steam_source_t2 control_type e2s_coeff run_stat",
+        "# 1 es_1 1 2 P 0.88 1",
+        "</AcE2Steam>",
+    ]
+    me_e = tmp_path / "me_rev_upwind.e"
+    me_e.write_text("\n".join(e_lines) + "\n", encoding="utf-8")
+
+    hc = HybridPowerFlowCalc.from_file_fast(me_e, parameters=LF_PARAMS, verbose=False)
+    hc.prepare()
+    assert hc.run(result_mode="array") == 0
+    bus_ac = hc.ac_calc.result["bus"]
+    br_ac = hc.ac_calc.result["branch"]
+    st_lf = hc.fluid_calcs["steam"]
+    assert float(st_lf.edge_flow[2]) < 0.0  # 确认 sp_rev_4_3 真实流向为负 (3 -> 4)
+
+    rows = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value status",
+        f"# 1 m1 ACNode bus_1 V 100.0 1 {float(bus_ac[0, 2] * bus_ac[0, 1]):.6f} 0",
+        f"# 2 m2 ACNode bus_2 V 100.0 1 {float(bus_ac[1, 2] * bus_ac[1, 1]):.6f} 0",
+        f"# 3 m3 ACBranch br_1_2 P_FROM 100.0 1 {float(br_ac[0, 7] * 100.0):.6f} 0",
+        f"# 4 m4 ACBranch br_1_2 Q_FROM 100.0 1 {float(br_ac[0, 8] * 100.0):.6f} 0",
+        f"# 5 m5 ACBranch br_1_2 P_TO 100.0 1 {float(br_ac[0, 10] * 100.0):.6f} 0",
+        f"# 6 m6 ACBranch br_1_2 Q_TO 100.0 1 {float(br_ac[0, 11] * 100.0):.6f} 0",
+        f"# 7 m7 SteamNode sn_1 PRESSURE 100.0 1 {float(st_lf.pressure[0]):.6f} 0",
+        f"# 8 m8 SteamNode sn_2 PRESSURE 100.0 1 {float(st_lf.pressure[1]) * 1.80:.6f} 0",  # 80% 压力大粗差
+        f"# 9 m9 SteamNode sn_3 PRESSURE 100.0 1 {float(st_lf.pressure[2]):.6f} 0",
+        f"# 10 m10 SteamNode sn_4 PRESSURE 100.0 1 {float(st_lf.pressure[3]):.6f} 0",
+        f"# 11 m11 SteamNode sn_1 ENTHALPY 100.0 1 {float(st_lf.enthalpy[0]):.6f} 0",
+        f"# 12 m12 SteamNode sn_2 ENTHALPY 100.0 1 {float(st_lf.enthalpy[1]):.6f} 0",
+        # 故意省略 sn_3 与 sn_4 的直接 ENTHALPY 测点，仅配置反向管 sp_rev_4_3 的 H_FROM / H_TO 测点
+        f"# 13 m13 SteamPipe sp_1_2 FLOW_FROM 100.0 1 {float(st_lf.edge_flow[0]):.6f} 0",
+        f"# 14 m14 SteamPipe sp_2_3 FLOW_FROM 100.0 1 {float(st_lf.edge_flow[1]):.6f} 0",
+        f"# 15 m15 SteamPipe sp_rev_4_3 FLOW_FROM 100.0 1 {float(st_lf.edge_flow[2]):.6f} 0",
+        f"# 16 m16 SteamPipe sp_rev_4_3 H_TO 100.0 1 {float(st_lf.enthalpy[2]):.6f} 0",
+        "</Measurement>",
+    ]
+    me_m = tmp_path / "me_rev_upwind.meas"
+    me_m.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS, flat_start=True)
+    est.prepare()
+    est.run(remove_bad_data=True, verbose=False, result_mode="none")
+    assert est.multi_energy_result.observable is True
+    assert est.multi_energy_result.converged is True
+    assert est.fluid_estimators["steam"].observability.observable is True
+    assert est.fluid_estimators["steam"].observability.deficiency == 0
+    # 验证 BDR 未被汇点零列锁死，成功剔除 sn_2 压力大粗差
+    rem_keys = {(str(it.measurement.device_name), str(it.measurement.meas_type)) for it in est.removed_bad_data}
+    assert ("sn_2", "PRESSURE") in rem_keys
+    # 验证上游节点 sn_3 比焓仍由 H_TO 精确反推（不受 1e-7 防翻转弱先验干扰）
+    st_x = est.fluid_estimators["steam"].result.x
+    h3_est = float(st_x[est.fluid_estimators["steam"].base_enthalpy + 2])
+    assert abs(h3_est - float(st_lf.enthalpy[2])) < 1e-3
+
+
+def test_me_dead_end_gas_cross_zero_overshoot_and_dirty_warm_with_outliers(tmp_path):
+    """验证多能气网零注入死胡同跨零 2x 过冲快速阻尼收敛，且严重热启动畸变在大粗差底噪下仍能稳健切至平启动。"""
+    e_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<ACNode>",
+        "@ idx name vbase voltage angle isl run_stat",
+        "# 1 bus_1 110.0 110.0 0.0 1 1",
+        "# 2 bus_2 110.0 218.0 42.0 1 1",  # 严重热启动电压与相角畸变 (V=1.98 pu, ang=42 deg)
+        "</ACNode>",
+        "<ACBranch>",
+        "@ idx name i_node j_node r x b run_stat",
+        "# 1 br_1_2 1 2 0.005 0.030 0.002 1",
+        "</ACBranch>",
+        "<ACGenerator>",
+        "@ idx name node control_type p_set q_set v_set v_gain run_stat",
+        "# 1 gen_1 1 SLACK 0.0 0.0 110.0 1.0 1",
+        "</ACGenerator>",
+        "<ACLoad>",
+        "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+        "# 1 ld_2 2 0.15 1.0 0.0 0.0 0.03 1.0 0.0 0.0 1",
+        "</ACLoad>",
+        "<GasMedium>",
+        "@ density compressibility molar_mass temperature flow_factor",
+        "# 0.72 0.92 0.016 288.15 1.0",
+        "</GasMedium>",
+        "<GasNode>",
+        "@ idx name pressure run_stat",
+        "# 1 gn_1 10.00 1",
+        "# 2 gn_2 9.95 1",
+        "# 3 gn_3 9.90 1",
+        "# 4 gn_dead 10.25 1",  # 无源无荷死胡同零注入叶节点，初值偏高触发跨零翻转
+        "</GasNode>",
+        "<GasSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+        "# 1 gsrc_1 1 PRESSURE 10.0 0.0 1.0 0.0 500.0 1",
+        "# 2 gfsrc_2 2 FLOW 9.95 4.0 1.0 0.0 200.0 1",
+        "</GasSource>",
+        "<GasLoad>",
+        "@ idx name node flow_set run_stat",
+        "# 1 gld_3 3 10.0 1",
+        "</GasLoad>",
+        "<GasPipe>",
+        "@ idx name i_node j_node conductance run_stat",
+        "# 1 gp_1_2 1 2 40.0 1",
+        "# 2 gp_2_3 2 3 40.0 1",
+        "# 3 gp_2_4 2 4 40.0 1",
+        "</GasPipe>",
+        "<AcE2Gas>",
+        "@ idx name idx_ac_load_t1 idx_gas_source_t2 control_type e2g_coeff run_stat",
+        "# 1 eg_1 1 2 P 0.50 1",
+        "</AcE2Gas>",
+    ]
+    me_e = tmp_path / "me_gas_dead_end.e"
+    me_e.write_text("\n".join(e_lines) + "\n", encoding="utf-8")
+
+    # 在 gp_2_4 上施加偏置流量测点诱发紧 FLOW_BALANCE 跨零争夺，并在 gp_1_2 注入巨幅粗差抬高总目标底噪
+    m_lines = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value status",
+        "# 1 m1 ACNode bus_1 V 100.0 1 110.000 0",
+        "# 2 m2 ACNode bus_2 V 100.0 1 109.950 0",
+        "# 3 m3 ACBranch br_1_2 P_FROM 100.0 1 15.010 0",
+        "# 4 m4 ACBranch br_1_2 Q_FROM 100.0 1 2.850 0",
+        "# 5 m5 ACBranch br_1_2 P_TO 100.0 1 -15.000 0",
+        "# 6 m6 ACBranch br_1_2 Q_TO 100.0 1 -3.000 0",
+        "# 7 m7 GasNode gn_1 PRESSURE 400.0 1 10.000 0",
+        "# 8 m8 GasNode gn_2 PRESSURE 400.0 1 9.960 0",
+        "# 9 m9 GasNode gn_3 PRESSURE 400.0 1 9.890 0",
+        "# 10 m10 GasNode gn_dead PRESSURE 400.0 1 10.220 0",
+        "# 11 m11 GasPipe gp_1_2 FLOW_FROM 100.0 1 850.000 0",  # 巨幅流量粗差垫高平方和底噪 (~7e7)
+        "# 12 m12 GasPipe gp_2_3 FLOW_FROM 100.0 1 10.000 0",
+        "# 13 m13 GasPipe gp_2_4 FLOW_FROM 10.0 1 2.600 0",
+        "</Measurement>",
+    ]
+    me_m = tmp_path / "me_gas_dead_end.meas"
+    me_m.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    est = HybridStateEstimator(me_e, me_m, parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=False)
+    est.prepare()
+    est.run(remove_bad_data=True, verbose=False, result_mode="none")
+    assert est.multi_energy_result.observable is True
+    assert est.multi_energy_result.converged is True
+    assert est.estimate_result.iterations <= 40
+
+
+def test_ac_blind_parallel_loads_and_breaker_current_outlier_convergence(tmp_path):
+    """验证同母线并联盲区负荷差模投影与零阻抗断路器电流巨幅粗差下 ACSE 不发散且快速收敛。"""
+    e_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<ACNode>",
+        "@ idx name vbase voltage angle isl run_stat",
+        "# 1 b1 110.0 110.0 0.0 1 1",
+        "# 2 b2 110.0 109.8 -0.5 1 1",
+        "# 3 b3 110.0 109.8 -0.5 1 1",
+        "# 4 b4 110.0 109.5 -1.1 1 1",
+        "</ACNode>",
+        "<ACBranch>",
+        "@ idx name i_node j_node r x b run_stat",
+        "# 1 br_1_2 1 2 0.0002 0.0010 0.0 1",
+        "# 2 br_3_4 3 4 0.0002 0.0010 0.0 1",
+        "</ACBranch>",
+        "<ACBreak>",
+        "@ idx name i_node j_node status run_stat",
+        "# 1 bk_2_3 2 3 1 1",
+        "</ACBreak>",
+        "<ACGenerator>",
+        "@ idx name node control_type p_set q_set v_set v_gain run_stat",
+        "# 1 g1 1 SLACK 0.0 0.0 110.0 1.0 1",
+        "</ACGenerator>",
+        "<ACLoad>",
+        "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+        "# 1 ld_4a 4 10.0 1.0 0.0 0.0 3.0 1.0 0.0 0.0 1",
+        "# 2 ld_4b 4 12.0 1.0 0.0 0.0 4.0 1.0 0.0 0.0 1",
+        "# 3 ld_4c 4 8.0 1.0 0.0 0.0 2.0 1.0 0.0 0.0 1",
+        "</ACLoad>",
+    ]
+    ac_e = tmp_path / "ac_blind_par_bk.e"
+    ac_e.write_text("\n".join(e_lines) + "\n", encoding="utf-8")
+
+    ppc = build_ac_ppc_from_e_file(ac_e)
+    lf = ACPowerFlowCalc(ppc, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf.prepare()
+    assert lf.run(result_mode="array") == 0
+    bus_r, br_r = lf.result["bus"], lf.result["branch"]
+
+    # 母线 4 上 3 个并联负荷全缺测（触发显式功率辅助状态 + 弱伪量测），且断路器 bk_2_3 注入 95 kA 巨幅电流粗差
+    m_lines = [
+        "<Measurement>",
+        "@ idx name dev_type dev_name meas_type weight valid value status",
+        f"# 1 m1 ACNode b1 V 1e4 1 {float(bus_r[0, 2] * bus_r[0, 1]):.6f} 0",
+        f"# 2 m2 ACNode b2 V 1e4 1 {float(bus_r[1, 2] * bus_r[1, 1]):.6f} 0",
+        f"# 3 m3 ACNode b4 V 1e4 1 {float(bus_r[3, 2] * bus_r[3, 1]):.6f} 0",
+        f"# 4 m4 ACBranch br_1_2 P_FROM 400.0 1 {float(br_r[0, 7] * 100.0):.6f} 0",
+        f"# 5 m5 ACBranch br_1_2 Q_FROM 400.0 1 {float(br_r[0, 8] * 100.0):.6f} 0",
+        f"# 6 m6 ACBranch br_1_2 P_TO 400.0 1 {float(br_r[0, 10] * 100.0):.6f} 0",
+        f"# 7 m7 ACBranch br_1_2 Q_TO 400.0 1 {float(br_r[0, 11] * 100.0):.6f} 0",
+        f"# 8 m8 ACBranch br_3_4 P_FROM 400.0 1 {float(br_r[1, 7] * 100.0):.6f} 0",
+        f"# 9 m9 ACBranch br_3_4 Q_FROM 400.0 1 {float(br_r[1, 8] * 100.0):.6f} 0",
+        f"# 10 m10 ACBranch br_3_4 P_TO 400.0 1 {float(br_r[1, 10] * 100.0):.6f} 0",
+        f"# 11 m11 ACBranch br_3_4 Q_TO 400.0 1 {float(br_r[1, 11] * 100.0):.6f} 0",
+        "# 12 m12 ACBreak bk_2_3 I_TO 400.0 1 95.000000 0",
+        "</Measurement>",
+    ]
+    ac_m = tmp_path / "ac_blind_par_bk.meas"
+    ac_m.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    est = ACStateEstimator(ac_e, ac_m, parameters=SE_PARAMS.with_overrides(max_iter=80), flat_start=True)
+    est.prepare()
+    res, rem = est.estimate_with_bad_data_removal()
+    assert res.converged is True
+    rem_idxs = {int(it.measurement.idx) for it in rem}
+    assert 12 in rem_idxs
+
+
+
+
+

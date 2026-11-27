@@ -11,9 +11,11 @@ from model.meas_type import (
     DEVICE_TYPE_ACZeroBranchConstraint,
     DEVICE_TYPE_CODES,
     DEVICE_TYPE_DCBreakConstraint,
+    DEVICE_TYPE_DCPowerBalance,
     DEVICE_TYPE_DCSwitchConstraint,
     DEVICE_TYPE_DCZeroBranchConstraint,
     DEVICE_TYPE_NAMES,
+    MEAS_TYPE_FLOW_BALANCE,
     MEAS_TYPE_NAMES,
     MEAS_TYPE_P_AC,
     MEAS_TYPE_P_BALANCE,
@@ -22,6 +24,7 @@ from model.meas_type import (
     MEAS_TYPE_P_GEN,
     MEAS_TYPE_P_IN,
     MEAS_TYPE_P_LOAD,
+    MEAS_TYPE_P_LOSS_BALANCE,
     MEAS_TYPE_P_OUT,
     MEAS_TYPE_P_THIRD,
     MEAS_TYPE_P_TO,
@@ -441,6 +444,7 @@ def measurement_table_bad_data_protected_mask(table: MeasurementTable) -> np.nda
         dt_arr = np.asarray(dt_code, dtype=np.int16)
         constraint_mask = (
             (dt_arr == DEVICE_TYPE_ACPowerBalance)
+            | (dt_arr == DEVICE_TYPE_DCPowerBalance)
             | (dt_arr == DEVICE_TYPE_ACZeroBranchConstraint)
             | (dt_arr == DEVICE_TYPE_ACSwitchConstraint)
             | (dt_arr == DEVICE_TYPE_ACBreakConstraint)
@@ -453,7 +457,12 @@ def measurement_table_bad_data_protected_mask(table: MeasurementTable) -> np.nda
     mt_code = getattr(table, "meas_type_code", None)
     if mt_code is not None and int(np.asarray(mt_code).size) == protected.size:
         mt_arr = np.asarray(mt_code, dtype=np.int16)
-        balance_mt_mask = (mt_arr == MEAS_TYPE_P_BALANCE) | (mt_arr == MEAS_TYPE_Q_BALANCE)
+        balance_mt_mask = (
+            (mt_arr == MEAS_TYPE_P_BALANCE)
+            | (mt_arr == MEAS_TYPE_Q_BALANCE)
+            | (mt_arr == MEAS_TYPE_FLOW_BALANCE)
+            | (mt_arr == MEAS_TYPE_P_LOSS_BALANCE)
+        )
         if np.any(balance_mt_mask):
             protected = protected | balance_mt_mask
     dt_names = getattr(table, "device_type", None)
@@ -490,6 +499,24 @@ def measurement_table_from_measurements(
                 tail_measurements,
                 device_type_codes=device_type_codes,
             )
+            merged_dn_dict = getattr(table, "device_names", None)
+            merged_dn_id = None
+            if merged_dn_dict is not None and getattr(table, "device_name_id", None) is not None:
+                dn_list = [str(x) for x in np.asarray(merged_dn_dict, dtype=object).tolist()]
+                dn_map = {nm: idx_n for idx_n, nm in enumerate(dn_list)}
+                tail_dnames = np.asarray(tail_table.device_name, dtype=object)
+                tail_ids = np.full(int(tail_table.idx.size), -1, dtype=np.int64)
+                for k_i in range(int(tail_table.idx.size)):
+                    if k_i < tail_dnames.size and tail_dnames[k_i] is not None:
+                        nm_s = str(tail_dnames[k_i])
+                        if nm_s not in dn_map:
+                            dn_map[nm_s] = len(dn_list)
+                            dn_list.append(nm_s)
+                        tail_ids[k_i] = dn_map[nm_s]
+                merged_dn_dict = np.asarray(dn_list, dtype=object)
+                merged_dn_id = np.concatenate((np.asarray(table.device_name_id, dtype=np.int64), tail_ids))
+            else:
+                merged_dn_id = _concat_optional_int_field(table, tail_table, "device_name_id")
             table = MeasurementTable(
                 idx=np.concatenate((table.idx, tail_table.idx)),
                 name=_concat_optional_object_field(table, tail_table, "name"),
@@ -503,9 +530,10 @@ def measurement_table_from_measurements(
                 angle_mask=np.concatenate((table.angle_mask, tail_table.angle_mask)),
                 status_code=np.concatenate((measurement_table_status_code(table), measurement_table_status_code(tail_table))),
                 rows_by_device_type_code=None,
-                device_name_id=_concat_optional_int_field(table, tail_table, "device_name_id"),
+                device_name_id=merged_dn_id,
                 meas_type_code=_concat_optional_int_field(table, tail_table, "meas_type_code"),
                 device_pos=_concat_optional_int_field(table, tail_table, "device_pos"),
+                device_names=merged_dn_dict,
             )
             try:
                 measurements.table = table

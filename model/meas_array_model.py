@@ -451,6 +451,17 @@ def _build_meas_ppc_from_rows_dict(rows_dict: Dict, source: Path) -> Dict:
     valid_col = header_index["valid"]
     value_col = header_index["value"]
     status_col = header_index.get("status", -1)
+    required_max_col = max(
+        idx_col,
+        name_col,
+        device_type_col,
+        device_name_col,
+        meas_type_col,
+        weight_col,
+        valid_col,
+        value_col,
+    )
+    allow_missing_trailing_value = value_col == required_max_col
     intern = sys.intern
     try:
         idx_values = np.fromiter((int(fields[idx_col]) for fields in rows), dtype=np.int64, count=count)
@@ -463,12 +474,22 @@ def _build_meas_ppc_from_rows_dict(rows_dict: Dict, source: Path) -> Dict:
         weight_values = np.fromiter((float(fields[weight_col]) for fields in rows), dtype=np.float64, count=count)
         valid_values = np.asarray(
             [
-                fields[valid_col] == "1" or fields[valid_col] == 1 or fields[valid_col] is True
+                (not (allow_missing_trailing_value and len(fields) == value_col))
+                and (fields[valid_col] == "1" or fields[valid_col] == 1 or fields[valid_col] is True)
                 for fields in rows
             ],
             dtype=bool,
         )
-        value_values = np.fromiter((float(fields[value_col]) for fields in rows), dtype=np.float64, count=count)
+        value_values = np.fromiter(
+            (
+                np.nan
+                if (allow_missing_trailing_value and len(fields) == value_col)
+                else float(fields[value_col])
+                for fields in rows
+            ),
+            dtype=np.float64,
+            count=count,
+        )
     except (IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Malformed Measurement row in {source}") from exc
     if status_col >= 0:
@@ -1082,7 +1103,7 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
                 if standard_raw_no_status and first == b"#" and raw_line[:1] == b"#":
                     fields = raw_line.split(None, 8)
-                    if len(fields) <= 8:
+                    if len(fields) < 8:
                         raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
                     if row_count >= next_flush:
                         flush_columns()
@@ -1114,10 +1135,15 @@ def _build_meas_ppc_from_measurement_file_array_only(
 
                     weight_field = fields[6]
                     weight_values.append(1.0 if weight_field == b"1.0" or weight_field == b"1" else weight_field)
-                    valid = fields[7] == b"1"
-                    value_values.append(fields[8])
-                    valid_values.append(valid)
-                    status_values.append(MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID)
+                    if len(fields) == 8:
+                        value_values.append(np.nan)
+                        valid_values.append(False)
+                        status_values.append(MEAS_STATUS_INVALID)
+                    else:
+                        valid = fields[7] == b"1"
+                        value_values.append(fields[8])
+                        valid_values.append(valid)
+                        status_values.append(MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID)
                     row_count += 1
                     continue
                 if first == b"#" and raw_line[:1] == b"#":
@@ -1144,7 +1170,8 @@ def _build_meas_ppc_from_measurement_file_array_only(
                     value_pos = value_col
                     status_pos = status_col
                     required_len = required_max_col
-                if len(fields) <= required_len:
+                missing_trailing_value = value_col == required_max_col and len(fields) == value_pos
+                if len(fields) <= required_len and not missing_trailing_value:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
                 if row_count >= next_flush:
                     flush_columns()
@@ -1184,14 +1211,19 @@ def _build_meas_ppc_from_measurement_file_array_only(
                 meas_type_code_values.append(meas_code)
                 weight_field = fields[weight_pos]
                 weight_values.append(1.0 if weight_field == b"1.0" or weight_field == b"1" else weight_field)
-                valid = fields[valid_pos] == b"1"
-                value_values.append(fields[value_pos])
-                if has_status and len(fields) > status_pos:
-                    status = _normalize_status_bytes(fields[status_pos], valid)
-                    if status != MEAS_STATUS_NORMAL:
-                        valid = False
+                if missing_trailing_value:
+                    valid = False
+                    value_values.append(np.nan)
+                    status = MEAS_STATUS_INVALID
                 else:
-                    status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+                    valid = fields[valid_pos] == b"1"
+                    value_values.append(fields[value_pos])
+                    if has_status and len(fields) > status_pos:
+                        status = _normalize_status_bytes(fields[status_pos], valid)
+                        if status != MEAS_STATUS_NORMAL:
+                            valid = False
+                    else:
+                        status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
                 valid_values.append(valid)
                 status_values.append(status)
                 row_count += 1
@@ -1346,7 +1378,8 @@ def _build_meas_ppc_from_measurement_file(
                 fields = text.split() if "'" not in text else split_data_row(text)
                 if not header:
                     raise RuntimeError(f"{source} Measurement data appears before header at line {line_no}")
-                if len(fields) <= required_max_col:
+                missing_trailing_value = value_col == required_max_col and len(fields) == value_col
+                if len(fields) <= required_max_col and not missing_trailing_value:
                     raise RuntimeError(f"Malformed Measurement row at line {line_no} in {source}")
                 idx_append(to_int(fields[idx_col]))
                 if include_strings:
@@ -1374,14 +1407,19 @@ def _build_meas_ppc_from_measurement_file(
                 if include_strings:
                     meas_type_append(intern(meas_type))
                 weight_append(to_float(fields[weight_col]))
-                valid = fields[valid_col] == "1"
-                value_append(to_float(fields[value_col]))
-                if status_col >= 0 and len(fields) > status_col:
-                    status = _normalize_status_text(fields[status_col], valid)
-                    if status != MEAS_STATUS_NORMAL:
-                        valid = False
+                if missing_trailing_value:
+                    valid = False
+                    value_append(np.nan)
+                    status = MEAS_STATUS_INVALID
                 else:
-                    status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
+                    valid = fields[valid_col] == "1"
+                    value_append(to_float(fields[value_col]))
+                    if status_col >= 0 and len(fields) > status_col:
+                        status = _normalize_status_text(fields[status_col], valid)
+                        if status != MEAS_STATUS_NORMAL:
+                            valid = False
+                    else:
+                        status = MEAS_STATUS_NORMAL if valid else MEAS_STATUS_INVALID
                 valid_append(valid)
                 status_append(status)
                 device_type_code_append(device_code)

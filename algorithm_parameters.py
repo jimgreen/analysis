@@ -66,6 +66,39 @@ def resolve_bad_data_limits(
     return eff_total, min(eff_per_round, eff_total)
 
 
+def resolve_auto_extreme_bad_data_caps(
+    measurement_count: int,
+    max_remove: Optional[int] = None,
+    max_remove_per_round: Optional[int] = None,
+    *,
+    param_max_remove: Optional[int] = None,
+    param_max_remove_per_round: Optional[int] = None,
+) -> Tuple[int, int]:
+    """在未显式指定剔除上限的全自动模式下，为高显著性极端粗差（|r_N| >= max(15, 4*thr)）推导弹性保护上限。
+
+    若调用者或参数文件显式指定了 ``max_remove`` 或 ``max_remove_per_round``，则严格服从显式配置不予突破。
+    """
+    base_total, base_round = resolve_bad_data_limits(
+        measurement_count,
+        max_remove=max_remove,
+        max_remove_per_round=max_remove_per_round,
+        param_max_remove=param_max_remove,
+        param_max_remove_per_round=param_max_remove_per_round,
+    )
+    if base_total <= 0:
+        return 0, 0
+    n_meas = max(0, int(measurement_count))
+    explicit_total = (max_remove is not None and int(max_remove) >= 0) or (
+        param_max_remove is not None and int(param_max_remove) >= 0
+    )
+    explicit_round = (max_remove_per_round is not None and int(max_remove_per_round) > 0) or (
+        param_max_remove_per_round is not None and int(param_max_remove_per_round) > 0
+    )
+    ext_total = base_total if explicit_total else max(base_total, min(400, int(n_meas * 0.035)))
+    ext_round = base_round if explicit_round else max(base_round, min(40, int(n_meas * 0.004)))
+    return ext_total, min(ext_round, ext_total)
+
+
 def _to_bool(value: Any) -> bool:
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "y", "on"}:

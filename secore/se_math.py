@@ -1815,6 +1815,7 @@ class CholmodAAtNormalEquationSolver:
     ):
         self._cholmod_factor = None
         self._cholmod_pattern = None
+        self._cholmod_shape_nnz = None
         self._cholmod_disabled = False
         self._pardiso_factor = None
         self._pardiso_upper_pattern = None
@@ -1824,6 +1825,8 @@ class CholmodAAtNormalEquationSolver:
         self._last_normal_operand = None
         self._last_factor_scaled = False
         self._last_unscaled_diag = None
+        self._dense_col_cache_sig = None
+        self._dense_col_prefer_cholmod = False
         self.assume_fixed_pattern = bool(assume_fixed_pattern)
         self.ordering_method = str(ordering_method or "auto")
         self.multi_solve = bool(multi_solve)
@@ -1839,7 +1842,7 @@ class CholmodAAtNormalEquationSolver:
     def __del__(self) -> None:
         self._reset_pardiso()
 
-    def _should_use_pardiso(self, n_state: int, nnz_a: int = 0) -> bool:
+    def _should_use_pardiso(self, n_state: int, nnz_a: int = 0, A_csc=None) -> bool:
         if self._pardiso_disabled or MKLPardisoFactor is None or build_upper_csr_from_aat is None:
             return False
         pref = get_linear_solver_preference()
@@ -1854,7 +1857,41 @@ class CholmodAAtNormalEquationSolver:
             return False
         if nnz_a > 0 and ns < 3000 and (float(nnz_a) / float(ns)) < 10.5:
             return False
-        return bool(is_mkl_pardiso_available())
+        if not is_mkl_pardiso_available():
+            return False
+        # 星型枢纽等存在超大度稠密列（如单行注入关联数百节点）时，显式展开上三角 CSR A·A^T 会产生 O(sum(c_j^2))
+        # 外积与巨大稠密团符号分析开销；此时若 CHOLMOD 可用，优先走 CHOLMOD 超节点隐式 AAt 分解（BLAS-3 SYRK）
+        if (
+            A_csc is not None
+            and not self._cholmod_disabled
+            and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None)
+        ):
+            indptr = getattr(A_csc, "indptr", None)
+            if indptr is not None and indptr.size > 1:
+                sig = (
+                    (int(A_csc.shape[0]), int(A_csc.shape[1]), int(A_csc.nnz))
+                    if self.assume_fixed_pattern
+                    else (id(indptr), int(A_csc.shape[0]), int(A_csc.shape[1]), int(A_csc.nnz))
+                )
+                if sig == self._dense_col_cache_sig:
+                    if self._dense_col_prefer_cholmod:
+                        return False
+                else:
+                    col_nnz = np.diff(indptr)
+                    max_col = int(col_nnz.max()) if col_nnz.size > 0 else 0
+                    prefer_cholmod = False
+                    if max_col >= 256:
+                        prefer_cholmod = True
+                    elif max_col >= 160:
+                        c64 = col_nnz.astype(np.int64, copy=False)
+                        aat_work = int(np.dot(c64, c64))
+                        if aat_work > max(4_000_000, 500 * ns):
+                            prefer_cholmod = True
+                    self._dense_col_cache_sig = sig
+                    self._dense_col_prefer_cholmod = prefer_cholmod
+                    if prefer_cholmod:
+                        return False
+        return True
 
     def _solve_sparse_pardiso(self, A_csc, rhs: np.ndarray, damping: float = 0.0):
         beta = float(damping)
@@ -1918,8 +1955,11 @@ class CholmodAAtNormalEquationSolver:
     def _solve_sparse_cholmod_aat(self, A_csc, rhs: np.ndarray, damping: float = 0.0):
         beta = float(damping)
         if CHOLMOD_ANALYZE_AAT is not None:
-            if self._cholmod_factor is None or (
-                not self.assume_fixed_pattern and not self._same_sparse_pattern(self._cholmod_pattern, A_csc)
+            shape_nnz = (A_csc.shape, int(A_csc.nnz))
+            if (
+                self._cholmod_factor is None
+                or self._cholmod_shape_nnz != shape_nnz
+                or (not self.assume_fixed_pattern and not self._same_sparse_pattern(self._cholmod_pattern, A_csc))
             ):
                 eff_ordering = (
                     SEScaleProfile.for_problem(
@@ -1938,6 +1978,7 @@ class CholmodAAtNormalEquationSolver:
                         self._cholmod_factor = CHOLMOD_ANALYZE_AAT(A_csc)
                 else:
                     self._cholmod_factor = CHOLMOD_ANALYZE_AAT(A_csc)
+                self._cholmod_shape_nnz = shape_nnz
                 if not self.assume_fixed_pattern:
                     self._cholmod_pattern = self._sparse_pattern(A_csc)
             if beta > 0.0:
@@ -1989,7 +2030,7 @@ class CholmodAAtNormalEquationSolver:
                 self._last_factor_scaled = True
                 self._last_unscaled_diag = diag_g
         pref = get_linear_solver_preference()
-        if col_scale is None and self._should_use_pardiso(int(A_solve.shape[0]), int(A_solve.nnz)):
+        if col_scale is None and self._should_use_pardiso(int(A_solve.shape[0]), int(A_solve.nnz), A_solve):
             try:
                 return self._solve_sparse_pardiso(A_solve, rhs_solve, damping=damping)
             except (TypeError, AttributeError):
@@ -2019,12 +2060,14 @@ class CholmodAAtNormalEquationSolver:
                 # 仅在接口不兼容时禁用 CHOLMOD；数值奇异/病态仅本次回退，避免后续健康矩阵永久退化到慢速 SuperLU
                 self._cholmod_factor = None
                 self._cholmod_pattern = None
+                self._cholmod_shape_nnz = None
                 self._last_normal_operand = None
                 self._active_backend = None
                 self._cholmod_disabled = True
             except Exception:
                 self._cholmod_factor = None
                 self._cholmod_pattern = None
+                self._cholmod_shape_nnz = None
                 self._last_normal_operand = None
                 self._active_backend = None
         if not allow_slow_fallback:
@@ -2047,6 +2090,67 @@ class CholmodAAtNormalEquationSolver:
         if self._active_backend == "pardiso" and self._pardiso_factor is not None:
             return self._pardiso_factor
         return self._cholmod_factor
+
+    def refresh_unregularized_factor(self, A_csc) -> bool:
+        """在收敛点处对未缩放稀疏操作数 A_csc 原位刷新无阻尼精确因子（兼容此前曾触发列均衡缩放的情形）。"""
+        if A_csc is None:
+            return False
+        A_op = A_csc if getattr(A_csc, "format", None) == "csc" else A_csc.tocsc()
+        if (
+            not self._pardiso_disabled
+            and self._pardiso_factor is not None
+            and self._should_use_pardiso(int(A_op.shape[0]), int(A_op.nnz), A_op)
+        ):
+            try:
+                self._pardiso_factor.update_damping_and_factorize(0.0, aat_operand=A_op)
+                self._last_normal_operand = A_op
+                self._last_factor_scaled = False
+                self._last_unscaled_diag = None
+                self._active_backend = "pardiso"
+                return True
+            except Exception:
+                pass
+        if (
+            not self._cholmod_disabled
+            and (CHOLMOD_ANALYZE_AAT is not None or CHOLMOD_CHOLESKY_AAT is not None)
+        ):
+            try:
+                shape_nnz = (A_op.shape, int(A_op.nnz))
+                if (
+                    self._cholmod_factor is None
+                    or self._cholmod_shape_nnz != shape_nnz
+                    or (not self.assume_fixed_pattern and not self._same_sparse_pattern(self._cholmod_pattern, A_op))
+                ):
+                    eff_ordering = (
+                        SEScaleProfile.for_problem(
+                            int(A_op.shape[0]),
+                            int(A_op.shape[1]),
+                            int(A_op.nnz),
+                            multi_solve=self.multi_solve,
+                        ).aat_ordering_method
+                        if self.ordering_method == "auto"
+                        else self.ordering_method
+                    )
+                    if eff_ordering and eff_ordering != "default" and CHOLMOD_ANALYZE_AAT is not None:
+                        try:
+                            self._cholmod_factor = CHOLMOD_ANALYZE_AAT(A_op, ordering_method=eff_ordering)
+                        except Exception:
+                            self._cholmod_factor = CHOLMOD_ANALYZE_AAT(A_op)
+                    elif CHOLMOD_ANALYZE_AAT is not None:
+                        self._cholmod_factor = CHOLMOD_ANALYZE_AAT(A_op)
+                    self._cholmod_shape_nnz = shape_nnz
+                    if not self.assume_fixed_pattern and self._cholmod_factor is not None:
+                        self._cholmod_pattern = self._sparse_pattern(A_op)
+                if self._cholmod_factor is not None:
+                    self._cholmod_factor.cholesky_AAt_inplace(A_op)
+                    self._last_normal_operand = A_op
+                    self._last_factor_scaled = False
+                    self._last_unscaled_diag = None
+                    self._active_backend = "cholmod"
+                    return True
+            except Exception:
+                pass
+        return False
 
     @property
     def last_normal_operand(self):
@@ -3040,11 +3144,12 @@ def compute_adaptive_bad_threshold(
     active_mask: Optional[np.ndarray] = None,
     protected_mask: Optional[np.ndarray] = None,
     critical_mask: Optional[np.ndarray] = None,
+    group_ids: Optional[np.ndarray] = None,
     ref_count: int = 200,
     min_bucket_size: int = 30,
     hetero_weight_ratio: float = 1e3,
 ) -> Tuple[float, Optional[np.ndarray]]:
-    """计算多重检验规模自适应与异构权值分桶校准的坏数据判定阈值 ``(scalar_thr, per_row_thr)``。
+    """计算多重检验规模自适应与异构权值/跨物理量纲分桶校准的坏数据判定阈值 ``(scalar_thr, per_row_thr)``。
 
     设计原则：
     1. **下界守恒**：绝不低于用户给定的 ``base_threshold``；当 ``n_effective <= ref_count``（默认 200）时
@@ -3052,11 +3157,11 @@ def compute_adaptive_bad_threshold(
     2. **规模 FWER 守恒**：当 ``n_effective > ref_count`` 时，按
        ``tau_scale = sqrt(tau_base^2 + 2 * ln(n_effective / ref_count))`` 自动抬高基准阈值，
        消除万~十万节点大网下的多重检验假阳性爆发；
-    3. **异构权值分桶稳健尺度校准**：当传入全量 ``normalized`` 与 ``weights`` 且有效权值跨度
-       ``w_max / w_min >= hetero_weight_ratio`` 且 ``n_effective > ref_count`` 时，按 ``floor(log10(w))``
-       分桶，对样本数 ``>= min_bucket_size`` 的桶使用 75% 分位数（25% 崩溃点，对常规坏数据免疫）
-       估计该桶的噪声方差膨胀倍数 ``s_b = max(1.0, p75(r^N_b) / 1.15034938)``，仅向上防误删，
-       不压低正常桶阈值。未发生明显膨胀时返回 ``per_row_thr=None`` 以免额外数组开销。
+    3. **异构权值与跨物理量纲分桶稳健尺度校准**：
+       - 默认（``group_ids is None``）在 ``n_effective > ref_count`` 且 ``w_max / w_min >= hetero_weight_ratio`` 时按 ``floor(log10(w))`` 分桶；
+       - 当显式提供物理量纲分组 ``group_ids``（流体有名值/多能跨能域场景）且有效测点数 ``>= 20`` 时，按 ``(group_id, floor(log10(w)))`` 复合分桶，
+         对桶样本数达标的桶使用 75% 分位数（25% 崩溃点，对常规粗差免疫）估计未标幺量纲或背景噪声方差膨胀倍数
+         ``s_b = q75(r^N_b) / 1.15034938``，仅向上防误删，不压低正常桶阈值。
     """
     tau_base = float(base_threshold)
     if not np.isfinite(tau_base) or tau_base <= 0.0:
@@ -3068,7 +3173,8 @@ def compute_adaptive_bad_threshold(
     else:
         tau_scale = tau_base
 
-    if normalized is None or weights is None or m_eff <= ref_m:
+    has_explicit_groups = group_ids is not None
+    if normalized is None or weights is None or (not has_explicit_groups and m_eff <= ref_m):
         return tau_scale, None
 
     norm_arr = np.asarray(normalized, dtype=np.float64)
@@ -3091,31 +3197,49 @@ def compute_adaptive_bad_threshold(
             valid &= ~c_arr
 
     n_valid = int(np.count_nonzero(valid))
-    if n_valid <= ref_m:
-        return tau_scale, None
-
-    w_valid = w_arr[valid]
-    w_min = float(w_valid.min())
-    w_max = float(w_valid.max())
-    if w_min <= 0.0 or (w_max / w_min) < float(hetero_weight_ratio):
-        return tau_scale, None
+    if has_explicit_groups:
+        g_arr = np.asarray(group_ids, dtype=np.int64)
+        if g_arr.size != norm_arr.size or n_valid < 20:
+            return tau_scale, None
+    else:
+        if n_valid <= ref_m:
+            return tau_scale, None
+        w_valid = w_arr[valid]
+        w_min = float(w_valid.min())
+        w_max = float(w_valid.max())
+        if w_min <= 0.0 or (w_max / w_min) < float(hetero_weight_ratio):
+            return tau_scale, None
 
     # 标准正态 |Z| 的 75% 分位数为 Phi^-1(0.875) = 1.1503493803760079
     _HALF_NORM_Q75 = 1.1503493803760079
-    buckets = np.floor(np.log10(np.maximum(w_arr, 1e-12))).astype(np.int32)
+    w_buckets = np.floor(np.log10(np.maximum(w_arr, 1e-12))).astype(np.int64)
+    buckets = (g_arr * 64 + (w_buckets + 32)) if has_explicit_groups else w_buckets
     valid_buckets = np.unique(buckets[valid])
     per_row_thr: Optional[np.ndarray] = None
-    min_b = max(10, int(min_bucket_size))
+    min_b = max(8, int(min_bucket_size)) if has_explicit_groups else max(10, int(min_bucket_size))
+    inflate_gate = 1.35 if has_explicit_groups else 1.15
     for b_val in valid_buckets.tolist():
         bm = valid & (buckets == int(b_val))
         if int(np.count_nonzero(bm)) < min_b:
             continue
         q75 = float(np.percentile(norm_arr[bm], 75.0))
         scale_b = q75 / _HALF_NORM_Q75
-        if scale_b > 1.15:
+        if scale_b > inflate_gate:
             if per_row_thr is None:
                 per_row_thr = np.full(norm_arr.size, tau_scale, dtype=np.float64)
-            per_row_thr[bm] = tau_scale * scale_b
+            per_row_thr[bm] = max(tau_scale, tau_scale * scale_b)
+    # 若显式分组下某物理量组因样本分散在多个权重档导致单档不足 min_b，按纯物理量组 g_arr 兜底校准
+    if has_explicit_groups:
+        for g_val in np.unique(g_arr[valid]).tolist():
+            gm = valid & (g_arr == int(g_val))
+            if int(np.count_nonzero(gm)) < min_b:
+                continue
+            q75_g = float(np.percentile(norm_arr[gm], 75.0))
+            scale_g = q75_g / _HALF_NORM_Q75
+            if scale_g > inflate_gate:
+                if per_row_thr is None:
+                    per_row_thr = np.full(norm_arr.size, tau_scale, dtype=np.float64)
+                per_row_thr[gm] = np.maximum(per_row_thr[gm], tau_scale * scale_g)
     return tau_scale, per_row_thr
 
 
@@ -3450,6 +3574,17 @@ def select_independent_bad_data_batch(
     blocked_cols = np.zeros(n_cols, dtype=bool)
     selected: List[int] = []
     block_hops = max(2, int(min_hops) - 1)
+    # 星型枢纽拓扑（Hub-Star）防全网广播阈值：常规变电站注入行/母线列度数远小于 128；
+    # 若存在 >128 元的超稠密星型枢纽行/列，仍封锁该枢纽列自身（禁止同批删两条直连枢纽的量测），
+    # 但禁止穿过星型中心向其余数百条独立辐射馈线做二次全网封锁，避免批删退化为 O(K) 轮逐一单删。
+    _HUB_DEG_CAP = 128
+    row_deg = csr_indptr[1:] - csr_indptr[:-1]
+    col_deg = csc_indptr[1:] - csc_indptr[:-1]
+    has_super_hub = bool(
+        (n_rows > 0 and int(row_deg.max()) > _HUB_DEG_CAP)
+        or (n_cols > 0 and int(col_deg.max()) > _HUB_DEG_CAP)
+    )
+    blocked_super_rows = np.zeros(n_rows, dtype=bool) if has_super_hub else None
 
     def _gather_adj(indptr_arr: np.ndarray, indices_arr: np.ndarray, idx_arr: np.ndarray) -> np.ndarray:
         if idx_arr.size == 0:
@@ -3471,11 +3606,21 @@ def select_independent_bad_data_batch(
         frontier = csr_indices[rs:re]
         blocked_cols[frontier] = True
         for hop in range(block_hops):
-            r_adj = _gather_adj(csc_indptr, csc_indices, frontier)
+            exp_cols = frontier[col_deg[frontier] <= _HUB_DEG_CAP] if has_super_hub else frontier
+            if exp_cols.size == 0:
+                return
+            r_adj = _gather_adj(csc_indptr, csc_indices, exp_cols)
             if r_adj.size == 0:
                 return
             if r_adj.size > 1:
                 r_adj = np.unique(r_adj)
+            if has_super_hub:
+                super_mask = row_deg[r_adj] > _HUB_DEG_CAP
+                if np.any(super_mask):
+                    blocked_super_rows[r_adj[super_mask]] = True
+                    r_adj = r_adj[~super_mask]
+                    if r_adj.size == 0:
+                        return
             c_all = _gather_adj(csr_indptr, csr_indices, r_adj)
             if c_all.size == 0:
                 return
@@ -3499,6 +3644,8 @@ def select_independent_bad_data_batch(
         if r_pos < 0 or r_pos >= n_rows:
             if not selected:
                 selected.append(idx)
+            continue
+        if blocked_super_rows is not None and blocked_super_rows[r_pos]:
             continue
         rs = int(csr_indptr[r_pos])
         re = int(csr_indptr[r_pos + 1])
@@ -4958,6 +5105,7 @@ class NormalEquationSolver:
     def __init__(self, assume_fixed_pattern: bool = False):
         self._cholmod_factor = None
         self._cholmod_pattern = None
+        self._cholmod_shape_nnz = None
         self._cholmod_disabled = False
         self.assume_fixed_pattern = bool(assume_fixed_pattern)
 
@@ -5741,6 +5889,91 @@ def build_switch_current_curvature_columns(
     data[1::2] = val1
     indptr = np.arange(0, 2 * k + 1, 2, dtype=np.int32)
     return SP_CSC_MATRIX((data, indices, indptr), shape=(int(n_state), k)), True
+
+
+def build_converter_current_curvature_columns(
+    n_state: int,
+    conv_rows: np.ndarray,
+    col_p: np.ndarray,
+    col_q: np.ndarray,
+    v_ac: np.ndarray,
+    p_ac: np.ndarray,
+    q_ac: np.ndarray,
+    residual: np.ndarray,
+    weight: np.ndarray,
+    *,
+    min_v: float = 1e-4,
+    min_curv: float = 1e-2,
+) -> Tuple[Optional[SP_CSC_MATRIX], bool]:
+    """为交直流换流器交流电流幅值量测 I_AC = hypot(P_AC, Q_AC) / V_AC 的负残差测点构造精确秩 1 半正定二阶曲率列矩阵。
+
+    当残差 r = z - I_AC < 0 且 S = hypot(P_AC, Q_AC) > 0 时，目标函数关于 (P_AC, Q_AC) 的精确二阶海森修正项为：
+        -w * r * nabla^2_{(P,Q)} I_AC = (w * (-r) / (V_AC * S)) * t * t^T >= 0,
+    其中切向单位向量 t = (-Q_AC / S, P_AC / S)^T。
+    当 P_AC 或 Q_AC 过零且对应无功/有功直测权重远低于电流权重时，Gauss-Newton 一阶近似在正交方向缺失该曲率项
+    会导致数百~数千倍切向过冲与微步锁死；追加该稀疏秩 1 列后可直接恢复精确二阶牛顿收敛。
+    """
+    k = int(conv_rows.size)
+    if k <= 0 or n_state <= 0:
+        return None, False
+    w_s = weight[conv_rows]
+    r_s = residual[conv_rows]
+    neg_mask = (w_s > 0.0) & (r_s < 0.0)
+    if not np.any(neg_mask):
+        return None, False
+    s_mag = np.hypot(p_ac, q_ac)
+    v_abs = np.abs(v_ac)
+    has_col = (col_p >= 0) | (col_q >= 0)
+    active = neg_mask & (v_abs > float(min_v)) & (s_mag > 1e-12) & has_col
+    if not np.any(active):
+        return None, False
+    curv = np.zeros(k, dtype=np.float64)
+    curv[active] = (w_s[active] * (-r_s[active])) / (v_abs[active] * s_mag[active])
+    sig_mask = curv > float(min_curv)
+    if not np.any(sig_mask):
+        return None, False
+    sel = np.flatnonzero(sig_mask)
+    amp_sel = np.sqrt(curv[sel]) / s_mag[sel]
+    vp_sel = -amp_sel * q_ac[sel]
+    vq_sel = amp_sel * p_ac[sel]
+    cp_sel = col_p[sel]
+    cq_sel = col_q[sel]
+
+    indices_list: List[int] = []
+    data_list: List[float] = []
+    indptr_list: List[int] = [0]
+    for idx_i in range(int(sel.size)):
+        cp = int(cp_sel[idx_i])
+        cq = int(cq_sel[idx_i])
+        vp = float(vp_sel[idx_i])
+        vq = float(vq_sel[idx_i])
+        if cp >= 0 and cq >= 0 and cp != cq:
+            if cp < cq:
+                indices_list.extend((cp, cq))
+                data_list.extend((vp, vq))
+            else:
+                indices_list.extend((cq, cp))
+                data_list.extend((vq, vp))
+        elif cp >= 0:
+            indices_list.append(cp)
+            data_list.append(vp)
+        elif cq >= 0:
+            indices_list.append(cq)
+            data_list.append(vq)
+        indptr_list.append(len(indices_list))
+    if not indices_list:
+        return None, False
+    return (
+        SP_CSC_MATRIX(
+            (
+                np.asarray(data_list, dtype=np.float64),
+                np.asarray(indices_list, dtype=np.int32),
+                np.asarray(indptr_list, dtype=np.int32),
+            ),
+            shape=(int(n_state), len(indptr_list) - 1),
+        ),
+        True,
+    )
 
 
 def detect_active_box_pinned_cols(

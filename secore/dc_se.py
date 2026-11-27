@@ -52,6 +52,7 @@ from model.meas_type import (
     DEVICE_TYPE_DCGenerator,
     DEVICE_TYPE_DCLoad,
     DEVICE_TYPE_DCNode,
+    DEVICE_TYPE_DCPowerBalance,
     DEVICE_TYPE_DCZeroBranch,
     DEVICE_TYPE_DCZeroBranchConstraint,
     MEAS_TYPE_CODES,
@@ -59,6 +60,7 @@ from model.meas_type import (
     MEAS_TYPE_I_TO,
     MEAS_TYPE_I_LOAD,
     MEAS_TYPE_I_GEN,
+    MEAS_TYPE_P_BALANCE,
     MEAS_TYPE_P_FROM,
     MEAS_TYPE_P_GEN,
     MEAS_TYPE_P_LOAD,
@@ -93,6 +95,7 @@ from algorithm_parameters import (
     DEFAULT_SE_PARAMETER_FILE,
     StateEstimationParameters,
     load_se_parameters,
+    resolve_auto_extreme_bad_data_caps,
     resolve_bad_data_limits,
 )
 from paths import measurement_file, model_file
@@ -165,6 +168,7 @@ _DC_TERMINAL_MEAS_TYPE_CODES = np.asarray(
 _DC_LOAD_MEAS_TYPE_CODES = np.asarray([MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD], dtype=np.int16)
 _DC_GEN_MEAS_TYPE_CODES = np.asarray([MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN], dtype=np.int16)
 _DC_NODE_MEAS_TYPE_CODES = np.asarray([MEAS_TYPE_V], dtype=np.int16)
+_DC_BALANCE_MEAS_TYPE_CODES = np.asarray([MEAS_TYPE_P_BALANCE], dtype=np.int16)
 _MAX_MEAS_TYPE_CODE = max(MEAS_TYPE_CODES.values())
 _VOLTAGE_MEASUREMENT_TYPE_CODES = np.asarray(
     [MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_GEN, MEAS_TYPE_V_LOAD],
@@ -1104,6 +1108,7 @@ class DCStateEstimator:
         if prepare_active_measurements:
             stage_start = time.perf_counter()
             self._add_pseudo_power_measurements()
+            self._add_power_balance_constraint_measurements()
             self._record_profile_time("init.add_pseudo_measurements", time.perf_counter() - stage_start)
             stage_start = time.perf_counter()
             self._refresh_active_measurement_indexes()
@@ -1697,6 +1702,7 @@ class DCStateEstimator:
             DEVICE_TYPE_DCDCConverter: size("_dcdc_names"),
             DEVICE_TYPE_DCZeroBranchConstraint: constraint_count,
             DEVICE_TYPE_DCBreakConstraint: constraint_count,
+            DEVICE_TYPE_DCPowerBalance: int(getattr(self, "n_nodes", 0)),
         }
 
     def _dead_or_inactive_device_info(self) -> Tuple[Dict[int, set], Dict[int, Dict[str, float]]]:
@@ -1755,6 +1761,7 @@ class DCStateEstimator:
             DEVICE_TYPE_DCDCConverter: np.asarray(getattr(self, "_dcdc_names", ()), dtype=object),
             DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
             DEVICE_TYPE_DCBreakConstraint: constraint_names,
+            DEVICE_TYPE_DCPowerBalance: np.asarray(getattr(self, "_node_name_by_pos", ()), dtype=object),
         }
         if requested is None:
             return names
@@ -1964,6 +1971,7 @@ class DCStateEstimator:
                         DEVICE_TYPE_DCGenerator,
                         DEVICE_TYPE_DCLoad,
                         DEVICE_TYPE_DCDCConverter,
+                        DEVICE_TYPE_DCPowerBalance,
                     ],
                     dtype=np.int16,
                 ),
@@ -2548,6 +2556,73 @@ class DCStateEstimator:
         self._dcdc_plan_pos = np.arange(self._dcdc_names.size, dtype=np.int64)
         self._dcdc_plan_p_col = self.dcdc_start + 2 * self._dcdc_plan_pos
         self._dcdc_plan_q_col = self._dcdc_plan_p_col + 1
+
+        # 预构建直流母线节点电流守恒稀疏算子: I_bal = G_kcl @ V + A_sw @ I_sw = 0（纯线性常系数）
+        n_nd = int(self.n_nodes)
+        bi = self._branch_plan_i
+        bj = self._branch_plan_j
+        inv_r = self._branch_plan_inv_r
+        valid_b = (bi >= 0) & (bi < n_nd) & (bj >= 0) & (bj < n_nd) & (bi != bj) & (inv_r > 0.0)
+        if np.any(valid_b):
+            bi_v = bi[valid_b]
+            bj_v = bj[valid_b]
+            g_v = inv_r[valid_b]
+            g_rows = np.concatenate((bi_v, bi_v, bj_v, bj_v))
+            g_cols = np.concatenate((bi_v, bj_v, bj_v, bi_v))
+            g_vals = np.concatenate((g_v, -g_v, g_v, -g_v))
+            self._dc_kcl_g_csr = coo_matrix((g_vals, (g_rows, g_cols)), shape=(n_nd, n_nd), dtype=np.float64).tocsr()
+        else:
+            self._dc_kcl_g_csr = coo_matrix((n_nd, n_nd), dtype=np.float64).tocsr()
+
+        n_sw = int(self.n_switch)
+        if n_sw > 0:
+            sw_i = np.concatenate((self._zero_branch_plan_i, self._break_plan_i))
+            sw_j = np.concatenate((self._zero_branch_plan_j, self._break_plan_j))
+            sw_p = np.arange(n_sw, dtype=np.int64)
+            valid_sw = (sw_i >= 0) & (sw_i < n_nd) & (sw_j >= 0) & (sw_j < n_nd) & (sw_i != sw_j)
+            if np.any(valid_sw):
+                si_v = sw_i[valid_sw]
+                sj_v = sw_j[valid_sw]
+                sp_v = sw_p[valid_sw]
+                self._dc_kcl_sw_csr = coo_matrix(
+                    (
+                        np.concatenate((np.ones(sp_v.size, dtype=np.float64), -np.ones(sp_v.size, dtype=np.float64))),
+                        (np.concatenate((si_v, sj_v)), np.concatenate((sp_v, sp_v))),
+                    ),
+                    shape=(n_nd, n_sw),
+                    dtype=np.float64,
+                ).tocsr()
+            else:
+                self._dc_kcl_sw_csr = coo_matrix((n_nd, n_sw), dtype=np.float64).tocsr()
+        else:
+            self._dc_kcl_sw_csr = coo_matrix((n_nd, 0), dtype=np.float64).tocsr()
+
+        j_row_parts = []
+        j_col_parts = []
+        j_val_parts = []
+        if self._dc_kcl_g_csr.nnz > 0:
+            g_coo = self._dc_kcl_g_csr.tocoo()
+            v_cols = self.voltage_col[g_coo.col.astype(np.intp, copy=False)].astype(np.int64, copy=False)
+            keep_vc = v_cols >= 0
+            if np.any(keep_vc):
+                j_row_parts.append(g_coo.row[keep_vc].astype(np.int64, copy=False))
+                j_col_parts.append(v_cols[keep_vc])
+                j_val_parts.append(np.asarray(g_coo.data[keep_vc], dtype=np.float64))
+        if self._dc_kcl_sw_csr.nnz > 0:
+            sw_coo = self._dc_kcl_sw_csr.tocoo()
+            j_row_parts.append(sw_coo.row.astype(np.int64, copy=False))
+            j_col_parts.append(sw_coo.col.astype(np.int64, copy=False) + int(self.switch_start))
+            j_val_parts.append(np.asarray(sw_coo.data, dtype=np.float64))
+        if j_row_parts:
+            self._dc_kcl_jac_csr = coo_matrix(
+                (np.concatenate(j_val_parts), (np.concatenate(j_row_parts), np.concatenate(j_col_parts))),
+                shape=(n_nd, int(self.n_state)),
+                dtype=np.float64,
+            ).tocsr()
+            self._dc_kcl_jac_csr.eliminate_zeros()
+        else:
+            self._dc_kcl_jac_csr = coo_matrix((n_nd, int(self.n_state)), dtype=np.float64).tocsr()
+
         self._build_measurement_plan_lookup_arrays()
 
     def _build_measurement_plan_lookup_arrays(self) -> None:
@@ -2562,6 +2637,7 @@ class DCStateEstimator:
             DEVICE_TYPE_DCZeroBranch: _DC_TERMINAL_MEAS_TYPE_CODES,
             DEVICE_TYPE_DCBreak: _DC_TERMINAL_MEAS_TYPE_CODES,
             DEVICE_TYPE_DCDCConverter: _DC_TERMINAL_MEAS_TYPE_CODES,
+            DEVICE_TYPE_DCPowerBalance: _DC_BALANCE_MEAS_TYPE_CODES,
         }
         self._measurement_plan_meas_kind_code_by_type_code = {
             int(code): _measurement_type_code_lookup(kind_map)
@@ -2593,6 +2669,7 @@ class DCStateEstimator:
             DEVICE_TYPE_DCDCConverter: np.asarray(getattr(self, "_dcdc_names", ()), dtype=object),
             DEVICE_TYPE_DCZeroBranchConstraint: constraint_names,
             DEVICE_TYPE_DCBreakConstraint: constraint_names,
+            DEVICE_TYPE_DCPowerBalance: np.asarray(getattr(self, "_node_name_by_pos", ()), dtype=object),
         }
 
     def _attach_meas_ppc_device_pos(self) -> None:
@@ -4467,6 +4544,110 @@ class DCStateEstimator:
             device_positions=pseudo_device_positions[:pseudo_count],
         )
 
+    def _add_power_balance_constraint_measurements(self) -> None:
+        """为纯联络零注入直流拓扑母线追加行均衡紧 KCL 电流守恒约束 (G_kcl @ V + A_sw @ I_sw = 0)。"""
+        node_count = int(getattr(self, "n_nodes", 0))
+        jac_csr = getattr(self, "_dc_kcl_jac_csr", None)
+        if node_count <= 0 or jac_csr is None or jac_csr.shape[0] != node_count or jac_csr.nnz == 0:
+            return
+
+        has_ext = np.zeros(node_count, dtype=bool)
+        for attr in ("_generator_pos", "_load_pos", "_dcdc_i_pos", "_dcdc_j_pos"):
+            pos_arr = np.asarray(getattr(self, attr, ()), dtype=np.int64)
+            if pos_arr.size:
+                valid_p = pos_arr[(pos_arr >= 0) & (pos_arr < node_count)]
+                if valid_p.size:
+                    has_ext[valid_p] = True
+
+        jac_deg = np.diff(jac_csr.indptr)
+        zi_mask = (~has_ext) & (jac_deg > 0)
+        if not np.any(zi_mask):
+            return
+
+        base_table = _measurement_table_from_array_view(self.measurements)
+        base_count = int(base_table.idx.size)
+        balance_code = int(DEVICE_TYPE_DCPowerBalance)
+
+        jac_sq = np.zeros(node_count, dtype=np.float64)
+        nz_r = np.flatnonzero(jac_deg > 0)
+        if nz_r.size:
+            jac_sq[nz_r] = np.add.reduceat(jac_csr.data * jac_csr.data, jac_csr.indptr[:-1][nz_r])
+        jac_sq = np.maximum(jac_sq, 1.0)
+        med_jac_sq = float(np.median(jac_sq[zi_mask]))
+
+        min_stiff = 10.0
+        p90_stiff = 100.0 * med_jac_sq
+        max_stiff = p90_stiff
+        max_w = 100.0
+        if base_count > 0:
+            bw = np.asarray(base_table.weight, dtype=np.float64)
+            bv = np.asarray(base_table.valid, dtype=bool)
+            bst = measurement_table_status_code(base_table)
+            bdt = np.asarray(base_table.device_type_code, dtype=np.int16)
+            bmt = np.asarray(
+                getattr(base_table, "meas_type_code", np.zeros(base_count, dtype=np.int16)),
+                dtype=np.int16,
+            )
+            real_m = bv & (bst == MEAS_STATUS_NORMAL) & (bdt != balance_code) & np.isfinite(bw) & (bw > 0.0)
+            if np.any(real_m):
+                rw = bw[real_m]
+                max_w = float(np.max(rw))
+                is_br_flow = (bdt[real_m] == DEVICE_TYPE_DCBranch) & (
+                    ~np.isin(bmt[real_m], (MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO))
+                )
+                row_jac_est = np.where(is_br_flow, 0.5 * med_jac_sq, 1.0)
+                real_stiff = rw * row_jac_est
+                min_stiff = max(float(np.percentile(real_stiff, 5)), 1.0)
+                p90_stiff = max(float(np.percentile(real_stiff, 90)), 100.0)
+                max_stiff = float(np.max(real_stiff))
+
+        # 精确区分电压测点 (||H||^2=1) 与支路潮流/电流测点 (||H||^2~0.5*jac_sq) 的真实行刚度，
+        # 既消除低阻直流支路高电导压扁紧权重的缺陷，又严格控制正规方程相对条件数以保持机器精度选择逆
+        ref_stiff = max(p90_stiff, 0.25 * max_stiff)
+        cond_stiff_cap = min(max(2.5e7 * min_stiff, 1.5e3 * ref_stiff), 5.0e11)
+        target_stiff = min(max(1.0e4 * ref_stiff, 1.0e6), cond_stiff_cap)
+        max_zi_w = min(max(1.5e7, 200.0 * max_w), 2.5e8)
+        node_zi_w = np.clip(target_stiff / jac_sq, 100.0, max_zi_w)
+
+        if base_count > 0:
+            bdt = np.asarray(base_table.device_type_code, dtype=np.int16)
+            existing_bal = np.flatnonzero((bdt == balance_code) & np.asarray(base_table.valid, dtype=bool))
+            if existing_bal.size > 0:
+                bdp = getattr(base_table, "device_pos", None)
+                if bdp is not None and np.asarray(bdp).size == base_count:
+                    bdp_arr = np.asarray(bdp, dtype=np.int64)
+                    for r_b in existing_bal.tolist():
+                        s_pos = int(bdp_arr[r_b])
+                        if 0 <= s_pos < node_count and zi_mask[s_pos]:
+                            base_table.weight[r_b] = max(float(base_table.weight[r_b]), float(node_zi_w[s_pos]))
+                            zi_mask[s_pos] = False
+
+        zi_pos = np.flatnonzero(zi_mask).astype(np.int64)
+        if zi_pos.size == 0:
+            return
+
+        next_idx = self._next_measurement_idx()
+        row_count = int(zi_pos.size)
+        empty_obj = np.asarray([], dtype=object)
+        balance_table = MeasurementTable(
+            idx=np.arange(next_idx, next_idx + row_count, dtype=np.int64),
+            name=empty_obj,
+            device_type=empty_obj,
+            device_name=empty_obj,
+            meas_type=empty_obj,
+            weight=node_zi_w[zi_pos].astype(np.float64, copy=True),
+            valid=np.ones(row_count, dtype=bool),
+            value=np.zeros(row_count, dtype=np.float64),
+            device_type_code=np.full(row_count, balance_code, dtype=np.int16),
+            angle_mask=np.zeros(row_count, dtype=bool),
+            status_code=np.full(row_count, MEAS_STATUS_NORMAL, dtype=np.int16),
+            rows_by_device_type_code={balance_code: np.arange(row_count, dtype=np.int64)},
+            device_name_id=np.full(row_count, -1, dtype=np.int64),
+            meas_type_code=np.full(row_count, MEAS_TYPE_P_BALANCE, dtype=np.int16),
+            device_pos=zi_pos,
+        )
+        self._append_pseudo_measurement_table(balance_table, record_summary=False)
+
     def _add_targeted_observability_pseudo_measurements(self) -> int:
         """Patch DC rank deficiencies and optional post-observability redundancy."""
         total_added = 0
@@ -5566,6 +5747,37 @@ class DCStateEstimator:
             "dcdc_pos": self._int_array(self._dcdc_plan_pos[device_pos]),
         }
 
+    def _build_balance_vector_plan_from_table(
+        self,
+        plan_table: MeasurementPlanTable,
+        handled: np.ndarray,
+    ) -> Dict[str, object]:
+        rows = self._plan_rows_for_device_code(plan_table, handled, DEVICE_TYPE_DCPowerBalance)
+        if rows.size == 0:
+            empty_i = self._int_array(())
+            return {
+                "balance_rows": empty_i,
+                "balance_pos": empty_i,
+                "balance_g_sub": None,
+                "balance_sw_sub": None,
+                "balance_jac_rows": empty_i,
+                "balance_jac_cols": empty_i,
+                "balance_jac_data": np.empty(0, dtype=np.float64),
+            }
+        pos = np.asarray(plan_table.device_pos, dtype=np.int64)[rows]
+        g_sub = self._dc_kcl_g_csr[pos].tocsr()
+        sw_sub = self._dc_kcl_sw_csr[pos].tocsr() if int(self.n_switch) > 0 else None
+        jac_sub = self._dc_kcl_jac_csr[pos].tocoo()
+        return {
+            "balance_rows": self._int_array(rows),
+            "balance_pos": self._int_array(pos),
+            "balance_g_sub": g_sub,
+            "balance_sw_sub": sw_sub,
+            "balance_jac_rows": self._int_array(rows[jac_sub.row]),
+            "balance_jac_cols": self._int_array(jac_sub.col),
+            "balance_jac_data": np.asarray(jac_sub.data, dtype=np.float64),
+        }
+
     def _measurement_plan(self, measurements_or_plan_tables) -> Dict[str, np.ndarray]:
         if isinstance(measurements_or_plan_tables, dict) or isinstance(measurements_or_plan_tables, MeasurementPlanTable):
             plan_table = self._common_measurement_plan_table(measurements_or_plan_tables)
@@ -5589,6 +5801,7 @@ class DCStateEstimator:
         plan.update(self._build_generator_vector_plan_from_table(plan_table, handled))
         plan.update(self._build_switch_vector_plan_from_table(plan_table, handled))
         plan.update(self._build_dcdc_vector_plan_from_table(plan_table, handled))
+        plan.update(self._build_balance_vector_plan_from_table(plan_table, handled))
         # Precompute per-kind bool masks once. The fill_* helpers branch on
         # `kind == k` for each k in the relevant range; without these caches
         # every iteration re-evaluates the comparison even though `kind` is
@@ -5773,6 +5986,15 @@ class DCStateEstimator:
                     if valid.any():
                         tmp[valid] = p_t[valid] / v_t[valid]
                     values[k_rows] = tmp
+
+        bal_rows = plan.get("balance_rows")
+        if bal_rows is not None and bal_rows.size:
+            g_sub = plan["balance_g_sub"]
+            sw_sub = plan["balance_sw_sub"]
+            bal_vals = np.asarray(g_sub @ voltage, dtype=np.float64)
+            if sw_sub is not None and sw_sub.nnz > 0 and switch_current.size > 0:
+                bal_vals = bal_vals + np.asarray(sw_sub @ switch_current, dtype=np.float64)
+            values[bal_rows] = bal_vals
 
         return plan["handled_mask"]
 
@@ -5997,6 +6219,10 @@ class DCStateEstimator:
                 p_to = dcdc_power[q_idx]
                 self._add_indexed_values(H, k_rows, qc, 1.0 / v_to)
                 self._add_indexed_values(H, k_rows, jc, -p_to / (v_to * v_to))
+
+        bal_j_rows = plan.get("balance_jac_rows")
+        if bal_j_rows is not None and bal_j_rows.size:
+            self._add_indexed_values(H, bal_j_rows, plan["balance_jac_cols"], plan["balance_jac_data"])
 
         return plan["handled_mask"]
 
@@ -6862,7 +7088,34 @@ class DCStateEstimator:
                         frozen_steps = 3
                     continue
                 if force_lm_damping < 100.0 and normal_operand is not None and aat_solver is not None:
-                    force_lm_damping = min(100.0, max(force_lm_damping * 10.0, 1e-2))
+                    if curvature_damping_active and step_damping > 0.0:
+                        step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else aat_solver
+                        diag_reg_lm = (
+                            step_solver_lm.unregularized_diagonal()
+                            if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
+                            else None
+                        )
+                        tr_d, _ = tr_ctrl.update(
+                            step_damping,
+                            rhs,
+                            dx,
+                            0.0,
+                            0.0,
+                            current_obj=objective,
+                            half_obj=True,
+                            diag_reg=diag_reg_lm,
+                            min_damping=0.0,
+                            max_damping=100.0,
+                            zero_cutoff=1e-3,
+                        )
+                        force_lm_damping = min(100.0, max(tr_d, step_damping * 4.0, 1e-2))
+                        tr_ctrl._last_safe_nonzero = max(tr_ctrl._last_safe_nonzero, force_lm_damping)
+                    else:
+                        base_d = max(float(force_lm_damping), float(step_damping))
+                        force_lm_damping = min(100.0, max(base_d * 10.0, 1e-2))
+                        curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(force_lm_damping, objective)
+                    lm_guard_streak = 0
                     backtrack_streak = 0
                     prev_step_accepted = False
                     continue
@@ -7158,6 +7411,8 @@ class DCStateEstimator:
                         converged = True
         factor_deferred = False
         inplace_factor_modified = bool(factor_is_current_weights)
+        if final_diagnostics and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)):
+            final_quantities_current = False
         if final_diagnostics and not final_quantities_current:
             start = time.perf_counter() if self.profile_enabled else None
             H = self.jacobian_sparse(x, measurement_plan_tables)
@@ -7183,7 +7438,6 @@ class DCStateEstimator:
                     use_aat_normal_solver
                     and aat_solver is not None
                     and aat_plan is not None
-                    and aat_solver.last_cholmod_factor is not None
                 ):
                     try:
                         start = time.perf_counter() if self.profile_enabled else None
@@ -7198,14 +7452,13 @@ class DCStateEstimator:
                             copy_rhs=False,
                             assume_pattern_matches=active_measurement_run,
                         )
-                        aat_solver.last_cholmod_factor.cholesky_AAt_inplace(normal_operand)
-                        aat_solver._last_normal_operand = normal_operand
-                        gain = None
-                        final_quantities_current = True
-                        aat_refreshed = True
-                        inplace_factor_modified = True
-                        if start is not None:
-                            self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
+                        if aat_solver.refresh_unregularized_factor(normal_operand):
+                            gain = None
+                            final_quantities_current = True
+                            aat_refreshed = True
+                            inplace_factor_modified = True
+                            if start is not None:
+                                self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
                     except Exception:
                         aat_refreshed = False
                 if not aat_refreshed:
@@ -7650,13 +7903,23 @@ class DCStateEstimator:
                 if 0 <= int(it.row_pos) < row_thr_use.size
                 and float(it.normalized_residual) > float(row_thr_use[int(it.row_pos)])
             ]
+        _raw_max_remove, _raw_max_per_round = max_remove, max_remove_per_round
+        _meas_cap_base = n_real_meas if n_real_meas > 0 else n_base
         max_remove, max_remove_per_round = resolve_bad_data_limits(
-            n_real_meas if n_real_meas > 0 else n_base,
-            max_remove=max_remove,
-            max_remove_per_round=max_remove_per_round,
+            _meas_cap_base,
+            max_remove=_raw_max_remove,
+            max_remove_per_round=_raw_max_per_round,
             param_max_remove=self.params.max_remove,
             param_max_remove_per_round=getattr(self.params, "max_remove_per_round", None),
         )
+        ext_max_remove, ext_max_per_round = resolve_auto_extreme_bad_data_caps(
+            _meas_cap_base,
+            max_remove=_raw_max_remove,
+            max_remove_per_round=_raw_max_per_round,
+            param_max_remove=self.params.max_remove,
+            param_max_remove_per_round=getattr(self.params, "max_remove_per_round", None),
+        )
+        ext_norm_floor = max(15.0, 4.0 * float(threshold))
         active_mask = np.ones(n_base, dtype=bool)
         masked_weights = base_weights.copy()
         masked_values: Optional[np.ndarray] = None
@@ -8266,7 +8529,7 @@ class DCStateEstimator:
             return [pair[1] for pair in chosen]
 
         while True:
-            if len(removed) >= max_remove:
+            if len(removed) >= ext_max_remove:
                 if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
@@ -8340,6 +8603,17 @@ class DCStateEstimator:
                 else:
                     if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
                         rescue_rounds += 1
+                        continue
+                    break
+
+            extreme_only_mode = len(removed) >= max_remove
+            if extreme_only_mode:
+                candidates = [it for it in candidates if float(it.normalized_residual) >= ext_norm_floor]
+                if not candidates:
+                    if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
+                        rescue_rounds += 1
+                        continue
+                    if _try_dc_flat_start_fallback():
                         continue
                     break
 
@@ -8547,7 +8821,9 @@ class DCStateEstimator:
                 return None
 
             accepted_removal = False
-            remaining_quota = max_remove - len(removed)
+            eff_total_cap = ext_max_remove if extreme_only_mode else max_remove
+            eff_round_cap = ext_max_per_round if extreme_only_mode else max_remove_per_round
+            remaining_quota = eff_total_cap - len(removed)
             cur_H_csr = (
                 (result.H if getattr(result.H, "format", None) == "csr" else result.H.tocsr())
                 if (result.H is not None and is_sparse_matrix(result.H) and int(result.H.shape[0]) == n_base)
@@ -8560,7 +8836,7 @@ class DCStateEstimator:
             )
             if batch_cooldown > 0:
                 batch_cooldown -= 1
-            elif len(candidates) >= 2 and remaining_quota >= 2 and max_remove_per_round >= 2 and result.H is not None:
+            elif len(candidates) >= 2 and remaining_quota >= 2 and eff_round_cap >= 2 and result.H is not None:
                 valid_cands = [
                     item
                     for item in candidates
@@ -8572,7 +8848,7 @@ class DCStateEstimator:
                     cands_norms = [float(it.normalized_residual) for it in valid_cands]
                     batch_min_norm = float(threshold)
                     batch_hops = 3
-                    batch_max = min(max_remove_per_round, remaining_quota)
+                    batch_max = min(eff_round_cap, remaining_quota)
                     if dynamic_batch_cap is not None:
                         batch_max = min(batch_max, dynamic_batch_cap)
                     batch_local = (

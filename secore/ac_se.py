@@ -99,6 +99,7 @@ from algorithm_parameters import (
     DEFAULT_SE_PARAMETER_FILE,
     StateEstimationParameters,
     load_se_parameters,
+    resolve_auto_extreme_bad_data_caps,
     resolve_bad_data_limits,
 )
 from paths import measurement_file, model_file
@@ -5974,42 +5975,149 @@ class ACStateEstimator:
         node_count = int(getattr(self, "n_nodes", 0))
         if node_count == 0:
             return
-        row_count = 2 * node_count
-        weight = 10.0
-        store_strings = False
-        if store_strings:
-            node_names = np.asarray(getattr(self, "_ac_node_names", np.asarray([], dtype=object)), dtype=object)
-            names = np.empty(row_count, dtype=object)
-            names[0::2] = [f"constraint_p_balance_{name}" for name in node_names]
-            names[1::2] = [f"constraint_q_balance_{name}" for name in node_names]
-            meas_type = np.empty(row_count, dtype=object)
-            meas_type[0::2] = "P_BALANCE"
-            meas_type[1::2] = "Q_BALANCE"
-            device_type = np.full(row_count, "ACPowerBalance", dtype=object)
-            device_name = np.repeat(node_names, 2)
-        else:
-            names = np.asarray([], dtype=object)
-            meas_type = np.asarray([], dtype=object)
-            device_type = np.asarray([], dtype=object)
-            device_name = np.asarray([], dtype=object)
+        base_table = _measurement_table_from_measurements(self.measurements)
+        base_count = int(base_table.idx.size)
         balance_code = DEVICE_TYPE_ACPowerBalance
-        meas_type_code = np.empty(row_count, dtype=np.int16)
-        meas_type_code[0::2] = MEAS_TYPE_P_BALANCE
-        meas_type_code[1::2] = MEAS_TYPE_Q_BALANCE
+
+        # 识别无发电机、无负荷、无并联无功及无 ACAC 扩展状态的纯联络零注入母线
+        has_ext_inj = np.zeros(node_count, dtype=bool)
+        for attr in (
+            "_ac_generator_power_node_pos",
+            "_ac_load_power_node_pos",
+            "shunt_q_pos_array",
+            "_ac_acac_power_i_pos",
+            "_ac_acac_power_j_pos",
+        ):
+            pos_arr = np.asarray(getattr(self, attr, ()), dtype=np.int64)
+            if pos_arr.size:
+                valid_p = pos_arr[(pos_arr >= 0) & (pos_arr < node_count)]
+                if valid_p.size:
+                    has_ext_inj[valid_p] = True
+        fixed_q = np.asarray(getattr(self, "fixed_shunt_q_injection_array", ()), dtype=np.float64)
+        if fixed_q.size == node_count:
+            has_ext_inj |= np.abs(fixed_q) > 1e-12
+        zi_bus_mask = ~has_ext_inj
+
+        # 统计有效真实测点真实行刚度分布（区分电压测点 ||H||^2=1 与支路潮流测点 ||H||^2~0.5*y_row_sq），
+        # 在严守正规方程相对条件数的前提下避免短低阻支路或异构高权重截断零注入紧度
+        y_csr = self.Y.tocsr() if hasattr(self.Y, "tocsr") else None
+        if y_csr is not None and y_csr.shape == (node_count, node_count) and y_csr.nnz > 0:
+            y_abs2 = np.abs(y_csr.data) ** 2
+            deg_y = np.diff(y_csr.indptr)
+            y_row_sq = np.zeros(node_count, dtype=np.float64)
+            nz_r = np.flatnonzero(deg_y > 0)
+            if nz_r.size:
+                y_row_sq[nz_r] = np.add.reduceat(y_abs2, y_csr.indptr[:-1][nz_r])
+            y_row_sq = np.maximum(y_row_sq, 1.0)
+        else:
+            y_row_sq = np.ones(node_count, dtype=np.float64)
+        med_y_sq = float(np.median(y_row_sq[zi_bus_mask])) if np.any(zi_bus_mask) else float(np.median(y_row_sq))
+
+        med_w = 100.0
+        max_w = 100.0
+        min_stiff = 10.0
+        p90_stiff = 100.0 * med_y_sq
+        max_stiff = p90_stiff
+        if base_count > 0:
+            bw = np.asarray(base_table.weight, dtype=np.float64)
+            bv = np.asarray(base_table.valid, dtype=bool)
+            bst = measurement_table_status_code(base_table)
+            bdt = np.asarray(base_table.device_type_code, dtype=np.int16)
+            bmt = np.asarray(
+                getattr(base_table, "meas_type_code", np.zeros(base_count, dtype=np.int16)),
+                dtype=np.int16,
+            )
+            real_m = bv & (bst == MEAS_STATUS_NORMAL) & (bdt != balance_code) & np.isfinite(bw) & (bw > 0.0)
+            if np.any(real_m):
+                rw = bw[real_m]
+                med_w = float(np.median(rw))
+                max_w = float(np.max(rw))
+                is_br_flow = np.isin(
+                    bdt[real_m],
+                    (DEVICE_TYPE_ACBranch, DEVICE_TYPE_ACTransformer, DEVICE_TYPE_ACThreeWindingTransformer),
+                ) & (~np.isin(bmt[real_m], (MEAS_TYPE_V, MEAS_TYPE_V_FROM, MEAS_TYPE_V_TO, MEAS_TYPE_V_THIRD)))
+                row_jac_est = np.where(is_br_flow, 0.5 * med_y_sq, 1.0)
+                real_stiff = rw * row_jac_est
+                min_stiff = max(float(np.percentile(real_stiff, 5)), 1.0)
+                p90_stiff = max(float(np.percentile(real_stiff, 90)), 100.0)
+                max_stiff = float(np.max(real_stiff))
+
+        ref_stiff = max(p90_stiff, 0.25 * max_stiff)
+        cond_stiff_cap = min(max(2.5e7 * min_stiff, 1.5e3 * ref_stiff), 2.5e11)
+        target_stiff = min(max(1.0e4 * ref_stiff, 1.0e6), cond_stiff_cap)
+        max_zi_w = min(max(1.0e7, 200.0 * max_w), 2.5e8)
+        zi_node_w = np.clip(target_stiff / y_row_sq, 100.0, max_zi_w)
+        ext_node_w = float(np.clip(max(10.0, 2.0 * med_w), 10.0, 500.0))
+        node_w = np.where(zi_bus_mask, zi_node_w, ext_node_w)
+
         node_plan_pos = np.asarray(getattr(self, "_ac_node_plan_pos", ()), dtype=np.int64)
         solver_to_plan_pos = np.empty(node_count, dtype=np.int64)
         solver_to_plan_pos.fill(-1)
         valid_plan = (node_plan_pos >= 0) & (node_plan_pos < node_count)
         if np.any(valid_plan):
             solver_to_plan_pos[node_plan_pos[valid_plan].astype(np.intp, copy=False)] = np.nonzero(valid_plan)[0]
-        device_pos = np.repeat(solver_to_plan_pos, 2)
+
+        # 若外部 .meas 已包含有效 ACPowerBalance 行，原地对齐紧权重并避免重复追加同母线同类型平衡行
+        need_p = np.ones(node_count, dtype=bool)
+        need_q = np.ones(node_count, dtype=bool)
+        if base_count > 0:
+            bdt = np.asarray(base_table.device_type_code, dtype=np.int16)
+            existing_bal = np.flatnonzero((bdt == balance_code) & np.asarray(base_table.valid, dtype=bool))
+            if existing_bal.size > 0:
+                bmt = np.asarray(
+                    getattr(base_table, "meas_type_code", np.zeros(base_count, dtype=np.int16)),
+                    dtype=np.int16,
+                )
+                bdp = getattr(base_table, "device_pos", None)
+                if bdp is not None and np.asarray(bdp).size == base_count:
+                    bdp_arr = np.asarray(bdp, dtype=np.int64)
+                    for r_b in existing_bal.tolist():
+                        dp_i = int(bdp_arr[r_b])
+                        if 0 <= dp_i < node_plan_pos.size:
+                            s_pos = int(node_plan_pos[dp_i])
+                            if 0 <= s_pos < node_count:
+                                mt_i = int(bmt[r_b])
+                                if mt_i == MEAS_TYPE_P_BALANCE:
+                                    base_table.weight[r_b] = max(float(base_table.weight[r_b]), float(node_w[s_pos]))
+                                    need_p[s_pos] = False
+                                elif mt_i == MEAS_TYPE_Q_BALANCE:
+                                    base_table.weight[r_b] = max(float(base_table.weight[r_b]), float(node_w[s_pos]))
+                                    need_q[s_pos] = False
+
+        full_row_count = 2 * node_count
+        keep_mask = np.empty(full_row_count, dtype=bool)
+        keep_mask[0::2] = need_p
+        keep_mask[1::2] = need_q
+        if not np.any(keep_mask):
+            self.measurements = self._measurement_sequence_from_table(
+                base_table,
+                normalized=getattr(self.measurements, "normalized", False),
+            )
+            self.measurement_table = base_table
+            return
+
+        meas_type_code_full = np.empty(full_row_count, dtype=np.int16)
+        meas_type_code_full[0::2] = MEAS_TYPE_P_BALANCE
+        meas_type_code_full[1::2] = MEAS_TYPE_Q_BALANCE
+        device_pos_full = np.repeat(solver_to_plan_pos, 2)
+        weight_full = np.repeat(node_w, 2)
+
+        meas_type_code = meas_type_code_full[keep_mask]
+        device_pos = device_pos_full[keep_mask]
+        row_weights = weight_full[keep_mask]
+        row_count = int(meas_type_code.size)
+
+        names = np.asarray([], dtype=object)
+        meas_type = np.asarray([], dtype=object)
+        device_type = np.asarray([], dtype=object)
+        device_name = np.asarray([], dtype=object)
         balance_table = MeasurementTable(
             idx=np.arange(next_idx, next_idx + row_count, dtype=np.int64),
             name=names,
             device_type=device_type,
             device_name=device_name,
             meas_type=meas_type,
-            weight=np.full(row_count, weight, dtype=np.float64),
+            weight=row_weights,
             valid=np.ones(row_count, dtype=bool),
             value=np.zeros(row_count, dtype=np.float64),
             device_type_code=np.full(row_count, balance_code, dtype=np.int16),
@@ -6020,8 +6128,6 @@ class ACStateEstimator:
             meas_type_code=meas_type_code,
             device_pos=device_pos,
         )
-        base_table = _measurement_table_from_measurements(self.measurements)
-        base_count = int(base_table.idx.size)
         combined_table = concat_measurement_tables(base_table, balance_table)
         rows_by_code = {
             int(code): np.asarray(rows, dtype=np.int64).copy()
@@ -10361,6 +10467,7 @@ class ACStateEstimator:
             else np.empty(0, dtype=np.intp)
         )
         box_pin_cache: Dict = {}
+        curv_aat_solver: Optional[CholmodAAtNormalEquationSolver] = None
         boundary_proj_streak = 0
         lm_guard_streak = 0
         frozen_fail_count = 0
@@ -10747,7 +10854,12 @@ class ACStateEstimator:
                                 solve_operand = sp_hstack([normal_operand, V_curv], format="csc")
                                 used_sw_curv = True
                         use_fast_lm_handoff = step_damping == 0.0 and self.n_state >= 500
-                        dx, _ = aat_solver.solve(
+                        eff_aat_solver = aat_solver
+                        if used_sw_curv:
+                            if curv_aat_solver is None:
+                                curv_aat_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=False)
+                            eff_aat_solver = curv_aat_solver
+                        dx, _ = eff_aat_solver.solve(
                             solve_operand,
                             rhs,
                             return_factor_diag=False,
@@ -10757,13 +10869,13 @@ class ACStateEstimator:
                         if step_damping == 0.0:
                             undamped_ok = (
                                 (dx.size == 0 or bool(np.all(np.isfinite(dx))))
-                                and getattr(aat_solver, "_active_backend", None) in ("pardiso", "cholmod")
+                                and getattr(eff_aat_solver, "_active_backend", None) in ("pardiso", "cholmod")
                             )
                             last_undamped_spd_failed = not undamped_ok
                         # 若无阻尼牛顿步出现非有限值、显著过冲或将弱盲节点推入低/过电压危险区，提前采用分级 LM 阻尼扶正方向
                         if step_damping == 0.0 and _dx_needs_lm_guard(dx, strict_step=True):
                             for beta_try in tr_ctrl.lm_guard_damping_ladder():
-                                dx_lm, _ = aat_solver.solve(
+                                dx_lm, _ = eff_aat_solver.solve(
                                     solve_operand,
                                     rhs,
                                     return_factor_diag=False,
@@ -10851,6 +10963,10 @@ class ACStateEstimator:
                 max_a_dx = float(np.max(np.abs(dx[: self.n_angle])))
                 if max_a_dx > 0.75:
                     step_scale = min(step_scale, 0.75 / max_a_dx)
+            if self.n_state > self.base_switch_re and dx.size > self.base_switch_re:
+                max_aux_dx = float(np.max(np.abs(dx[self.base_switch_re :])))
+                if max_aux_dx > 15.0:
+                    step_scale = min(step_scale, 15.0 / max_aux_dx)
             base_step_scale = step_scale
             accepted_step = None
             used_boundary_proj = False
@@ -10951,7 +11067,35 @@ class ACStateEstimator:
                         frozen_steps = max(scale_profile.frozen_max_steps, scale_profile.local_warm_frozen_max_steps)
                     continue
                 if force_lm_damping < 100.0 and normal_operand is not None and aat_solver is not None:
-                    force_lm_damping = max(force_lm_damping * 10.0, 1e-2)
+                    if curvature_damping_active and step_damping > 0.0:
+                        step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else aat_solver
+                        diag_reg_lm = (
+                            step_solver_lm.unregularized_diagonal()
+                            if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
+                            else None
+                        )
+                        tr_d, _ = tr_ctrl.update(
+                            step_damping,
+                            rhs,
+                            dx,
+                            0.0,
+                            0.0,
+                            current_obj=objective,
+                            half_obj=True,
+                            diag_reg=diag_reg_lm,
+                            min_damping=0.0,
+                            max_damping=100.0,
+                            zero_cutoff=1e-3,
+                        )
+                        force_lm_damping = min(100.0, max(tr_d, step_damping * 4.0, 1e-2))
+                        tr_ctrl._last_safe_nonzero = max(tr_ctrl._last_safe_nonzero, force_lm_damping)
+                    else:
+                        base_d = max(float(force_lm_damping), float(step_damping))
+                        force_lm_damping = min(100.0, max(base_d * 10.0, 1e-2))
+                        curvature_damping_active = True
+                        tr_ctrl.notify_damping_activated(force_lm_damping, objective)
+                    lm_guard_streak = 0
+                    damped_flip_streak = 0
                     backtrack_streak = 0
                     prev_step_accepted = False
                     continue
@@ -11048,7 +11192,11 @@ class ACStateEstimator:
 
             # 支柱 1：带退避倍率 ν 与反极限环下界记忆的 Nielsen (1999) 连续阻尼更新律（严格使用纯 GN/LM 单步降幅）
             if curvature_damping_active and step_damping > 0.0:
-                step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else aat_solver
+                step_solver_lm = (
+                    box_pin_cache.get("solver")
+                    if used_box_pin_step
+                    else (curv_aat_solver if used_sw_curv else aat_solver)
+                )
                 diag_reg_lm = (
                     step_solver_lm.unregularized_diagonal()
                     if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
@@ -11113,6 +11261,49 @@ class ACStateEstimator:
                     prev_step_accepted = False
             else:
                 lm_guard_streak = 0
+
+            # 固定核心 (V, theta, I_sw) 的显式功率辅助子块精确最小二乘闭合投影：
+            # 消除盲区同母线多负荷/发荷差模方向在 LM 阻尼压制下的数百步慢漂移拖尾
+            pq_start = int(getattr(self, "base_gen_p", self.n_state))
+            if (
+                self.n_state > pq_start
+                and (step_damping > 0.0 or iteration >= 6)
+                and H is not None
+                and issparse(H)
+                and (iteration % 3 == 0)
+                and dx.size == self.n_state
+            ):
+                core_max = float(np.max(np.abs(dx[:pq_start]))) if pq_start > 0 else 0.0
+                pq_max = float(np.max(np.abs(dx[pq_start:])))
+                if core_max <= 1.5e-2 and pq_max > max(2.5 * core_max, 8.0e-3):
+                    try:
+                        from scipy.sparse import diags as sp_diags
+                        from scipy.sparse.linalg import spsolve as sp_spsolve
+
+                        H_pq = H.tocsc()[:, pq_start:]
+                        w_pos = np.maximum(weight, 0.0)
+                        WH_pq = H_pq.multiply(w_pos[:, None])
+                        n_pq = int(self.n_state - pq_start)
+                        G_pq = (H_pq.T @ WH_pq + sp_diags(np.full(n_pq, 1.0e-10, dtype=np.float64), format="csc")).tocsc()
+                        rhs_pq = np.asarray(H_pq.T @ (w_pos * residual), dtype=np.float64).ravel()
+                        dx_pq = np.asarray(sp_spsolve(G_pq, rhs_pq), dtype=np.float64).ravel()
+                        if dx_pq.size == n_pq and np.all(np.isfinite(dx_pq)):
+                            for pq_alpha in (1.0, 0.5):
+                                x_pq = x.copy()
+                                x_pq[pq_start:] += pq_alpha * dx_pq
+                                self.evaluate(x_pq, measurement_plan_tables, out=cand_z_est)
+                                self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                                pq_obj = self._weighted_objective(weight, cand_residual)
+                                if np.isfinite(pq_obj) and pq_obj < objective - max(1e-12, 1e-10 * (abs(objective) + 1.0)):
+                                    x = x_pq
+                                    z_est, cand_z_est = cand_z_est, z_est
+                                    residual, cand_residual = cand_residual, residual
+                                    objective = pq_obj
+                                    objective_change = abs(previous_objective - objective)
+                                    prev_step_accepted = False
+                                    break
+                    except Exception:
+                        pass
             if accepted_step is not None and accepted_step < 1e-3 and max_correction > 1e-2:
                 micro_step_streak += 1
                 fullstep_osc_streak = 0
@@ -11391,8 +11582,16 @@ class ACStateEstimator:
                     sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
                     if float(np.max(sv_chk)) <= max(5e-3, 5000.0 * self.tol):
                         converged = True
+        if curv_aat_solver is not None:
+            try:
+                curv_aat_solver._reset_pardiso()
+            except Exception:
+                pass
+            curv_aat_solver = None
         factor_deferred = False
         inplace_factor_modified = bool(factor_is_current_weights)
+        if final_diagnostics and aat_solver is not None and bool(getattr(aat_solver, "_last_factor_scaled", False)):
+            final_quantities_current = False
         if final_diagnostics and not final_quantities_current:
             start = time.perf_counter() if self.profile_enabled else None
             H = self.jacobian_sparse(x, measurement_plan_tables)
@@ -11438,7 +11637,6 @@ class ACStateEstimator:
                     use_aat_normal_solver
                     and aat_solver is not None
                     and aat_plan is not None
-                    and aat_solver.last_cholmod_factor is not None
                 ):
                     try:
                         start = time.perf_counter() if self.profile_enabled else None
@@ -11453,14 +11651,13 @@ class ACStateEstimator:
                             copy_rhs=False,
                             assume_pattern_matches=active_measurement_run,
                         )
-                        aat_solver.last_cholmod_factor.cholesky_AAt_inplace(normal_operand)
-                        aat_solver._last_normal_operand = normal_operand
-                        gain = None
-                        final_quantities_current = True
-                        aat_refreshed = True
-                        inplace_factor_modified = True
-                        if start is not None:
-                            self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
+                        if aat_solver.refresh_unregularized_factor(normal_operand):
+                            gain = None
+                            final_quantities_current = True
+                            aat_refreshed = True
+                            inplace_factor_modified = True
+                            if start is not None:
+                                self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
                     except Exception:
                         aat_refreshed = False
                 if not aat_refreshed:
@@ -11920,13 +12117,23 @@ class ACStateEstimator:
                 if 0 <= int(it.row_pos) < row_thr_use.size
                 and float(it.normalized_residual) > float(row_thr_use[int(it.row_pos)])
             ]
+        _raw_max_remove, _raw_max_per_round = max_remove, max_remove_per_round
+        _meas_cap_base = n_real_meas if n_real_meas > 0 else n_base
         max_remove, max_remove_per_round = resolve_bad_data_limits(
-            n_real_meas if n_real_meas > 0 else n_base,
-            max_remove=max_remove,
-            max_remove_per_round=max_remove_per_round,
+            _meas_cap_base,
+            max_remove=_raw_max_remove,
+            max_remove_per_round=_raw_max_per_round,
             param_max_remove=self.params.max_remove,
             param_max_remove_per_round=getattr(self.params, "max_remove_per_round", None),
         )
+        ext_max_remove, ext_max_per_round = resolve_auto_extreme_bad_data_caps(
+            _meas_cap_base,
+            max_remove=_raw_max_remove,
+            max_remove_per_round=_raw_max_per_round,
+            param_max_remove=self.params.max_remove,
+            param_max_remove_per_round=getattr(self.params, "max_remove_per_round", None),
+        )
+        ext_norm_floor = max(15.0, 4.0 * float(threshold))
         active_mask = np.ones(n_base, dtype=bool)
         masked_weights = base_weights.copy()
         masked_values: Optional[np.ndarray] = None
@@ -12369,7 +12576,7 @@ class ACStateEstimator:
             return is_critical_leverage_row(cur_leverage, masked_weights, row_pos)
 
         def _can_warm_start_from(res_obj: EstimateResult) -> bool:
-            """仅当当前状态健康且无贴墙电压/相角节点（即使已收敛）时才允许原样延续温启动或刷新锚点 x0。"""
+            """仅当当前状态健康、无贴墙电压/相角节点且无逃逸辅助功率/电流状态时才允许原样延续温启动。"""
             if not np.isfinite(float(res_obj.objective)):
                 return False
             is_coarse = bool(getattr(res_obj, "_coarse_stopped", False))
@@ -12386,10 +12593,13 @@ class ACStateEstimator:
                 ap = xv[: self.n_angle]
                 if float(ap.min()) < float(self.angle_min_rad) + 0.1 or float(ap.max()) > float(self.angle_max_rad) - 0.1:
                     return False
+            if self.n_state > self.base_switch_re and xv.size > self.base_switch_re:
+                if float(np.max(np.abs(xv[self.base_switch_re :]))) > 20.0:
+                    return False
             return True
 
         def _warm_start_x0(res_obj: EstimateResult, fallback_x0: np.ndarray) -> Tuple[np.ndarray, bool]:
-            """构造删坏后重算初值：若存在贴墙电压节点则仅将贴墙节点复位为标称 1.0，跳出低电压下支盆地。"""
+            """构造删坏后重算初值：局部复位贴墙母线电压与大幅逃逸的显式辅助功率/开关电流状态。"""
             if _can_warm_start_from(res_obj):
                 return res_obj.x, False
             xv = res_obj.x
@@ -12407,6 +12617,7 @@ class ACStateEstimator:
                 ap = xv[: self.n_angle]
                 if float(ap.min()) < float(self.angle_min_rad) + 0.1 or float(ap.max()) > float(self.angle_max_rad) - 0.1:
                     return fallback_x0, True
+            clean_x = None
             if self.base_switch_re > self.n_angle:
                 vp = xv[self.n_angle : self.base_switch_re]
                 pin_mask = (vp < float(self.voltage_min) + 0.03) | (vp > float(self.voltage_max) - 0.03)
@@ -12414,12 +12625,21 @@ class ACStateEstimator:
                     clean_x = xv.copy()
                     v_nom = float(np.clip(1.0, float(self.voltage_min) + 0.05, float(self.voltage_max) - 0.05))
                     clean_x[self.n_angle : self.base_switch_re][pin_mask] = v_nom
-                    return clean_x, True
+            if self.n_state > self.base_switch_re and xv.size == fallback_x0.size:
+                aux_cur = xv[self.base_switch_re :]
+                aux_ref = fallback_x0[self.base_switch_re :]
+                esc_mask = np.abs(aux_cur - aux_ref) > 15.0
+                if np.any(esc_mask):
+                    if clean_x is None:
+                        clean_x = xv.copy()
+                    clean_x[self.base_switch_re :][esc_mask] = aux_ref[esc_mask]
+            if clean_x is not None:
+                return clean_x, True
             return fallback_x0, True
 
         def _try_boundary_node_rescue_once() -> bool:
-            """当常规坏数据剔除结束仍未收敛且存在贴边电压节点时，执行两级自救：
-            1) 沿贴边节点 1 跳失衡功率平衡方程反查被掩蔽的高杠杆真实坏数据并安全剔除；
+            """当常规坏数据剔除结束仍未收敛且存在贴边电压节点或大幅逃逸辅助状态时，执行两级自救：
+            1) 沿贴边/逃逸状态关联失衡方程反查被掩蔽的高杠杆真实坏数据（含零阻抗开关粗差）并安全剔除；
             2) 若无高杠杆坏数据失衡，仅对贴边盲节点自身的电压伪量测局部抬升权重（×10，上限 10.0）重算。
             """
             nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
@@ -12438,9 +12658,15 @@ class ACStateEstimator:
             ext_loc = np.flatnonzero(
                 (vx <= float(self.voltage_min) + 0.02) | (vx >= float(self.voltage_max) - 0.02)
             )
-            if ext_loc.size == 0:
+            esc_aux_cols = (
+                (np.flatnonzero(np.abs(result.x[self.base_switch_re :]) > 20.0) + self.base_switch_re).tolist()
+                if (self.n_state > self.base_switch_re and result.x is not None and result.x.size > self.base_switch_re)
+                else []
+            )
+            if ext_loc.size == 0 and not esc_aux_cols:
                 return False
-            ext_cols = (ext_loc + self.n_angle).tolist()
+            ext_v_cols = (ext_loc + self.n_angle).tolist()
+            ext_cols = ext_v_cols + esc_aux_cols
             if (
                 result.x is not None
                 and result.x.size == x0.size
@@ -12448,7 +12674,10 @@ class ACStateEstimator:
                 and np.isfinite(float(result.objective))
             ):
                 rescue_x0 = result.x.copy()
-                rescue_x0[ext_cols] = 1.0
+                if ext_v_cols:
+                    rescue_x0[ext_v_cols] = 1.0
+                if esc_aux_cols:
+                    rescue_x0[esc_aux_cols] = x0[esc_aux_cols]
             else:
                 rescue_x0 = x0
             H_csc = result.H.tocsc()
@@ -12458,8 +12687,11 @@ class ACStateEstimator:
             st_arr = measurement_table_status_code(base_table)
             val_arr = np.asarray(base_table.value, dtype=np.float64)
 
-            if len(removed) < max_remove:
-                # 跨分区按贴边节点各自定位 Top-1 失衡关联高杠杆真实坏数据，支持大规模多分区一次批量解救
+            eff_rescue_cap = ext_max_remove if len(removed) >= max_remove else max_remove
+            eff_rescue_round = ext_max_per_round if len(removed) >= max_remove else max_remove_per_round
+            rescue_score_floor = ext_norm_floor if len(removed) >= max_remove else 0.0
+            if len(removed) < eff_rescue_cap:
+                # 跨分区按贴边/逃逸节点各自定位 Top-1 失衡关联高杠杆真实坏数据，支持大规模多分区一次批量解救
                 per_bus_top: Dict[int, Tuple[float, int, Measurement]] = {}
                 all_cand_map: Dict[int, Tuple[float, int, Measurement]] = {}
                 for c_ext in ext_cols:
@@ -12472,14 +12704,14 @@ class ACStateEstimator:
                             and abs(float(result.residual[r_i])) > 0.05
                         ):
                             local_bal.append(r_i)
-                    if not local_bal:
-                        continue
-                    nb_cols = set()
+                    nb_cols = {int(c_ext)} if c_ext >= self.base_switch_re else set()
                     for br in local_bal:
                         nb_cols.update(H_csr.indices[H_csr.indptr[br] : H_csr.indptr[br + 1]].tolist())
+                    if not nb_cols:
+                        continue
                     best_local: Optional[Tuple[float, int, Measurement]] = None
                     for c in nb_cols:
-                        if c < self.base_gen_p:
+                        if c < self.base_switch_re:
                             continue
                         for r in H_csc.indices[H_csc.indptr[c] : H_csc.indptr[c + 1]]:
                             r_i = int(r)
@@ -12491,7 +12723,10 @@ class ACStateEstimator:
                             ):
                                 meas_cand = measurement_from_table_row(base_table, r_i)
                                 if (int(meas_cand.idx), str(meas_cand.name)) not in protected_keys:
-                                    score = abs(float(val_arr[r_i])) * float(np.sqrt(masked_weights[r_i]))
+                                    res_abs = abs(float(result.residual[r_i])) if result.residual is not None else 0.0
+                                    score = max(abs(float(val_arr[r_i])), res_abs) * float(np.sqrt(masked_weights[r_i]))
+                                    if score < rescue_score_floor:
+                                        continue
                                     item_t = (score, r_i, meas_cand)
                                     if best_local is None or score > best_local[0]:
                                         best_local = item_t
@@ -12505,7 +12740,7 @@ class ACStateEstimator:
                 if all_cand_map:
                     col_deg_rescue = compute_active_column_degrees(H_csr, active_mask, masked_weights)
                     prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
-                    rem_quota = min(max_remove_per_round, max_remove - len(removed))
+                    rem_quota = min(eff_rescue_round, eff_rescue_cap - len(removed))
                     batch_cands = sorted(per_bus_top.values(), key=lambda item: item[0], reverse=True)[:rem_quota]
                     if len(batch_cands) >= 2 and col_deg_rescue is not None:
                         safe_b_idx, _ = filter_batch_preserving_column_coverage(
@@ -12712,20 +12947,35 @@ class ACStateEstimator:
         warm_cont_tried = False
 
         def _try_warm_continuation() -> bool:
-            """若在当前活跃量测集上跑满 max_iter 仍未收敛但状态健康，以当前解清零阻尼温启动续跑一次。"""
+            """若在当前活跃量测集上跑满 max_iter 仍未收敛但核心电压/相角健康，清洗逃逸辅助状态后清零阻尼续跑一次。"""
             nonlocal result, cur_factor, cur_leverage, bad_items, normalized, full_normalized_valid
             nonlocal x0, warm_cont_tried, unconverged_stall_rounds, unconverged_total_rounds
             if (
                 result.converged
                 or warm_cont_tried
                 or int(getattr(result, "iterations", 0)) < min(20, int(self.max_iter))
-                or not _can_warm_start_from(result)
             ):
                 return False
+            xv = result.x
+            if xv is None or xv.size == 0 or not np.all(np.isfinite(xv)) or not np.isfinite(float(result.objective)):
+                return False
+            if self.base_switch_re > self.n_angle:
+                vp = xv[self.n_angle : self.base_switch_re]
+                if float(vp.min()) < float(self.voltage_min) + 0.03 or float(vp.max()) > float(self.voltage_max) - 0.03:
+                    return False
+            if self.n_angle > 0:
+                ap = xv[: self.n_angle]
+                if float(ap.min()) < float(self.angle_min_rad) + 0.1 or float(ap.max()) > float(self.angle_max_rad) - 0.1:
+                    return False
+            cont_x0 = xv.copy()
+            if self.n_state > self.base_switch_re and xv.size == x0.size:
+                esc_m = np.abs(cont_x0[self.base_switch_re :] - x0[self.base_switch_re :]) > 60.0
+                if np.any(esc_m):
+                    cont_x0[self.base_switch_re :][esc_m] = x0[self.base_switch_re :][esc_m]
             warm_cont_tried = True
             cont_res = self.estimate(
                 base_plan_tables,
-                x0=result.x.copy(),
+                x0=cont_x0,
                 verbose=verbose,
                 _defer_observability=True,
                 _weight_override=masked_weights,
@@ -12808,7 +13058,7 @@ class ACStateEstimator:
             return [pair[1] for pair in chosen]
 
         while True:
-            if len(removed) >= max_remove:
+            if len(removed) >= ext_max_remove:
                 if rescue_rounds < 6 and _try_boundary_node_rescue():
                     rescue_rounds += 1
                     continue
@@ -12888,6 +13138,17 @@ class ACStateEstimator:
                 else:
                     if rescue_rounds < 3 and _try_boundary_node_rescue():
                         rescue_rounds += 1
+                        continue
+                    break
+
+            extreme_only_mode = len(removed) >= max_remove
+            if extreme_only_mode:
+                candidates = [it for it in candidates if float(it.normalized_residual) >= ext_norm_floor]
+                if not candidates:
+                    if rescue_rounds < 6 and _try_boundary_node_rescue():
+                        rescue_rounds += 1
+                        continue
+                    if _try_flat_start_fallback():
                         continue
                     break
 
@@ -13102,7 +13363,9 @@ class ACStateEstimator:
                 return None
 
             accepted_removal = False
-            remaining_quota = max_remove - len(removed)
+            eff_total_cap = ext_max_remove if extreme_only_mode else max_remove
+            eff_round_cap = ext_max_per_round if extreme_only_mode else max_remove_per_round
+            remaining_quota = eff_total_cap - len(removed)
             cur_H_csr = (
                 (result.H if getattr(result.H, "format", None) == "csr" else result.H.tocsr())
                 if (result.H is not None and issparse(result.H) and int(result.H.shape[0]) == n_base)
@@ -13116,7 +13379,7 @@ class ACStateEstimator:
             # 多处坏数据并存时，在单步上限内按标准化残差降序做拓扑隔离（>=3 跳）安全批量剔除
             if batch_cooldown > 0:
                 batch_cooldown -= 1
-            elif len(candidates) >= 2 and remaining_quota >= 2 and max_remove_per_round >= 2 and result.H is not None:
+            elif len(candidates) >= 2 and remaining_quota >= 2 and eff_round_cap >= 2 and result.H is not None:
                 valid_cands = [
                     item
                     for item in candidates
@@ -13128,7 +13391,7 @@ class ACStateEstimator:
                     cands_norms = [float(it.normalized_residual) for it in valid_cands]
                     batch_min_norm = float(threshold)
                     batch_hops = 3
-                    batch_max = min(max_remove_per_round, remaining_quota)
+                    batch_max = min(eff_round_cap, remaining_quota)
                     if dynamic_batch_cap is not None:
                         batch_max = min(batch_max, dynamic_batch_cap)
                     batch_local = (

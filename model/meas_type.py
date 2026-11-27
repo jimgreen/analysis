@@ -55,6 +55,7 @@ DEVICE_TYPE_HeatStorage = 52
 DEVICE_TYPE_GasStorage = 53
 DEVICE_TYPE_HydroStorage = 54
 DEVICE_TYPE_SteamStorage = 55
+DEVICE_TYPE_DCPowerBalance = 56
 
 DEVICE_TYPE_CODES = {
     "ACNode": DEVICE_TYPE_ACNode,
@@ -113,6 +114,7 @@ DEVICE_TYPE_CODES = {
     "GasStorage": DEVICE_TYPE_GasStorage,
     "HydroStorage": DEVICE_TYPE_HydroStorage,
     "SteamStorage": DEVICE_TYPE_SteamStorage,
+    "DCPowerBalance": DEVICE_TYPE_DCPowerBalance,
 }
 DEVICE_TYPE_NAMES = {code: name for name, code in DEVICE_TYPE_CODES.items()}
 
@@ -169,6 +171,8 @@ MEAS_TYPE_H_FROM = 54
 MEAS_TYPE_H_TO = 55
 MEAS_TYPE_T_FROM = 56
 MEAS_TYPE_T_TO = 57
+MEAS_TYPE_FLOW_BALANCE = 58
+MEAS_TYPE_P_LOSS_BALANCE = 59
 
 MEAS_TYPE_CODES = {
     "UNKNOWN": MEAS_TYPE_UNKNOWN,
@@ -224,6 +228,8 @@ MEAS_TYPE_CODES = {
     "H_TO": MEAS_TYPE_H_TO,
     "T_FROM": MEAS_TYPE_T_FROM,
     "T_TO": MEAS_TYPE_T_TO,
+    "FLOW_BALANCE": MEAS_TYPE_FLOW_BALANCE,
+    "P_LOSS_BALANCE": MEAS_TYPE_P_LOSS_BALANCE,
 }
 MEAS_TYPE_NAMES = {code: name for name, code in MEAS_TYPE_CODES.items()}
 MEAS_TYPE_CODES.update(
