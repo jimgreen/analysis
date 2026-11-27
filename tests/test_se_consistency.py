@@ -8292,6 +8292,422 @@ def test_ac_blind_parallel_loads_and_breaker_current_outlier_convergence(tmp_pat
     assert 12 in rem_idxs
 
 
+def test_measurement_prefilter_device_limits_ac_dc_hybrid_and_fluid(tmp_path: Path):
+    """验证状态估计前基于设备自身状态限值区间的超倍预过滤（功率/电压/电流/流量/压力/温度/比焓）与 se.para 配置。"""
+    from algorithm_parameters import load_se_parameters
+    from model.heat_model import load_heat_network_from_e_file
+    from model.steam_model import load_steam_network_from_e_file
+    from secore.heat_se import HeatStateEstimator
+    from secore.meas_prefilter import REASON_DEVICE_LIMIT_EXCEEDED
+    from secore.steam_se import SteamStateEstimator
+
+    # 1. 验证 se.para 解析 enable_device_limit_prefilter 与 prefilter_device_limit_factor
+    para_file = tmp_path / "device_lim_se.para"
+    para_file.write_text(
+        "\n".join(
+            [
+                "<StateEstimationParameter>",
+                "@ name value",
+                "# tol 1e-6",
+                "# max_iter 80",
+                "# diff_step 1e-6",
+                "# flat_start true",
+                "# bad_threshold 3.0",
+                "# max_remove 10",
+                "# targeted_pseudo_measurement_max 50",
+                "# voltage_floor 0.1",
+                "# min_current_voltage 0.1",
+                "# power_flow_tol 1e-6",
+                "# power_flow_max_iter 50",
+                "# power_flow_min_voltage 0.1",
+                "# enable_measurement_prefilter true",
+                "# enable_device_limit_prefilter true",
+                "# prefilter_device_limit_factor 2.0",
+                "</StateEstimationParameter>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_se_parameters(para_file)
+    assert loaded.enable_device_limit_prefilter is True
+    assert loaded.prefilter_device_limit_factor == pytest.approx(2.0)
+
+    # 2. AC 设备状态限值预过滤：节点电压 [0.9, 1.1] pu -> k=2.0 允许 [0.7, 1.3]；
+    #    支路功率 [-50, 50] MW -> 允许 [-150, 150]；发电机有功 [0, 60] MW -> 允许 [-60, 120]；
+    #    断路器电流 [0, 1.0] kA -> 允许 [0, 2.0] kA。
+    ac_e = tmp_path / "ac_dev_lim.e"
+    ac_e.write_text(
+        "\n".join(
+            [
+                "<Model>",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100.0 kV MW kA",
+                "</Model>",
+                "<ACNode>",
+                "@ idx name vbase voltage angle isl run_stat v_min v_max",
+                "# 1 b1 110.0 110.0 0.0 1 1 99.0 121.0",
+                "# 2 b2 110.0 109.5 -0.6 1 1 99.0 121.0",
+                "# 3 b3 110.0 109.5 -0.6 1 1 99.0 121.0",
+                "</ACNode>",
+                "<ACBranch>",
+                "@ idx name i_node j_node r x b run_stat p_min p_max q_min q_max",
+                "# 1 br_1_2 1 2 0.005 0.030 0.002 1 -50.0 50.0 -30.0 30.0",
+                "</ACBranch>",
+                "<ACBreak>",
+                "@ idx name i_node j_node status run_stat i_max",
+                "# 1 bk_2_3 2 3 1 1 1.0",
+                "</ACBreak>",
+                "<ACGenerator>",
+                "@ idx name node control_type p_set q_set v_set alpha run_stat p_min p_max q_min q_max",
+                "# 1 g1 1 SLACK 0.0 0.0 110.0 1.0 1 0.0 60.0 -40.0 40.0",
+                "</ACGenerator>",
+                "<ACLoad>",
+                "@ idx name node pbase pv0 pv1 pv2 qbase qv0 qv1 qv2 run_stat",
+                "# 1 ld_3 3 25.0 1.0 0.0 0.0 8.0 1.0 0.0 0.0 1",
+                "</ACLoad>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ppc_ac = build_ac_ppc_from_e_file(ac_e)
+    lf_ac = ACPowerFlowCalc(ppc_ac, parameters=LF_PARAMS, keep_node_objects=False, verbose=False)
+    lf_ac.prepare()
+    assert lf_ac.run(result_mode="array") == 0
+    bus_r, br_r = lf_ac.result["bus"], lf_ac.result["branch"]
+    ac_m = tmp_path / "ac_dev_lim.meas"
+    ac_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value status",
+                f"# 1 m1 ACNode b1 V 100.0 1 {float(bus_r[0, 2] * 110.0):.6f} 0",
+                f"# 2 m2 ACNode b2 V 100.0 1 {float(bus_r[1, 2] * 110.0):.6f} 0",
+                f"# 3 m3 ACNode b3 V 100.0 1 {float(bus_r[2, 2] * 110.0):.6f} 0",
+                f"# 4 m4 ACBranch br_1_2 P_FROM 50.0 1 {float(br_r[0, 7] * 100.0):.6f} 0",
+                f"# 5 m5 ACBranch br_1_2 Q_FROM 50.0 1 {float(br_r[0, 8] * 100.0):.6f} 0",
+                f"# 6 m6 ACBranch br_1_2 P_TO 50.0 1 {float(br_r[0, 10] * 100.0):.6f} 0",
+                f"# 7 m7 ACBranch br_1_2 Q_TO 50.0 1 {float(br_r[0, 11] * 100.0):.6f} 0",
+                # 在全局 [0.1, 1.9] pu 内，但超过设备电压 [0.9, 1.1] pu 的 2.0 系数允许区间 [0.7, 1.3] pu
+                "# 8 m_v_over ACNode b2 V 100.0 1 165.0 0",
+                # 端口电压回退节点电压限值：1.5 pu > 1.3 pu
+                "# 9 m_vfrom_over ACBranch br_1_2 V_FROM 100.0 1 165.0 0",
+                # 超过支路 [-50, 50] MW 的 2.0 系数区间 [-150, 150] MW（但在全局 ±1e4 pu 内）
+                "# 10 m_p_over ACBranch br_1_2 P_FROM 50.0 1 220.0 0",
+                # 超过发电机 [0, 60] MW 的 2.0 系数区间 [-60, 120] MW
+                "# 11 m_pg_over ACGenerator g1 P_GEN 50.0 1 180.0 0",
+                # 超过断路器 i_max=1.0 kA 的 2.0 系数上限 2.0 kA
+                "# 12 m_i_over ACBreak bk_2_3 I_FROM 50.0 1 3.5 0",
+                # 轻度越限（1.2 pu 在 [0.7, 1.3] 内）不应被设备越限预过滤误删
+                "# 13 m_v_mild ACNode b3 V 1.0 1 132.0 0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    est_ac = ACStateEstimator(ac_e, ac_m, parameters=loaded, flat_start=True)
+    se_ac = est_ac.run(result_mode="full", skip_bad_data=True, verbose=False)
+    assert est_ac.converged is True
+    active_ac = set(int(x) for x in est_ac.estimate_result.measurement_table.idx.tolist())
+    pref_ac = {int(r.idx): str(r.reason) for r in se_ac.prefiltered_measurements.rows}
+    for over_id in (8, 9, 10, 11, 12):
+        assert over_id not in active_ac
+        assert pref_ac[over_id] == REASON_DEVICE_LIMIT_EXCEEDED
+    assert 13 in active_ac
+
+    # 关闭 enable_device_limit_prefilter 后，上述点不再被设备越限预过滤
+    est_ac_off = ACStateEstimator(
+        ac_e,
+        ac_m,
+        parameters=loaded.with_overrides(enable_device_limit_prefilter=False),
+        flat_start=True,
+    )
+    se_ac_off = est_ac_off.run(result_mode="full", skip_bad_data=True, verbose=False)
+    pref_ac_off = {int(r.idx): str(r.reason) for r in se_ac_off.prefiltered_measurements.rows}
+    for over_id in (8, 9, 10, 11, 12):
+        assert pref_ac_off.get(over_id) != REASON_DEVICE_LIMIT_EXCEEDED
+
+    # 3. DC + Hybrid（DCNode/DCBranch/DCACConverter）设备限值预过滤
+    hyb_e = tmp_path / "hyb_dev_lim.e"
+    hyb_e.write_text(
+        "\n".join(
+            [
+                "<Model>",
+                "@ p_base u_unit p_unit i_unit",
+                "# 100.0 kV MW kA",
+                "</Model>",
+                "<ACNode>",
+                "@ idx name vbase voltage angle isl run_stat v_min v_max",
+                "# 1 ab1 110.0 110.0 0.0 1 1 99.0 121.0",
+                "# 2 ab2 110.0 109.5 -0.4 1 1 99.0 121.0",
+                "</ACNode>",
+                "<ACBranch>",
+                "@ idx name i_node j_node r x b run_stat",
+                "# 1 abr_1 1 2 0.005 0.030 0.002 1",
+                "</ACBranch>",
+                "<ACGenerator>",
+                "@ idx name node control_type p_set q_set v_set alpha run_stat",
+                "# 1 ag1 1 SLACK 0.0 0.0 110.0 1.0 1",
+                "</ACGenerator>",
+                "<DCNode>",
+                "@ idx name vbase voltage isl run_stat v_min v_max",
+                "# 1 db1 100.0 100.0 1 1 90.0 110.0",
+                "# 2 db2 100.0 99.5 1 1 90.0 110.0",
+                "</DCNode>",
+                "<DCBranch>",
+                "@ idx name i_node j_node r run_stat p_max i_max",
+                "# 1 dbr_1 1 2 0.015 1 40.0 0.5",
+                "</DCBranch>",
+                "<DCGenerator>",
+                "@ idx name node control_type p_set v_set run_stat",
+                "# 1 dg1 1 V 0.0 100.0 1",
+                "</DCGenerator>",
+                "<DCLoad>",
+                "@ idx name node pbase pv0 pv1 pv2 run_stat",
+                "# 1 dld1 2 10.0 1.0 0.0 0.0 1",
+                "</DCLoad>",
+                "<DCACConverter>",
+                "@ idx name ac_node dc_node r1 r2 ac_control_type dc_control_type p_ac_set p_dc_set q_ac_set v_ac_set v_dc_set run_stat p_ac_min p_ac_max",
+                "# 1 dcac_1 2 2 0.005 0.005 PQ NONE 5.0 0.0 1.0 0.0 0.0 1 -30.0 30.0",
+                "</DCACConverter>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    hcalc = HybridPowerFlowCalc.from_file_fast(hyb_e, parameters=LF_PARAMS, verbose=False)
+    hcalc.prepare()
+    assert hcalc.run(result_mode="array") == 0
+    ab, abr = hcalc.ac_calc.result["bus"], hcalc.ac_calc.result["branch"]
+    db, dbr = hcalc.dc_calc.result["bus"], hcalc.dc_calc.result["branch"]
+    conv0 = hcalc.network.dcac_converters[0]
+    hyb_m = tmp_path / "hyb_dev_lim.meas"
+    hyb_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value status",
+                f"# 1 m1 ACNode ab1 V 100.0 1 {float(ab[0, 2] * 110.0):.6f} 0",
+                f"# 2 m2 ACNode ab2 V 100.0 1 {float(ab[1, 2] * 110.0):.6f} 0",
+                f"# 3 m3 ACBranch abr_1 P_FROM 50.0 1 {float(abr[0, 7] * 100.0):.6f} 0",
+                f"# 4 m4 ACBranch abr_1 Q_FROM 50.0 1 {float(abr[0, 8] * 100.0):.6f} 0",
+                f"# 5 m5 DCNode db1 V 100.0 1 {float(db[0, 2] * 100.0):.6f} 0",
+                f"# 6 m6 DCNode db2 V 100.0 1 {float(db[1, 2] * 100.0):.6f} 0",
+                f"# 7 m7 DCBranch dbr_1 P_FROM 50.0 1 {float(dbr[0, 5] * 100.0):.6f} 0",
+                f"# 8 m8 DCACConverter dcac_1 P_AC 50.0 1 {float(conv0.ac_p * 100.0):.6f} 0",
+                f"# 9 m9 DCACConverter dcac_1 Q_AC 50.0 1 {float(conv0.ac_q * 100.0):.6f} 0",
+                # DC 电压越限（[0.9, 1.1] pu -> 允许 [0.7, 1.3]，报 1.55 pu）
+                "# 10 m_dv_over DCNode db2 V 100.0 1 155.0 0",
+                # DC 支路单侧额定功率 p_max=40 MW（双向对称允许 [-80, 80]），报 -120 MW
+                "# 11 m_dp_over DCBranch dbr_1 P_FROM 50.0 1 -120.0 0",
+                # DC 支路单侧载流量 i_max=0.5 kA（双向允许 [-1.0, 1.0] kA），报 1.8 kA
+                "# 12 m_di_over DCBranch dbr_1 I_FROM 50.0 1 1.8 0",
+                # DCACConverter p_ac 限值 [-30, 30] MW -> 允许 [-90, 90] MW，报 150 MW
+                "# 13 m_dcac_p_over DCACConverter dcac_1 P_AC 50.0 1 150.0 0",
+                # DCACConverter V_DC 回退 DCNode [90, 110] kV -> 允许 [70, 130] kV，报 160 kV
+                "# 14 m_dcac_vdc_over DCACConverter dcac_1 V_DC 100.0 1 160.0 0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    est_hyb = HybridStateEstimator(hyb_e, hyb_m, parameters=loaded, flat_start=True)
+    se_hyb = est_hyb.run(result_mode="full", skip_bad_data=True, verbose=False)
+    assert est_hyb.converged is True
+    active_hyb = set(int(x) for x in est_hyb.estimate_result.measurement_table.idx.tolist())
+    pref_hyb = {int(r.idx): str(r.reason) for r in se_hyb.prefiltered_measurements.rows}
+    for over_id in (10, 11, 12, 13, 14):
+        assert over_id not in active_hyb
+        assert pref_hyb[over_id] == REASON_DEVICE_LIMIT_EXCEEDED
+
+    # 4. 流体热网与蒸汽网：压力 / 温度 / 流量 / 比焓 设备限值超倍预过滤
+    heat_e = tmp_path / "heat_dev_lim.e"
+    heat_e.write_text(
+        "\n".join(
+            [
+                "<HeatMedium>",
+                "@ density heat_capacity ambient_temperature",
+                "# 998.0 4.186 20.0",
+                "</HeatMedium>",
+                "<HeatNode>",
+                "@ idx name pressure supply_temperature return_temperature run_stat pressure_min pressure_max supply_temperature_min supply_temperature_max",
+                "# 1 hn_1 5.0 90.0 60.0 1 4.0 6.0 75.0 95.0",
+                "# 2 hn_2 4.9 89.0 60.5 1 4.0 6.0 75.0 95.0",
+                "</HeatNode>",
+                "<HeatSource>",
+                "@ idx name node control_type pressure_set flow_set supply_temperature_set return_temperature_set alpha flow_min flow_max run_stat",
+                "# 1 hs_1 1 PRESSURE 5.0 0.0 90.0 60.0 1.0 0.0 2.0 1",
+                "</HeatSource>",
+                "<HeatLoad>",
+                "@ idx name node flow_set return_temperature_set run_stat",
+                "# 1 hl_2 2 0.3 60.5 1",
+                "</HeatLoad>",
+                "<HeatPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat flow_min flow_max",
+                "# 1 hp_1_2 1 2 4.0 1e-4 1 -1.0 1.0",
+                "</HeatPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    heat_m = tmp_path / "heat_dev_lim.meas"
+    heat_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value status",
+                "# 1 m1 HeatNode hn_1 PRESSURE 100.0 1 5.0 0",
+                "# 2 m2 HeatNode hn_2 PRESSURE 100.0 1 4.9 0",
+                "# 3 m3 HeatNode hn_1 T_SUPPLY 25.0 1 90.0 0",
+                "# 4 m4 HeatNode hn_2 T_SUPPLY 25.0 1 89.0 0",
+                "# 5 m5 HeatNode hn_1 T_RETURN 25.0 1 60.0 0",
+                "# 6 m6 HeatNode hn_2 T_RETURN 25.0 1 60.5 0",
+                "# 7 m7 HeatPipe hp_1_2 FLOW_FROM 50.0 1 0.3 0",
+                # 压力 [4, 6] -> 允许 [2, 8]，报 15.0（仍在全局 [0, 1e4] 内）
+                "# 8 m_p_over HeatNode hn_2 PRESSURE 100.0 1 15.0 0",
+                # 供温 [75, 95] -> 允许 [55, 115]，报 180.0（仍在全局 [-50, 1000] 内）
+                "# 9 m_t_over HeatNode hn_2 T_SUPPLY 25.0 1 180.0 0",
+                # 管道流量 [-1, 1] -> 允许 [-3, 3]，报 8.0（仍在全局 ±1e6 内）
+                "# 10 m_f_over HeatPipe hp_1_2 FLOW_FROM 50.0 1 8.0 0",
+                # 热源流量 [0, 2] -> 允许 [-2, 4]，报 9.0
+                "# 11 m_sf_over HeatSource hs_1 FLOW 50.0 1 9.0 0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    est_heat = HeatStateEstimator(load_heat_network_from_e_file(str(heat_e)), str(heat_m), parameters=loaded, flat_start=True)
+    assert est_heat.run() == 0
+    assert est_heat.result is not None and est_heat.result.converged
+    active_heat = {int(m.idx) for m in est_heat.active_measurements}
+    pref_heat = {int(m.idx): str(reason) for m, reason in est_heat.prefiltered_measurements}
+    for over_id in (8, 9, 10, 11):
+        assert over_id not in active_heat
+        assert pref_heat[over_id] == REASON_DEVICE_LIMIT_EXCEEDED
+
+    # 蒸汽比焓设备限值
+    steam_e = tmp_path / "steam_dev_lim.e"
+    steam_e.write_text(
+        "\n".join(
+            [
+                "<SteamMedium>",
+                "@ heat_capacity ambient_enthalpy feedwater_enthalpy reference_enthalpy reference_temperature",
+                "# 2.1 2500.0 419.0 2800.0 200.0",
+                "</SteamMedium>",
+                "<SteamNode>",
+                "@ idx name pressure enthalpy run_stat enthalpy_min enthalpy_max",
+                "# 1 sn_1 10.0 3000.0 1 2800.0 3200.0",
+                "# 2 sn_2 9.8 2985.0 1 2800.0 3200.0",
+                "</SteamNode>",
+                "<SteamSource>",
+                "@ idx name node control_type pressure_set flow_set enthalpy_set alpha flow_min flow_max run_stat",
+                "# 1 ss_1 1 PRESSURE 10.0 0.0 3000.0 1.0 0.0 50.0 1",
+                "</SteamSource>",
+                "<SteamLoad>",
+                "@ idx name node flow_set condensate_enthalpy run_stat",
+                "# 1 sl_2 2 0.25 419.0 1",
+                "</SteamLoad>",
+                "<SteamPipe>",
+                "@ idx name i_node j_node conductance heat_loss run_stat",
+                "# 1 sp_1_2 1 2 1.2 2e-5 1",
+                "</SteamPipe>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    steam_m = tmp_path / "steam_dev_lim.meas"
+    steam_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value status",
+                "# 1 m1 SteamNode sn_1 PRESSURE 400.0 1 10.0 0",
+                "# 2 m2 SteamNode sn_2 PRESSURE 400.0 1 9.8 0",
+                "# 3 m3 SteamNode sn_1 ENTHALPY 4.0 1 3000.0 0",
+                "# 4 m4 SteamNode sn_2 ENTHALPY 4.0 1 2985.0 0",
+                "# 5 m5 SteamPipe sp_1_2 FLOW_FROM 100.0 1 0.25 0",
+                # 比焓 [2800, 3200] -> 允许 [2400, 3600]，报 4500（仍在全局 [0, 6000] 内）
+                "# 6 m_h_over SteamNode sn_2 ENTHALPY 4.0 1 4500.0 0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    est_steam = SteamStateEstimator(load_steam_network_from_e_file(str(steam_e)), str(steam_m), parameters=loaded, flat_start=True)
+    assert est_steam.run() == 0
+    assert est_steam.result is not None and est_steam.result.converged
+    active_steam = {int(m.idx) for m in est_steam.active_measurements}
+    pref_steam = {int(m.idx): str(reason) for m, reason in est_steam.prefiltered_measurements}
+    assert 6 not in active_steam
+    assert pref_steam[6] == REASON_DEVICE_LIMIT_EXCEEDED
+
+
+def test_hybrid_dirty_warm_start_and_lower_csc_fallback_regression(tmp_path: Path):
+    """验证交直流混合网畸变热启动不再抛 UnboundLocalError，且无 CHOLMOD 时下三角稀疏正规矩阵对称补全精确求解。"""
+    from scipy.sparse import tril as sp_tril
+    from secore.se_math import LowerNormalEquationCscPlan, NormalEquationSolver
+
+    # 1. 验证下三角 CSC 矩阵在无 CHOLMOD / scipy 偏好下与稠密对称正定求解机器精度一致
+    rng = np.random.default_rng(20261128)
+    H_dense = rng.normal(size=(40, 12))
+    from scipy.sparse import csc_matrix
+
+    H_sp = csc_matrix(H_dense)
+    w = np.linspace(1.0, 100.0, 40)
+    r = rng.normal(size=40)
+    plan = LowerNormalEquationCscPlan.from_jacobian(H_sp)
+    gain_lower, rhs = plan.assemble(H_sp, r, w, dense_gain_limit=0)
+    gain_full = (H_dense.T * w) @ H_dense
+    dx_ref = np.linalg.solve(gain_full, rhs)
+    solver = NormalEquationSolver()
+    solver._cholmod_disabled = True
+    dx_sp, _ = solver.solve(gain_lower, rhs, return_factor_diag=False)
+    assert np.allclose(dx_sp, dx_ref, rtol=1e-10, atol=1e-10)
+    dx_damp_ref = np.linalg.solve(gain_full + 0.5 * np.eye(12), rhs)
+    dx_damp_sp, _ = solver.solve(sp_tril(csc_matrix(gain_full), format="csc"), rhs, return_factor_diag=False, damping=0.5)
+    assert np.allclose(dx_damp_sp, dx_damp_ref, rtol=1e-10, atol=1e-10)
+
+    # 2. 验证 HybridStateEstimator 在 flat_start=False 且初值电压/相角严重偏离时正常回退平启动并快速收敛
+    ef, mf = _generate_hybrid_case(8, 6, tmp_path, inject_bad=False)
+    lines = ef.read_text(encoding="utf-8").splitlines()
+    dirty_lines = []
+    in_ac_node = False
+    perturbed = False
+    for ln in lines:
+        s = ln.strip()
+        if s == "<ACNode>":
+            in_ac_node = True
+            dirty_lines.append(ln)
+            continue
+        if s == "</ACNode>":
+            in_ac_node = False
+            dirty_lines.append(ln)
+            continue
+        if in_ac_node and s.startswith("#") and not perturbed:
+            parts = ln.split()
+            # idx name vbase voltage angle ... -> 注入 1.32 pu 畸变热启动初值触发 severe_hyb_warm
+            vbase = float(parts[3])
+            parts[4] = f"{vbase * 1.32:.4f}"
+            parts[5] = "28.0"
+            dirty_lines.append(" ".join(parts))
+            perturbed = True
+        else:
+            dirty_lines.append(ln)
+    ef.write_text("\n".join(dirty_lines) + "\n", encoding="utf-8")
+    est = HybridStateEstimator(e_file=ef, meas_file=mf, parameters=SE_PARAMS, flat_start=False)
+    res = est.estimate(verbose=False)
+    assert res.converged
+    assert res.iterations <= 20
+
+
+
 
 
 

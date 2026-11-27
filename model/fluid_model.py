@@ -57,6 +57,14 @@ def _model_rows(model, *table_names: str):
         yield from getattr(model, table_name, ()) or ()
 
 
+def _optional_float_alias(row, *names: str, default: float = np.nan) -> float:
+    for name in names:
+        value = getattr(row, name, None)
+        if value not in (None, "", "-"):
+            return float(value)
+    return float(default)
+
+
 def _text(row, name: str, default: str = "") -> str:
     value = getattr(row, name, default)
     return str(default if value in (None, "") else value)
@@ -137,6 +145,16 @@ class FluidNode:
     enthalpy: float = 2800.0
     temperature: float = 100.0
     run_stat: int = 1
+    pressure_min: float = np.nan
+    pressure_max: float = np.nan
+    temperature_min: float = np.nan
+    temperature_max: float = np.nan
+    supply_temperature_min: float = np.nan
+    supply_temperature_max: float = np.nan
+    return_temperature_min: float = np.nan
+    return_temperature_max: float = np.nan
+    enthalpy_min: float = np.nan
+    enthalpy_max: float = np.nan
 
 
 @dataclass(slots=True)
@@ -157,6 +175,18 @@ class FluidSource:
     run_stat: int = 1
     supply_node: Optional[int] = None
     return_node: Optional[int] = None
+    pressure_min: float = np.nan
+    pressure_max: float = np.nan
+    temperature_min: float = np.nan
+    temperature_max: float = np.nan
+    supply_temperature_min: float = np.nan
+    supply_temperature_max: float = np.nan
+    return_temperature_min: float = np.nan
+    return_temperature_max: float = np.nan
+    enthalpy_min: float = np.nan
+    enthalpy_max: float = np.nan
+    heat_min: float = np.nan
+    heat_max: float = np.nan
 
     def __post_init__(self) -> None:
         if self.supply_temperature_set is None:
@@ -187,6 +217,20 @@ class FluidLoad:
     run_stat: int = 1
     supply_node: Optional[int] = None
     return_node: Optional[int] = None
+    flow_min: float = np.nan
+    flow_max: float = np.nan
+    pressure_min: float = np.nan
+    pressure_max: float = np.nan
+    temperature_min: float = np.nan
+    temperature_max: float = np.nan
+    supply_temperature_min: float = np.nan
+    supply_temperature_max: float = np.nan
+    return_temperature_min: float = np.nan
+    return_temperature_max: float = np.nan
+    enthalpy_min: float = np.nan
+    enthalpy_max: float = np.nan
+    heat_min: float = np.nan
+    heat_max: float = np.nan
 
 
 @dataclass(slots=True)
@@ -203,6 +247,16 @@ class FluidEdge:
     pressure_gain: float = 0.0
     heat_loss: float = 0.0
     run_stat: int = 1
+    flow_min: float = np.nan
+    flow_max: float = np.nan
+    pressure_min: float = np.nan
+    pressure_max: float = np.nan
+    temperature_min: float = np.nan
+    temperature_max: float = np.nan
+    enthalpy_min: float = np.nan
+    enthalpy_max: float = np.nan
+    heat_min: float = np.nan
+    heat_max: float = np.nan
 
 
 @dataclass(slots=True)
@@ -222,6 +276,12 @@ class HeatExchanger:
     primary_return_node: Optional[int] = None
     secondary_return_node: Optional[int] = None
     secondary_supply_node: Optional[int] = None
+    flow_min: float = np.nan
+    flow_max: float = np.nan
+    heat_min: float = np.nan
+    heat_max: float = np.nan
+    temperature_min: float = np.nan
+    temperature_max: float = np.nan
 
 
 @dataclass
@@ -1127,7 +1187,75 @@ class FluidNetwork:
             self.balance_node_pos = self.free_node_pos.copy()
             self.balance_row_by_node = self.free_state_by_node.copy()
         self.prepared = True
+        self._build_device_limit_arrays()
         return self
+
+    def _build_device_limit_arrays(self) -> None:
+        """汇总活网各流体设备的状态限值向量，供状态估计量测预过滤零拷贝向量化查询。"""
+        def _collect(items, field_names) -> Dict[str, np.ndarray]:
+            out: Dict[str, np.ndarray] = {}
+            if not items:
+                return out
+            for fname in field_names:
+                arr = np.asarray([float(getattr(it, fname, np.nan)) for it in items], dtype=np.float64)
+                if np.any(np.isfinite(arr)):
+                    out[fname] = arr
+            return out
+
+        self.device_limits: Dict[str, Dict[str, np.ndarray]] = {
+            "node": _collect(
+                self.nodes,
+                (
+                    "pressure_min", "pressure_max",
+                    "temperature_min", "temperature_max",
+                    "supply_temperature_min", "supply_temperature_max",
+                    "return_temperature_min", "return_temperature_max",
+                    "enthalpy_min", "enthalpy_max",
+                ),
+            ),
+            "source": _collect(
+                self.sources,
+                (
+                    "flow_min", "flow_max",
+                    "pressure_min", "pressure_max",
+                    "temperature_min", "temperature_max",
+                    "supply_temperature_min", "supply_temperature_max",
+                    "return_temperature_min", "return_temperature_max",
+                    "enthalpy_min", "enthalpy_max",
+                    "heat_min", "heat_max",
+                ),
+            ),
+            "load": _collect(
+                self.loads,
+                (
+                    "flow_min", "flow_max",
+                    "pressure_min", "pressure_max",
+                    "temperature_min", "temperature_max",
+                    "supply_temperature_min", "supply_temperature_max",
+                    "return_temperature_min", "return_temperature_max",
+                    "enthalpy_min", "enthalpy_max",
+                    "heat_min", "heat_max",
+                ),
+            ),
+            "edge": _collect(
+                self.edges,
+                (
+                    "flow_min", "flow_max",
+                    "pressure_min", "pressure_max",
+                    "temperature_min", "temperature_max",
+                    "enthalpy_min", "enthalpy_max",
+                    "heat_min", "heat_max",
+                ),
+            ),
+            "exchanger": _collect(
+                self.heat_exchangers,
+                (
+                    "flow_min", "flow_max",
+                    "heat_min", "heat_max",
+                    "temperature_min", "temperature_max",
+                ),
+            ),
+        }
 
     def initial_potential(self) -> np.ndarray:
         pressure = np.maximum(self.node_pressure, 1e-6)
@@ -1175,6 +1303,16 @@ def _parse_nodes(model, prefix: str, thermal: bool) -> List[FluidNode]:
                 enthalpy=_float(row, "enthalpy", 2800.0),
                 temperature=_float(row, "temperature", 100.0),
                 run_stat=_int(row, "run_stat", 1),
+                pressure_min=_optional_float_alias(row, "pressure_min", "p_min"),
+                pressure_max=_optional_float_alias(row, "pressure_max", "p_max"),
+                temperature_min=_optional_float_alias(row, "temperature_min", "temp_min", "t_min"),
+                temperature_max=_optional_float_alias(row, "temperature_max", "temp_max", "t_max"),
+                supply_temperature_min=_optional_float_alias(row, "supply_temperature_min", "ts_min", "t_supply_min"),
+                supply_temperature_max=_optional_float_alias(row, "supply_temperature_max", "ts_max", "t_supply_max"),
+                return_temperature_min=_optional_float_alias(row, "return_temperature_min", "tr_min", "t_return_min"),
+                return_temperature_max=_optional_float_alias(row, "return_temperature_max", "tr_max", "t_return_max"),
+                enthalpy_min=_optional_float_alias(row, "enthalpy_min", "h_min"),
+                enthalpy_max=_optional_float_alias(row, "enthalpy_max", "h_max"),
             )
         )
     return nodes
@@ -1219,6 +1357,18 @@ def _parse_sources(model, prefix: str, thermal: bool) -> List[FluidSource]:
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int_alias(row, "supply_node", "i_node"),
                 return_node=_optional_int_alias(row, "return_node", "j_node"),
+                pressure_min=_optional_float_alias(row, "pressure_min", "p_min"),
+                pressure_max=_optional_float_alias(row, "pressure_max", "p_max"),
+                temperature_min=_optional_float_alias(row, "temperature_min", "temp_min", "t_min"),
+                temperature_max=_optional_float_alias(row, "temperature_max", "temp_max", "t_max"),
+                supply_temperature_min=_optional_float_alias(row, "supply_temperature_min", "ts_min", "t_supply_min"),
+                supply_temperature_max=_optional_float_alias(row, "supply_temperature_max", "ts_max", "t_supply_max"),
+                return_temperature_min=_optional_float_alias(row, "return_temperature_min", "tr_min", "t_return_min"),
+                return_temperature_max=_optional_float_alias(row, "return_temperature_max", "tr_max", "t_return_max"),
+                enthalpy_min=_optional_float_alias(row, "enthalpy_min", "h_min"),
+                enthalpy_max=_optional_float_alias(row, "enthalpy_max", "h_max"),
+                heat_min=_optional_float_alias(row, "heat_min", "heat_power_min"),
+                heat_max=_optional_float_alias(row, "heat_max", "heat_power_max"),
             )
         )
     return sources
@@ -1286,6 +1436,18 @@ def _parse_storages(model, prefix: str, thermal: bool) -> List[FluidStorage]:
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int(row, "supply_node"),
                 return_node=_optional_int(row, "return_node"),
+                pressure_min=_optional_float_alias(row, "pressure_min", "p_min"),
+                pressure_max=_optional_float_alias(row, "pressure_max", "p_max"),
+                temperature_min=_optional_float_alias(row, "temperature_min", "temp_min", "t_min"),
+                temperature_max=_optional_float_alias(row, "temperature_max", "temp_max", "t_max"),
+                supply_temperature_min=_optional_float_alias(row, "supply_temperature_min", "ts_min", "t_supply_min"),
+                supply_temperature_max=_optional_float_alias(row, "supply_temperature_max", "ts_max", "t_supply_max"),
+                return_temperature_min=_optional_float_alias(row, "return_temperature_min", "tr_min", "t_return_min"),
+                return_temperature_max=_optional_float_alias(row, "return_temperature_max", "tr_max", "t_return_max"),
+                enthalpy_min=_optional_float_alias(row, "enthalpy_min", "h_min"),
+                enthalpy_max=_optional_float_alias(row, "enthalpy_max", "h_max"),
+                heat_min=_optional_float_alias(row, "heat_min", "heat_power_min"),
+                heat_max=_optional_float_alias(row, "heat_max", "heat_power_max"),
             )
         )
     return storages
@@ -1308,6 +1470,20 @@ def _parse_loads(model, prefix: str) -> List[FluidLoad]:
                 run_stat=_int(row, "run_stat", 1),
                 supply_node=_optional_int_alias(row, "supply_node", "i_node"),
                 return_node=_optional_int_alias(row, "return_node", "j_node"),
+                flow_min=_optional_float_alias(row, "flow_min"),
+                flow_max=_optional_float_alias(row, "flow_max"),
+                pressure_min=_optional_float_alias(row, "pressure_min", "p_min"),
+                pressure_max=_optional_float_alias(row, "pressure_max", "p_max"),
+                temperature_min=_optional_float_alias(row, "temperature_min", "temp_min", "t_min"),
+                temperature_max=_optional_float_alias(row, "temperature_max", "temp_max", "t_max"),
+                supply_temperature_min=_optional_float_alias(row, "supply_temperature_min", "ts_min", "t_supply_min"),
+                supply_temperature_max=_optional_float_alias(row, "supply_temperature_max", "ts_max", "t_supply_max"),
+                return_temperature_min=_optional_float_alias(row, "return_temperature_min", "tr_min", "t_return_min"),
+                return_temperature_max=_optional_float_alias(row, "return_temperature_max", "tr_max", "t_return_max"),
+                enthalpy_min=_optional_float_alias(row, "enthalpy_min", "h_min"),
+                enthalpy_max=_optional_float_alias(row, "enthalpy_max", "h_max"),
+                heat_min=_optional_float_alias(row, "heat_min", "heat_power_min"),
+                heat_max=_optional_float_alias(row, "heat_max", "heat_power_max"),
             )
         )
     return loads
@@ -1330,6 +1506,16 @@ def _parse_edges(model, prefix: str, block_suffix: str, kind: str, default_contr
                 pressure_gain=_float(row, "pressure_gain", _float(row, "gain", 0.0)),
                 heat_loss=_float(row, "heat_loss", 0.0),
                 run_stat=_int(row, "run_stat", 1),
+                flow_min=_optional_float_alias(row, "flow_min"),
+                flow_max=_optional_float_alias(row, "flow_max"),
+                pressure_min=_optional_float_alias(row, "pressure_min", "p_min"),
+                pressure_max=_optional_float_alias(row, "pressure_max", "p_max"),
+                temperature_min=_optional_float_alias(row, "temperature_min", "temp_min", "t_min"),
+                temperature_max=_optional_float_alias(row, "temperature_max", "temp_max", "t_max"),
+                enthalpy_min=_optional_float_alias(row, "enthalpy_min", "h_min"),
+                enthalpy_max=_optional_float_alias(row, "enthalpy_max", "h_max"),
+                heat_min=_optional_float_alias(row, "heat_min", "heat_power_min"),
+                heat_max=_optional_float_alias(row, "heat_max", "heat_power_max"),
             )
         )
     return edges
@@ -1355,6 +1541,12 @@ def _parse_heat_exchangers(model) -> List[HeatExchanger]:
                 primary_return_node=_optional_int(row, "primary_return_node"),
                 secondary_return_node=_optional_int(row, "secondary_return_node"),
                 secondary_supply_node=_optional_int(row, "secondary_supply_node"),
+                flow_min=_optional_float_alias(row, "flow_min"),
+                flow_max=_optional_float_alias(row, "flow_max"),
+                heat_min=_optional_float_alias(row, "heat_min", "heat_power_min"),
+                heat_max=_optional_float_alias(row, "heat_max", "heat_power_max"),
+                temperature_min=_optional_float_alias(row, "temperature_min", "temp_min", "t_min"),
+                temperature_max=_optional_float_alias(row, "temperature_max", "temp_max", "t_max"),
             )
         )
     return exchangers

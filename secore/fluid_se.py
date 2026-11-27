@@ -333,8 +333,22 @@ class FluidStateEstimator:
                             if dset and dev_names_list[int(dn_id[r])] in dset:
                                 is_dead_or_inactive[r] = True
 
-            from secore.meas_prefilter import evaluate_fluid_measurement_prefilter
+            from secore.meas_prefilter import (
+                build_fluid_device_limits_lookup,
+                evaluate_fluid_measurement_prefilter,
+            )
 
+            fluid_device_limits = build_fluid_device_limits_lookup(
+                net,
+                node_dt=node_dt,
+                pipe_dt=pipe_dt,
+                valve_dt=valve_dt,
+                ctrl_dt=ctrl_dt,
+                src_dt=src_dt,
+                sto_dt=sto_dt,
+                load_dt=load_dt,
+                exch_dt=exch_dt,
+            )
             pf_keep, pf_reasons = evaluate_fluid_measurement_prefilter(
                 values=raw_value,
                 weights=raw_weight,
@@ -343,6 +357,9 @@ class FluidStateEstimator:
                 meas_type_code=mt_code,
                 params=self.params,
                 is_dead_or_inactive=is_dead_or_inactive,
+                device_type_code=dt_code,
+                device_pos=device_pos,
+                device_limits_lookup=fluid_device_limits,
             )
             active_mask = dt_ok & (device_pos >= 0) & mt_ok & pf_keep
 
@@ -401,8 +418,23 @@ class FluidStateEstimator:
             self._rebuild_measurement_groups()
             return
 
-        from secore.meas_prefilter import check_single_fluid_measurement_prefilter
+        from secore.meas_prefilter import (
+            build_fluid_device_limits_lookup,
+            check_single_fluid_measurement_prefilter,
+        )
 
+        ctrl_type = f"{prefix}Pump" if net.thermal else (f"{prefix}PressureReducer" if net.steam else f"{prefix}Compressor")
+        fluid_device_limits = build_fluid_device_limits_lookup(
+            net,
+            node_dt=int(DEVICE_TYPE_CODES.get(f"{prefix}Node", -1)),
+            pipe_dt=int(DEVICE_TYPE_CODES.get(f"{prefix}Pipe", -1)),
+            valve_dt=int(DEVICE_TYPE_CODES.get(f"{prefix}Valve", -1)),
+            ctrl_dt=int(DEVICE_TYPE_CODES.get(ctrl_type, -1)),
+            src_dt=int(DEVICE_TYPE_CODES.get(f"{prefix}Source", -1)),
+            sto_dt=int(DEVICE_TYPE_CODES.get(f"{prefix}Storage", -1)),
+            load_dt=int(DEVICE_TYPE_CODES.get(f"{prefix}Load", -1)),
+            exch_dt=int(DEVICE_TYPE_CODES.get("HeatExchanger", -1)) if net.thermal else -1,
+        )
         inactive_by_type = getattr(net, "inactive_device_names_by_type", None) or {}
         active = []
         prefiltered = []
@@ -437,6 +469,16 @@ class FluidStateEstimator:
             elif measurement.meas_type not in SUPPORTED_MEASUREMENT_TYPES:
                 reason = "unsupported measurement type"
             else:
+                dev_lo = None
+                dev_hi = None
+                sym_upper = False
+                lim_entry = fluid_device_limits.get((measurement.device_type_code, measurement.meas_type_code))
+                if lim_entry is not None and measurement.device_pos >= 0:
+                    lo_vec, hi_vec, sym_upper = lim_entry
+                    if lo_vec is not None and measurement.device_pos < int(np.asarray(lo_vec).size):
+                        dev_lo = float(lo_vec[measurement.device_pos])
+                    if hi_vec is not None and measurement.device_pos < int(np.asarray(hi_vec).size):
+                        dev_hi = float(hi_vec[measurement.device_pos])
                 reason = check_single_fluid_measurement_prefilter(
                     value=float(measurement.value),
                     weight=float(measurement.weight),
@@ -445,6 +487,9 @@ class FluidStateEstimator:
                     meas_type=measurement.meas_type,
                     params=self.params,
                     is_dead_or_inactive=False,
+                    device_limit_lo=dev_lo,
+                    device_limit_hi=dev_hi,
+                    symmetric_upper=sym_upper,
                 )
             if reason:
                 measurement.valid = False
@@ -2548,8 +2593,12 @@ class FluidStateEstimator:
         min_row_sq = max(f_base * f_base * 1e-4, 1e-8)
         fin_pos_w = base_w[np.isfinite(base_w) & (base_w > 0.0)]
         max_real_w = float(np.max(fin_pos_w)) if fin_pos_w.size else 100.0
-        max_zi_w = min(max(1.5e7, 200.0 * max_real_w), 1.0e8)
-        zi_weights = np.clip(target_e / np.maximum(zi_row_sq, min_row_sq), 100.0, max_zi_w)
+        med_real_w = float(np.median(fin_pos_w)) if fin_pos_w.size else 100.0
+        max_zi_w = min(max(2.5e8, 5.0e4 * max_real_w), 2.5e9)
+        row_eq_w = target_e / np.maximum(zi_row_sq, min_row_sq)
+        # 物理流量空间紧守恒保底权重：防止高管导节点因 zi_row_sq 偏大反被除成低权重而产生质量泄漏
+        flow_tight_w = 2.5e5 * max(med_real_w, 25.0) / max(f_base * f_base, 1.0e-2)
+        zi_weights = np.clip(np.maximum(row_eq_w, flow_tight_w), 100.0, max_zi_w)
 
         all_tbl = getattr(self.measurements, "table", None)
         if all_tbl is not None and int(all_tbl.idx.size) > 0:
@@ -3734,6 +3783,80 @@ class FluidStateEstimator:
             evaluated_at_final_x = False
             cached_z_est = cached_residual = cached_objective = None
             last_used_damping = max(last_used_damping, 1e-6)
+
+        # 增广拉格朗日乘子（ALM）零注入流量守恒精修：在不继续放大惩罚权重、保持正规方程良态的前提下，
+        # 通过 1~3 轮乘子偏置更新消除高管导/强压力噪声对纯零注入节点的残余质量牵拉
+        if converged and zi_active_rows.size > 0:
+            z_est_chk = cached_z_est if cached_z_est is not None else self.evaluate(x)
+            res_chk = z - z_est_chk
+            _, flow_chk, _ = self._flow_state_arrays(x, need_derivative=False)
+            f_ref_alm = max(float(np.max(np.abs(flow_chk))) if flow_chk.size else 1.0, 1.0)
+            best_zi_err = float(np.max(np.abs(res_chk[zi_active_rows])))
+            if np.isfinite(best_zi_err) and best_zi_err > 1.0e-5 * f_ref_alm:
+                x_alm = x.copy()
+                z_est_alm = z_est_chk.copy()
+                alm_shift = np.zeros(zi_active_rows.size, dtype=np.float64)
+                for _alm_outer in range(3):
+                    true_zi_res = z[zi_active_rows] - z_est_alm[zi_active_rows]
+                    cur_zi_err = float(np.max(np.abs(true_zi_res)))
+                    if cur_zi_err <= 5.0e-6 * f_ref_alm:
+                        break
+                    alm_shift = alm_shift + true_zi_res
+                    z_target_alm = z.copy()
+                    z_target_alm[zi_active_rows] = z[zi_active_rows] + alm_shift
+                    for _alm_inner in range(3):
+                        res_alm = z_target_alm - z_est_alm
+                        obj_alm = float(np.dot(weight, res_alm * res_alm))
+                        H_alm = self.jacobian_sparse(x_alm)
+                        dx_alm = None
+                        for beta_alm in (0.0, 1e-5, 1e-3):
+                            try:
+                                dx_try, _, _, _ = _solve_step(H_alm, res_alm, beta_alm)
+                                if dx_try is not None and dx_try.size == self.state_count and np.all(np.isfinite(dx_try)):
+                                    dx_alm = dx_try
+                                    break
+                            except Exception:
+                                continue
+                        if dx_alm is None:
+                            break
+                        if float(np.max(np.abs(dx_alm) / np.maximum(state_scales, 1.0))) < 1.0e-8:
+                            break
+                        step_alm = 1.0
+                        pot_min_alm = (
+                            np.maximum(minimum, 0.25 * x_alm[: self.n_potential])
+                            if self.n_potential > 0
+                            else np.empty(0, dtype=np.float64)
+                        )
+                        step_ok = False
+                        for _ls_a in range(10):
+                            cand_alm = x_alm + step_alm * dx_alm
+                            if self.n_potential > 0 and np.any(cand_alm[: self.n_potential] < pot_min_alm):
+                                step_alm *= 0.5
+                                continue
+                            cand_ze = self.evaluate(cand_alm)
+                            if not np.all(np.isfinite(cand_ze)):
+                                step_alm *= 0.5
+                                continue
+                            cand_ra = z_target_alm - cand_ze
+                            cand_oa = float(np.dot(weight, cand_ra * cand_ra))
+                            if np.isfinite(cand_oa) and cand_oa <= obj_alm * (1.0 + 1e-11) + 1e-12:
+                                x_alm = cand_alm
+                                z_est_alm = cand_ze
+                                step_ok = True
+                                break
+                            step_alm *= 0.5
+                        if not step_ok:
+                            break
+                    new_zi_err = float(np.max(np.abs(z[zi_active_rows] - z_est_alm[zi_active_rows])))
+                    if np.isfinite(new_zi_err) and new_zi_err < best_zi_err:
+                        best_zi_err = new_zi_err
+                        x = x_alm.copy()
+                        cached_z_est = cached_residual = cached_objective = None
+                        evaluated_at_final_x = False
+                        last_used_damping = max(last_used_damping, 1e-6)
+                    else:
+                        break
+
         if not evaluated_at_final_x:
             if cached_z_est is not None:
                 z_est = cached_z_est

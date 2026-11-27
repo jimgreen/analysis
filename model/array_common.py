@@ -1,7 +1,7 @@
 from pathlib import Path
 import math
 import operator
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -702,3 +702,130 @@ def _name_array(devices, prefix: str) -> np.ndarray:
         [str(getattr(dev, "name", "") or f"{prefix}_{_int_value(dev, 'idx', pos)}") for pos, dev in enumerate(devices)],
         dtype=object,
     )
+
+
+def _first_present_float_column(table_rows, columns, aliases, default: float = np.nan) -> Optional[np.ndarray]:
+    """按别名优先顺序提取第一个存在于 E 文件表头的数值列；全部不存在时返回 None。"""
+    for attr in aliases:
+        if attr in columns:
+            return _float_column(table_rows, columns, attr, default)
+    return None
+
+
+def _extract_device_limits_from_rows(
+    table_rows,
+    columns,
+    *,
+    p_base: float,
+    v_node_values: Optional[np.ndarray] = None,
+    raw_vbase_by_idx=None,
+    i_node_values: Optional[np.ndarray] = None,
+    current_scale_by_node=None,
+    extra_specs=(),
+) -> Dict[str, np.ndarray]:
+    """从 E 文件设备表提取可选的状态限值列并统一转换到标幺值（未配置任何限值列时返回空字典）。"""
+    if not table_rows or not columns:
+        return {}
+    limits: Dict[str, np.ndarray] = {}
+
+    # 功率类限值（按 p_base 标幺化）
+    power_specs = (
+        ("p_min", ("p_min", "pmin")),
+        ("p_max", ("p_max", "pmax")),
+        ("q_min", ("q_min", "qmin")),
+        ("q_max", ("q_max", "qmax")),
+        ("s_max", ("s_max", "smax", "rate_a", "rated_capacity")),
+    )
+    for key, aliases in power_specs:
+        raw = _first_present_float_column(table_rows, columns, aliases, np.nan)
+        if raw is not None and np.any(np.isfinite(raw)):
+            limits[key] = raw / float(p_base)
+
+    # 电压类限值（按关联节点 raw_vbase 标幺化）
+    if v_node_values is not None and raw_vbase_by_idx is not None:
+        v_scales = None
+        for key, aliases in (("v_min", ("v_min", "vmin")), ("v_max", ("v_max", "vmax"))):
+            raw = _first_present_float_column(table_rows, columns, aliases, np.nan)
+            if raw is not None and np.any(np.isfinite(raw)):
+                if v_scales is None:
+                    v_scales = _raw_vbase_by_node(np.asarray(v_node_values, dtype=np.int64), raw_vbase_by_idx)
+                scaled = np.full_like(raw, np.nan)
+                ok = np.isfinite(raw) & (np.abs(v_scales) > 1e-12)
+                if np.any(ok):
+                    scaled[ok] = raw[ok] / v_scales[ok]
+                limits[key] = scaled
+
+    # 电流类限值（按关联节点电流基准标幺化）
+    if i_node_values is not None and current_scale_by_node is not None:
+        i_scales = None
+        for key, aliases in (("i_min", ("i_min", "imin")), ("i_max", ("i_max", "imax", "rated_current"))):
+            raw = _first_present_float_column(table_rows, columns, aliases, np.nan)
+            if raw is not None and np.any(np.isfinite(raw)):
+                if i_scales is None:
+                    scale_map = current_scale_by_node() if callable(current_scale_by_node) else current_scale_by_node
+                    i_scales = _scale_by_node(np.asarray(i_node_values, dtype=np.int64), scale_map)
+                scaled = np.full_like(raw, np.nan)
+                ok = np.isfinite(raw) & (np.abs(i_scales) > 1e-12)
+                if np.any(ok):
+                    scaled[ok] = raw[ok] / i_scales[ok]
+                limits[key] = scaled
+
+    # 扩展专用列（如 DCAC 分侧限值）
+    for spec in extra_specs:
+        key, aliases, kind, node_vals, ref_lookup = spec
+        raw = _first_present_float_column(table_rows, columns, aliases, np.nan)
+        if raw is None or not np.any(np.isfinite(raw)):
+            continue
+        if kind == "p":
+            limits[key] = raw / float(p_base)
+        elif kind == "v" and node_vals is not None and ref_lookup is not None:
+            v_scales = _raw_vbase_by_node(np.asarray(node_vals, dtype=np.int64), ref_lookup)
+            scaled = np.full_like(raw, np.nan)
+            ok = np.isfinite(raw) & (np.abs(v_scales) > 1e-12)
+            if np.any(ok):
+                scaled[ok] = raw[ok] / v_scales[ok]
+            limits[key] = scaled
+        elif kind == "i" and node_vals is not None and ref_lookup is not None:
+            scale_map = ref_lookup() if callable(ref_lookup) else ref_lookup
+            i_scales = _scale_by_node(np.asarray(node_vals, dtype=np.int64), scale_map)
+            scaled = np.full_like(raw, np.nan)
+            ok = np.isfinite(raw) & (np.abs(i_scales) > 1e-12)
+            if np.any(ok):
+                scaled[ok] = raw[ok] / i_scales[ok]
+            limits[key] = scaled
+    return limits
+
+
+def _extract_device_limits_from_objects(
+    devices,
+    *,
+    extra_alias_map=(),
+) -> Dict[str, np.ndarray]:
+    """从已标幺化的内存设备对象列表提取可选的状态限值字典。"""
+    if not devices:
+        return {}
+    specs = (
+        ("v_min", ("v_min", "vmin")),
+        ("v_max", ("v_max", "vmax")),
+        ("p_min", ("p_min", "pmin")),
+        ("p_max", ("p_max", "pmax")),
+        ("q_min", ("q_min", "qmin")),
+        ("q_max", ("q_max", "qmax")),
+        ("s_max", ("s_max", "smax", "rate_a", "rated_capacity")),
+        ("i_min", ("i_min", "imin")),
+        ("i_max", ("i_max", "imax", "rated_current")),
+        *extra_alias_map,
+    )
+    limits: Dict[str, np.ndarray] = {}
+    for key, aliases in specs:
+        found = False
+        for attr in aliases:
+            if _has_value(devices, attr):
+                arr = np.asarray([_float_value(dev, attr, np.nan) for dev in devices], dtype=np.float64)
+                if np.any(np.isfinite(arr)):
+                    limits[key] = arr
+                    found = True
+                    break
+        if found:
+            continue
+    return limits

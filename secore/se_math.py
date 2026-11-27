@@ -5099,6 +5099,26 @@ def unanchored_angle_state_indices(
     return [idx for _, idx in state_indices]
 
 
+def _is_strictly_lower_csc(matrix) -> bool:
+    """判断稀疏 CSC 方阵是否仅存储了下三角元素（含严格下三角非零元且无严格上三角非零元）。"""
+    if not is_sparse_matrix(matrix):
+        return False
+    n_rows, n_cols = matrix.shape
+    if n_rows != n_cols or n_rows <= 1 or int(matrix.nnz) == 0:
+        return False
+    csc = matrix if getattr(matrix, "format", None) == "csc" else matrix.tocsc()
+    cols = np.repeat(np.arange(n_cols, dtype=csc.indices.dtype), np.diff(csc.indptr))
+    return bool((not np.any(csc.indices < cols)) and np.any(csc.indices > cols))
+
+
+def cholmod_lower_csc_available() -> bool:
+    """判断当前环境是否可直接用 CHOLMOD 处理仅存下三角的正规方程稀疏矩阵。"""
+    return bool(
+        get_linear_solver_preference() != "scipy"
+        and (CHOLMOD_ANALYZE is not None or CHOLMOD_CHOLESKY is not None)
+    )
+
+
 class NormalEquationSolver:
     """Solve repeated normal equations, reusing CHOLMOD symbolic analysis when available."""
 
@@ -5107,7 +5127,13 @@ class NormalEquationSolver:
         self._cholmod_pattern = None
         self._cholmod_shape_nnz = None
         self._cholmod_disabled = False
+        self._last_factor_scaled = False
+        self._last_unscaled_diag: Optional[np.ndarray] = None
         self.assume_fixed_pattern = bool(assume_fixed_pattern)
+
+    def unregularized_diagonal(self) -> Optional[np.ndarray]:
+        """返回最近一次启用 Jacobi 列均衡阻尼前的原始正规矩阵对角元。"""
+        return self._last_unscaled_diag
 
     @staticmethod
     def _sparse_pattern(matrix) -> Tuple[Tuple[int, int], int, np.ndarray, np.ndarray]:
@@ -5152,23 +5178,79 @@ class NormalEquationSolver:
         gain: np.ndarray,
         rhs: np.ndarray,
         return_factor_diag: bool = True,
+        damping: float = 0.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Solve normal equations, preferring sparse SPD Cholesky when available."""
+        """求解正规方程，支持可选 Marquardt 对角阻尼与异构权重列均衡。"""
+        self._last_factor_scaled = False
+        self._last_unscaled_diag = None
+        col_scale = None
+        rhs_solve = np.asarray(rhs, dtype=np.float64)
+        beta = float(damping)
+
         if is_sparse_matrix(gain):
             gain_csc = gain if getattr(gain, "format", None) == "csc" else gain.tocsc()
-            if (
+            use_cholmod = (
                 get_linear_solver_preference() != "scipy"
                 and not self._cholmod_disabled
                 and (CHOLMOD_ANALYZE is not None or CHOLMOD_CHOLESKY is not None)
-            ):
+            )
+            if not use_cholmod and _is_strictly_lower_csc(gain_csc):
+                gain_csc = full_normal_equation_from_lower(gain_csc)
+            if beta > 0.0 and int(gain_csc.shape[0]) > 0:
+                diag_g = np.asarray(gain_csc.diagonal(), dtype=np.float64)
+                nz_diag = diag_g[np.isfinite(diag_g) & (diag_g > 1e-12)]
+                diag_ratio = (float(nz_diag.max()) / float(nz_diag.min())) if nz_diag.size >= 2 else 1.0
+                if diag_ratio > 5e7 or (diag_ratio > 5e5 and beta >= 0.5):
+                    col_scale = 1.0 / np.sqrt(np.maximum(diag_g, 1e-12))
+                    from scipy.sparse import diags as sp_diags
+
+                    D_sc = sp_diags(col_scale, format="csc")
+                    gain_csc = (D_sc @ gain_csc @ D_sc + SP_EYE(gain_csc.shape[0], format="csc", dtype=np.float64) * beta).tocsc()
+                    rhs_solve = rhs_solve * col_scale
+                    self._last_factor_scaled = True
+                    self._last_unscaled_diag = diag_g
+                else:
+                    gain_csc = (gain_csc + SP_EYE(gain_csc.shape[0], format="csc", dtype=np.float64) * beta).tocsc()
+            if use_cholmod and col_scale is None:
                 try:
-                    return self._solve_sparse_cholmod(gain_csc, rhs)
+                    return self._solve_sparse_cholmod(gain_csc, rhs_solve)
                 except Exception:
                     self._cholmod_factor = None
                     self._cholmod_pattern = None
                     self._cholmod_disabled = True
-            return _solve_normal_equations_no_cholmod(gain_csc, rhs, return_factor_diag)
-        return _solve_dense_normal_equations(gain, rhs, return_factor_diag)
+                    if _is_strictly_lower_csc(gain_csc):
+                        gain_csc = full_normal_equation_from_lower(gain_csc)
+            elif use_cholmod and col_scale is not None:
+                try:
+                    sol = CHOLMOD_CHOLESKY(gain_csc)(rhs_solve) if CHOLMOD_CHOLESKY is not None else self._solve_sparse_cholmod(gain_csc, rhs_solve)[0]
+                    return np.asarray(sol, dtype=np.float64) * col_scale, None
+                except Exception:
+                    if _is_strictly_lower_csc(gain_csc):
+                        gain_csc = full_normal_equation_from_lower(gain_csc)
+            sol, fdiag = _solve_normal_equations_no_cholmod(gain_csc, rhs_solve, return_factor_diag)
+            if col_scale is not None:
+                sol = np.asarray(sol, dtype=np.float64) * col_scale
+            return sol, fdiag
+
+        gain_arr = np.asarray(gain, dtype=np.float64)
+        if beta > 0.0 and gain_arr.ndim == 2 and gain_arr.shape[0] > 0:
+            diag_g = np.diag(gain_arr).copy()
+            nz_diag = diag_g[np.isfinite(diag_g) & (diag_g > 1e-12)]
+            diag_ratio = (float(nz_diag.max()) / float(nz_diag.min())) if nz_diag.size >= 2 else 1.0
+            if diag_ratio > 5e7 or (diag_ratio > 5e5 and beta >= 0.5):
+                col_scale = 1.0 / np.sqrt(np.maximum(diag_g, 1e-12))
+                gain_arr = (gain_arr * col_scale[:, None]) * col_scale[None, :]
+                gain_arr[np.diag_indices_from(gain_arr)] += beta
+                rhs_solve = rhs_solve * col_scale
+                self._last_factor_scaled = True
+                self._last_unscaled_diag = diag_g
+            else:
+                gain_arr = gain_arr.copy()
+                gain_arr[np.diag_indices_from(gain_arr)] += beta
+        sol, fdiag = _solve_dense_normal_equations(gain_arr, rhs_solve, return_factor_diag)
+        if col_scale is not None:
+            sol = np.asarray(sol, dtype=np.float64) * col_scale
+        return sol, fdiag
 
 
 def _solve_normal_equations_no_cholmod(
@@ -5176,6 +5258,10 @@ def _solve_normal_equations_no_cholmod(
     rhs: np.ndarray,
     return_factor_diag: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    if _is_strictly_lower_csc(gain_csc):
+        gain_csc = full_normal_equation_from_lower(gain_csc)
+    if int(gain_csc.shape[0]) <= 192:
+        return _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
     try:
         lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
         factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
@@ -6069,7 +6155,8 @@ def solve_box_pinned_normal_equations(
 
     if gain is not None:
         if SP_ISSPARSE(gain):
-            G_coo = gain.tocoo()
+            gain_sym = full_normal_equation_from_lower(gain) if _is_strictly_lower_csc(gain) else gain
+            G_coo = gain_sym.tocoo()
             pin_mask = np.zeros(n_state, dtype=bool)
             pin_mask[pinned_cols] = True
             keep = (~pin_mask[G_coo.row]) & (~pin_mask[G_coo.col])
@@ -6077,16 +6164,12 @@ def solve_box_pinned_normal_equations(
             cols = np.concatenate([G_coo.col[keep], pinned_cols])
             vals = np.concatenate([G_coo.data[keep], np.ones(k, dtype=np.float64)])
             G_pin = SP_CSC_MATRIX((vals, (rows, cols)), shape=(n_state, n_state))
-            if beta > 0.0:
-                G_pin = G_pin + SP_EYE(n_state, format="csc", dtype=np.float64) * beta
         else:
             G_pin = np.array(gain, dtype=np.float64, copy=True)
             G_pin[pinned_cols, :] = 0.0
             G_pin[:, pinned_cols] = 0.0
             G_pin[pinned_cols, pinned_cols] = 1.0
-            if beta > 0.0:
-                G_pin[np.diag_indices_from(G_pin)] += beta
-        dx, _ = NormalEquationSolver().solve(G_pin, rhs_pin, return_factor_diag=False)
+        dx, _ = NormalEquationSolver().solve(G_pin, rhs_pin, return_factor_diag=False, damping=beta)
         if dx.size == n_state and np.all(np.isfinite(dx)):
             dx[pinned_cols] = 0.0
             return dx, True

@@ -176,6 +176,8 @@ class StateEstimationParameters:
     max_remove_per_round: Optional[int] = None
     # 量测预过滤配置：所有上下限与容差均作为可配置输入参数，不在求解流程中写死
     enable_measurement_prefilter: bool = True
+    enable_device_limit_prefilter: bool = True
+    prefilter_device_limit_factor: Optional[float] = 2.0
     prefilter_dead_island_zero_tol: float = 1e-3
     prefilter_voltage_min_pu: Optional[float] = 0.1
     prefilter_voltage_max_pu: Optional[float] = 1.9
@@ -219,6 +221,8 @@ class StateEstimationParameters:
         angle_max_deg: Optional[float] = None,
         max_remove_per_round: Any = _UNSET,
         enable_measurement_prefilter: Optional[bool] = None,
+        enable_device_limit_prefilter: Optional[bool] = None,
+        prefilter_device_limit_factor: Any = _UNSET,
         prefilter_dead_island_zero_tol: Optional[float] = None,
         prefilter_voltage_min_pu: Any = _UNSET,
         prefilter_voltage_max_pu: Any = _UNSET,
@@ -286,6 +290,12 @@ class StateEstimationParameters:
             max_remove_per_round=resolved_per_round,
             enable_measurement_prefilter=bool(
                 _override_value(self.enable_measurement_prefilter, enable_measurement_prefilter)
+            ),
+            enable_device_limit_prefilter=bool(
+                _override_value(self.enable_device_limit_prefilter, enable_device_limit_prefilter)
+            ),
+            prefilter_device_limit_factor=_opt_float(
+                self.prefilter_device_limit_factor, prefilter_device_limit_factor
             ),
             prefilter_dead_island_zero_tol=float(
                 _override_value(self.prefilter_dead_island_zero_tol, prefilter_dead_island_zero_tol)
@@ -381,6 +391,8 @@ def load_se_parameters(path: Optional[Path] = None) -> StateEstimationParameters
         angle_max_deg=float(values.get("angle_max_deg", "270.0")),
         max_remove_per_round=parsed_max_remove_per_round,
         enable_measurement_prefilter=_to_bool(values.get("enable_measurement_prefilter", "true")),
+        enable_device_limit_prefilter=_to_bool(values.get("enable_device_limit_prefilter", "true")),
+        prefilter_device_limit_factor=_parse_opt_float("prefilter_device_limit_factor", 2.0),
         prefilter_dead_island_zero_tol=float(values.get("prefilter_dead_island_zero_tol", "1e-3")),
         prefilter_voltage_min_pu=_parse_opt_float(
             "prefilter_voltage_min_pu", float(values.get("voltage_min", "0.1"))

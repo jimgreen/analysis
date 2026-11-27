@@ -31,6 +31,8 @@ from model.array_common import (
     _code_value,
     _current_scale_by_node,
     _empty,
+    _extract_device_limits_from_objects,
+    _extract_device_limits_from_rows,
     _float_cell,
     _float_column,
     _float_value,
@@ -516,6 +518,57 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         _assign_current_if_present(dcdc, DCDC_COLS["j_c"], table_rows, columns, "j_c", dcdc[:, DCDC_COLS["j_node"]], get_current_scale_by_node)
     dcdc_names = _names_from_rows(table_rows, columns, "dcdc", dcdc[:, DCDC_COLS["idx"]])
 
+    device_limits: Dict[str, Dict[str, np.ndarray]] = {}
+    if bus.shape[0]:
+        c_b, r_b = _rows_for(rows, "DCNode")
+        bus_lim = _extract_device_limits_from_rows(
+            r_b,
+            c_b,
+            p_base=p_base,
+            v_node_values=bus[:, BUS_COLS["idx"]],
+            raw_vbase_by_idx=raw_vbase_by_idx,
+        )
+        if bus_lim:
+            device_limits["bus"] = bus_lim
+    for dev_key, tbl_name, arr, cols_map, v_col, i_col in (
+        ("branch", "DCBranch", branch, BRANCH_COLS, "i_node", "i_node"),
+        ("load", "DCLoad", load, LOAD_COLS, "node", "node"),
+        ("zero_branch", "DCZeroBranch", zero_branch, ZERO_BRANCH_COLS, "i_node", "i_node"),
+        ("switch", "DCSwitch", switch, SWITCH_COLS, "i_node", "i_node"),
+        ("break", "DCBreak", breaker, BREAK_COLS, "i_node", "i_node"),
+        ("dcdc", "DCDCConverter", dcdc, DCDC_COLS, "i_node", "i_node"),
+    ):
+        if arr.shape[0]:
+            c_m, r_m = _rows_for(rows, tbl_name)
+            lim = _extract_device_limits_from_rows(
+                r_m,
+                c_m,
+                p_base=p_base,
+                v_node_values=arr[:, cols_map[v_col]],
+                raw_vbase_by_idx=raw_vbase_by_idx,
+                i_node_values=arr[:, cols_map[i_col]],
+                current_scale_by_node=get_current_scale_by_node,
+            )
+            if lim:
+                device_limits[dev_key] = lim
+    if gen.shape[0]:
+        c_g, r_g = _rows_for(rows, "DCGenerator")
+        gen_lim = _extract_device_limits_from_rows(
+            r_g,
+            c_g,
+            p_base=p_base,
+            v_node_values=gen[:, GEN_COLS["node"]],
+            raw_vbase_by_idx=raw_vbase_by_idx,
+            i_node_values=gen[:, GEN_COLS["node"]],
+            current_scale_by_node=get_current_scale_by_node,
+        )
+        if np.any(np.isfinite(gen_p_min)):
+            gen_lim["p_min"] = gen_p_min
+        if np.any(np.isfinite(gen_p_max)):
+            gen_lim["p_max"] = gen_p_max
+        if gen_lim:
+            device_limits["gen"] = gen_lim
+
     ppc = {
         "format": "dc_ppc_v1",
         "source": str(source),
@@ -533,6 +586,7 @@ def _build_dc_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "_gen_p_min": gen_p_min,
         "_gen_p_max": gen_p_max,
         "_gen_alpha": gen_alpha,
+        "_device_limits": device_limits,
         "zero_branch": zero_branch,
         "switch": switch,
         "break": breaker,
@@ -802,6 +856,27 @@ def build_dc_ppc_from_network(network) -> Dict:
             dcdc[:, DCDC_COLS["j_control_type"]].astype(np.int64, copy=False),
         )
 
+    device_limits: Dict[str, Dict[str, np.ndarray]] = {}
+    for dev_key, dev_list in (
+        ("bus", nodes),
+        ("branch", branches),
+        ("load", loads),
+        ("zero_branch", zero_branches),
+        ("switch", switches),
+        ("break", breakers),
+        ("dcdc", dcdcs),
+    ):
+        lim = _extract_device_limits_from_objects(dev_list)
+        if lim:
+            device_limits[dev_key] = lim
+    gen_lim = _extract_device_limits_from_objects(generators)
+    if np.any(np.isfinite(gen_p_min)):
+        gen_lim["p_min"] = gen_p_min
+    if np.any(np.isfinite(gen_p_max)):
+        gen_lim["p_max"] = gen_p_max
+    if gen_lim:
+        device_limits["gen"] = gen_lim
+
     ppc = {
         "format": "dc_ppc_v1",
         "source": str(getattr(network, "source", getattr(network, "file_name", "<network>"))),
@@ -819,6 +894,7 @@ def build_dc_ppc_from_network(network) -> Dict:
         "_gen_p_min": gen_p_min,
         "_gen_p_max": gen_p_max,
         "_gen_alpha": gen_alpha,
+        "_device_limits": device_limits,
         "zero_branch": zero_branch,
         "switch": build_switch_like(switches),
         "break": build_switch_like(breakers),

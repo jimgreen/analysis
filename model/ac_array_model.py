@@ -44,6 +44,8 @@ from model.array_common import (
     _code_value,
     _current_scale_by_node,
     _empty,
+    _extract_device_limits_from_objects,
+    _extract_device_limits_from_rows,
     _fill_float_column_if_present,
     _float_cell,
     _float_column,
@@ -955,6 +957,77 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         p_base,
     )
 
+    device_limits: Dict[str, Dict[str, np.ndarray]] = {}
+    if bus.shape[0]:
+        bus_lim = _extract_device_limits_from_rows(
+            _rows_for(rows, "ACNode")[1],
+            _rows_for(rows, "ACNode")[0],
+            p_base=p_base,
+            v_node_values=bus[:, BUS_COLS["idx"]],
+            raw_vbase_by_idx=raw_vbase_by_idx,
+        )
+        if bus_lim:
+            device_limits["bus"] = bus_lim
+    for dev_key, tbl_name, arr, cols_map, v_col, i_col in (
+        ("branch", "ACBranch", branch, BRANCH_COLS, "i_node", "i_node"),
+        ("transformer", "ACTransformer", transformer, TRANSFORMER_COLS, "i_node", "i_node"),
+        ("load", "ACLoad", load, LOAD_COLS, "node", "node"),
+        ("zero_branch", "ACZeroBranch", zero_branch, ZERO_BRANCH_COLS, "i_node", "i_node"),
+        ("switch", "ACSwitch", switch, SWITCH_COLS, "i_node", "i_node"),
+        ("break", "ACBreak", breaker, BREAK_COLS, "i_node", "i_node"),
+        ("acac", "ACACConverter", acac, ACAC_COLS, "i_node", "i_node"),
+    ):
+        if arr.shape[0]:
+            c_m, r_m = _rows_for(rows, tbl_name)
+            lim = _extract_device_limits_from_rows(
+                r_m,
+                c_m,
+                p_base=p_base,
+                v_node_values=arr[:, cols_map[v_col]],
+                raw_vbase_by_idx=raw_vbase_by_idx,
+                i_node_values=arr[:, cols_map[i_col]],
+                current_scale_by_node=get_current_scale_by_node,
+            )
+            if lim:
+                device_limits[dev_key] = lim
+    if three_winding_transformer.shape[0]:
+        c_3, r_3 = _rows_for(rows, "ACThreeWindingTransformer")
+        if not r_3:
+            c_3, r_3 = _rows_for(rows, "AC3WTransformer")
+        lim_3 = _extract_device_limits_from_rows(
+            r_3,
+            c_3,
+            p_base=p_base,
+            v_node_values=three_winding_transformer[:, THREE_WINDING_TRANSFORMER_COLS["i_node"]],
+            raw_vbase_by_idx=raw_vbase_by_idx,
+            i_node_values=three_winding_transformer[:, THREE_WINDING_TRANSFORMER_COLS["i_node"]],
+            current_scale_by_node=get_current_scale_by_node,
+        )
+        if lim_3:
+            device_limits["three_winding_transformer"] = lim_3
+    if gen.shape[0]:
+        c_g, r_g = _rows_for(rows, "ACGenerator")
+        gen_lim = _extract_device_limits_from_rows(
+            r_g,
+            c_g,
+            p_base=p_base,
+            v_node_values=gen[:, GEN_COLS["node"]],
+            raw_vbase_by_idx=raw_vbase_by_idx,
+            i_node_values=gen[:, GEN_COLS["node"]],
+            current_scale_by_node=get_current_scale_by_node,
+        )
+        # 复用已处理 rated_capacity 占位兜底后的发电机上下限
+        if np.any(np.isfinite(gen_p_min)):
+            gen_lim["p_min"] = gen_p_min
+        if np.any(np.isfinite(gen[:, GEN_COLS["p_max"]])):
+            gen_lim["p_max"] = gen[:, GEN_COLS["p_max"]]
+        if np.any(np.isfinite(gen_q_min)):
+            gen_lim["q_min"] = gen_q_min
+        if np.any(np.isfinite(gen_q_max)):
+            gen_lim["q_max"] = gen_q_max
+        if gen_lim:
+            device_limits["gen"] = gen_lim
+
     ppc = {
         "format": "ac_ppc_v1",
         "source": str(source),
@@ -973,6 +1046,7 @@ def _build_ac_ppc_from_rows_dict(rows: Dict, source) -> Dict:
         "_gen_p_min": gen_p_min,
         "_gen_q_min": gen_q_min,
         "_gen_q_max": gen_q_max,
+        "_device_limits": device_limits,
         "load": load,
         "shunt": shunt,
         "zero_branch": zero_branch,
@@ -2529,6 +2603,33 @@ def build_ac_ppc_from_network(network) -> Dict:
     for attr in ("i_p", "i_q", "j_p", "j_q", "i_i", "j_i"):
         _fill_float_column_if_present(acac, acac_converters, ACAC_COLS[attr], attr)
 
+    device_limits: Dict[str, Dict[str, np.ndarray]] = {}
+    for dev_key, dev_list in (
+        ("bus", nodes),
+        ("branch", branches),
+        ("transformer", transformers),
+        ("three_winding_transformer", three_winding_transformers),
+        ("load", loads),
+        ("zero_branch", zero_branches),
+        ("switch", switches),
+        ("break", breakers),
+        ("acac", acac_converters),
+    ):
+        lim = _extract_device_limits_from_objects(dev_list)
+        if lim:
+            device_limits[dev_key] = lim
+    gen_lim = _extract_device_limits_from_objects(generators)
+    if np.any(np.isfinite(gen_p_min)):
+        gen_lim["p_min"] = gen_p_min
+    if gen.shape[0] and np.any(np.isfinite(gen[:, GEN_COLS["p_max"]])):
+        gen_lim["p_max"] = gen[:, GEN_COLS["p_max"]]
+    if np.any(np.isfinite(gen_q_min)):
+        gen_lim["q_min"] = gen_q_min
+    if np.any(np.isfinite(gen_q_max)):
+        gen_lim["q_max"] = gen_q_max
+    if gen_lim:
+        device_limits["gen"] = gen_lim
+
     ppc = {
         "format": "ac_ppc_v1",
         "source": str(getattr(network, "source", getattr(network, "file_name", "<network>"))),
@@ -2547,6 +2648,7 @@ def build_ac_ppc_from_network(network) -> Dict:
         "_gen_p_min": gen_p_min,
         "_gen_q_min": gen_q_min,
         "_gen_q_max": gen_q_max,
+        "_device_limits": device_limits,
         "load": load,
         "shunt": shunt,
         "zero_branch": zero_branch,

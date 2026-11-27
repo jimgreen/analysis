@@ -138,6 +138,7 @@ from secore.se_math import (
     build_normal_equations,
     build_switch_current_curvature_columns,
     check_active_structural_full_rank,
+    cholmod_lower_csc_available,
     compute_active_column_degrees,
     compute_adaptive_bad_threshold,
     compute_normalized_residuals_for_bad_data,
@@ -1870,6 +1871,7 @@ class ACStateEstimator:
             cache_lower_normal_plan
             and self._measurement_plan_tables_are_active(measurements)
             and issparse(H)
+            and cholmod_lower_csc_available()
             and not self._aat_normal_solver_enabled()
         ):
             lower_normal_plan = getattr(self, "_active_lower_normal_plan", None)
@@ -3734,8 +3736,15 @@ class ACStateEstimator:
         dead_scales_by_type = None
         if flagged_unavailable.any():
             dead_names_by_type, dead_scales_by_type = self._dead_or_inactive_device_info()
-        from secore.meas_prefilter import prefilter_electric_measurements
+        from secore.meas_prefilter import (
+            build_ac_device_limits_lookup,
+            prefilter_electric_measurements,
+        )
 
+        ac_device_limits = build_ac_device_limits_lookup(
+            self._ac_ppc_dict(),
+            getattr(self, "_ac_measurement_plan_rows_by_type_code", None),
+        )
         pf_invalidated, pf_reasons = prefilter_electric_measurements(
             table,
             self.params,
@@ -3745,6 +3754,7 @@ class ACStateEstimator:
             dead_device_scales_by_type=dead_scales_by_type,
             dead_power_scale=float(self.p_base),
             side="ac",
+            device_limits_lookup=ac_device_limits,
         )
         if pf_invalidated.any():
             invalidated_mask |= pf_invalidated
@@ -10656,6 +10666,7 @@ class ACStateEstimator:
                         observability_cache["lower_normal_plan"] = None
                 if (
                     active_measurement_run
+                    and cholmod_lower_csc_available()
                     and not use_aat_normal_solver
                     and lower_normal_plan is None
                     and issparse(H)
@@ -10908,7 +10919,24 @@ class ACStateEstimator:
                             solve_gain,
                             rhs,
                             return_factor_diag=False,
+                            damping=step_damping,
                         )
+                        if step_damping == 0.0:
+                            last_undamped_spd_failed = not (dx.size == 0 or bool(np.all(np.isfinite(dx))))
+                        if step_damping == 0.0 and _dx_needs_lm_guard(dx, strict_step=True):
+                            for beta_try in tr_ctrl.lm_guard_damping_ladder():
+                                dx_lm, _ = normal_solver.solve(
+                                    solve_gain,
+                                    rhs,
+                                    return_factor_diag=False,
+                                    damping=beta_try,
+                                )
+                                if dx_lm.size == dx.size and np.all(np.isfinite(dx_lm)):
+                                    dx = dx_lm
+                                    step_damping = beta_try
+                                    used_lm_guard_step = True
+                                    if not _dx_needs_lm_guard(dx, strict_step=False):
+                                        break
                 if start is not None:
                     self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
                 frozen_steps = 0
@@ -11066,9 +11094,13 @@ class ACStateEstimator:
                         frozen_fail_count += 1
                         frozen_steps = max(scale_profile.frozen_max_steps, scale_profile.local_warm_frozen_max_steps)
                     continue
-                if force_lm_damping < 100.0 and normal_operand is not None and aat_solver is not None:
+                if force_lm_damping < 100.0 and ((normal_operand is not None and aat_solver is not None) or gain is not None):
                     if curvature_damping_active and step_damping > 0.0:
-                        step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else aat_solver
+                        step_solver_lm = (
+                            box_pin_cache.get("solver")
+                            if used_box_pin_step
+                            else (aat_solver if normal_operand is not None else normal_solver)
+                        )
                         diag_reg_lm = (
                             step_solver_lm.unregularized_diagonal()
                             if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
@@ -11104,7 +11136,7 @@ class ACStateEstimator:
                 # 确认已到达带约束局部极小驻点并优雅收敛
                 if (
                     not _state_out_of_bounds(x)
-                    and max_correction <= 5e-2
+                    and max_correction <= 5e-3
                     and rhs is not None
                     and rhs.size > 0
                 ):
@@ -11115,6 +11147,8 @@ class ACStateEstimator:
                     )
                     if diag_g_st is None and normal_operand is not None:
                         diag_g_st = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    if diag_g_st is None and gain is not None:
+                        diag_g_st = np.asarray(gain.diagonal() if issparse(gain) else np.diag(gain), dtype=np.float64).ravel()
                     if diag_g_st is not None and diag_g_st.size == rhs.size:
                         eff_rhs_st = rhs.copy()
                         if self.base_switch_re > self.n_angle:
@@ -11129,7 +11163,7 @@ class ACStateEstimator:
                         scaled_vec_st = np.abs(eff_rhs_st) / np.maximum(diag_g_st, 1.0)
                         va_end_st = min(int(self.base_switch_re), int(scaled_vec_st.size))
                         va_g_st = float(np.max(scaled_vec_st[:va_end_st])) if va_end_st > 0 else 0.0
-                        if va_g_st <= max(5e-3, 5000.0 * self.tol):
+                        if va_g_st <= max(5e-4, 500.0 * self.tol):
                             converged = True
                 final_quantities_current = factor_is_current_weights
                 break
@@ -11195,7 +11229,7 @@ class ACStateEstimator:
                 step_solver_lm = (
                     box_pin_cache.get("solver")
                     if used_box_pin_step
-                    else (curv_aat_solver if used_sw_curv else aat_solver)
+                    else ((curv_aat_solver if used_sw_curv else aat_solver) if normal_operand is not None else normal_solver)
                 )
                 diag_reg_lm = (
                     step_solver_lm.unregularized_diagonal()
@@ -11321,7 +11355,7 @@ class ACStateEstimator:
                 micro_step_streak = 0
                 fullstep_osc_streak = 0
                 backtrack_streak += 4
-                if backtrack_streak >= 12 and normal_operand is not None and aat_solver is not None:
+                if backtrack_streak >= 12 and ((normal_operand is not None and aat_solver is not None) or gain is not None):
                     if force_lm_damping < 10.0:
                         hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                         force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
@@ -11343,7 +11377,7 @@ class ACStateEstimator:
                         and objective_change <= 1e-3 * (abs(previous_objective) + 1.0)
                     ):
                         fullstep_osc_streak += 1
-                        if fullstep_osc_streak >= 4 and normal_operand is not None and aat_solver is not None:
+                        if fullstep_osc_streak >= 4 and ((normal_operand is not None and aat_solver is not None) or gain is not None):
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                             force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                             curvature_damping_active = True
@@ -11555,33 +11589,6 @@ class ACStateEstimator:
             except Exception:
                 pass
             box_pin_cache.clear()
-        # 有界约束 KKT 驻点终末核验：扣除紧贴电压边界且梯度指外的活跃分量后，若自由子空间梯度满足容差则优雅收敛
-        if (
-            (not converged)
-            and (not coarse_stopped)
-            and iteration >= 3
-            and np.isfinite(objective)
-            and max_correction <= 2e-2
-            and H is not None
-            and not _state_out_of_bounds(x)
-        ):
-            if H.shape[0] == residual.size and weight.size == residual.size:
-                rhs_chk = np.asarray(H.T @ (weight * residual), dtype=np.float64).ravel()
-                if issparse(H):
-                    dg_chk = np.asarray(H.power(2).T @ weight, dtype=np.float64).ravel()
-                else:
-                    dg_chk = np.asarray(np.sum((H * H) * weight[:, None], axis=0), dtype=np.float64).ravel()
-                if rhs_chk.size == x.size and dg_chk.size == x.size:
-                    if v_cols_box.size:
-                        pin_lo = v_cols_box[(x[v_cols_box] <= v_min_bound + 1e-3) & (rhs_chk[v_cols_box] < 0.0)]
-                        pin_hi = v_cols_box[(x[v_cols_box] >= v_max_bound - 1e-3) & (rhs_chk[v_cols_box] > 0.0)]
-                        if pin_lo.size:
-                            rhs_chk[pin_lo] = 0.0
-                        if pin_hi.size:
-                            rhs_chk[pin_hi] = 0.0
-                    sv_chk = np.abs(rhs_chk) / np.maximum(dg_chk, 1.0)
-                    if float(np.max(sv_chk)) <= max(5e-3, 5000.0 * self.tol):
-                        converged = True
         if curv_aat_solver is not None:
             try:
                 curv_aat_solver._reset_pardiso()

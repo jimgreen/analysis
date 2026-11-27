@@ -32,6 +32,8 @@ from model.array_common import (
     _code_column,
     _current_scale_by_node,
     _empty,
+    _extract_device_limits_from_objects,
+    _extract_device_limits_from_rows,
     _float_cell,
     _float_column,
     _int_cell,
@@ -589,6 +591,52 @@ def _build_dcac_from_rows(
     return out, names, objects
 
 
+def _extract_dcac_limits_from_rows(
+    rows: Dict,
+    dcac: np.ndarray,
+    ac_ppc: Dict,
+    dc_ppc: Dict,
+    vbase_maps=None,
+) -> Dict[str, np.ndarray]:
+    if dcac.shape[0] == 0:
+        return {}
+    columns, table_rows = _rows_for(rows, "DCACConverter")
+    if not table_rows:
+        return {}
+    p_base = float(ac_ppc["base"]["p_base"])
+    ac_raw_vbase, dc_raw_vbase, ac_current, dc_current = (
+        _raw_vbase_maps(ac_ppc, dc_ppc) if vbase_maps is None else vbase_maps
+    )
+    ac_nodes = dcac[:, DCAC_COLS["ac_node"]]
+    dc_nodes = dcac[:, DCAC_COLS["dc_node"]]
+    extra_specs = (
+        ("p_ac_min", ("p_ac_min",), "p", None, None),
+        ("p_ac_max", ("p_ac_max",), "p", None, None),
+        ("p_dc_min", ("p_dc_min",), "p", None, None),
+        ("p_dc_max", ("p_dc_max",), "p", None, None),
+        ("q_ac_min", ("q_ac_min",), "p", None, None),
+        ("q_ac_max", ("q_ac_max",), "p", None, None),
+        ("v_ac_min", ("v_ac_min",), "v", ac_nodes, ac_raw_vbase),
+        ("v_ac_max", ("v_ac_max",), "v", ac_nodes, ac_raw_vbase),
+        ("v_dc_min", ("v_dc_min",), "v", dc_nodes, dc_raw_vbase),
+        ("v_dc_max", ("v_dc_max",), "v", dc_nodes, dc_raw_vbase),
+        ("i_ac_min", ("i_ac_min",), "i", ac_nodes, ac_current),
+        ("i_ac_max", ("i_ac_max",), "i", ac_nodes, ac_current),
+        ("i_dc_min", ("i_dc_min",), "i", dc_nodes, dc_current),
+        ("i_dc_max", ("i_dc_max",), "i", dc_nodes, dc_current),
+    )
+    return _extract_device_limits_from_rows(
+        table_rows,
+        columns,
+        p_base=p_base,
+        v_node_values=ac_nodes,
+        raw_vbase_by_idx=ac_raw_vbase,
+        i_node_values=ac_nodes,
+        current_scale_by_node=ac_current,
+        extra_specs=extra_specs,
+    )
+
+
 def build_hybrid_ppc_from_e_file(file_path):
     rows = _read_efile_rows(file_path)
     return build_hybrid_ppc_from_efile_rows(file_path, rows)
@@ -600,9 +648,11 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
     dc_ppc = build_dc_ppc_from_efile_rows(file_path, effective_rows, run_states_propagated=True)
     ac_ppc["source"] = str(file_path)
     dc_ppc["source"] = str(file_path)
+    vbase_maps = _raw_vbase_maps(ac_ppc, dc_ppc)
     dcac, dcac_name, _dcac_objects = _build_dcac_from_rows(
-        effective_rows, ac_ppc, dc_ppc, build_objects=False
+        effective_rows, ac_ppc, dc_ppc, build_objects=False, vbase_maps=vbase_maps
     )
+    dcac_limits = _extract_dcac_limits_from_rows(effective_rows, dcac, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
     acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
     acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
     ppc = {
@@ -617,6 +667,7 @@ def build_hybrid_ppc_only_from_efile_rows(file_path, rows):
         "acac_name": acac_name,
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
+        "_device_limits": {"dcac": dcac_limits} if dcac_limits else {},
     }
     sanitize_dcac_voltage_setpoints(ppc)
     ppc["_setpoints_preverified"] = True
@@ -643,6 +694,7 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
         dc_ppc,
         vbase_maps=vbase_maps,
     )
+    dcac_limits = _extract_dcac_limits_from_rows(effective_rows, dcac, ac_ppc, dc_ppc, vbase_maps=vbase_maps)
     acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
     acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
     acac_objects = list(getattr(ac_network, "acac_converters", []))
@@ -662,6 +714,7 @@ def build_hybrid_ppc_from_efile_rows(file_path, rows):
         "acac_objects": acac_objects,
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
+        "_device_limits": {"dcac": dcac_limits} if dcac_limits else {},
         "_effective_run_state_overrides": overrides,
     }
     sanitize_dcac_voltage_setpoints(ppc)
@@ -679,6 +732,26 @@ def build_hybrid_ppc_from_model(file_path, model):
     dc_network, dc_ppc = _build_dc_ppc_from_model(model, units_already_normalized=True)
     dc_network.ppc = dc_ppc
     dcac, dcac_name, dcac_objects = _build_dcac_with_objects(model)
+    dcac_raw_objs = list(getattr(model, "DCACConverter", []))
+    dcac_limits = _extract_device_limits_from_objects(
+        dcac_raw_objs,
+        extra_alias_map=(
+            ("p_ac_min", ("p_ac_min",)),
+            ("p_ac_max", ("p_ac_max",)),
+            ("p_dc_min", ("p_dc_min",)),
+            ("p_dc_max", ("p_dc_max",)),
+            ("q_ac_min", ("q_ac_min",)),
+            ("q_ac_max", ("q_ac_max",)),
+            ("v_ac_min", ("v_ac_min",)),
+            ("v_ac_max", ("v_ac_max",)),
+            ("v_dc_min", ("v_dc_min",)),
+            ("v_dc_max", ("v_dc_max",)),
+            ("i_ac_min", ("i_ac_min",)),
+            ("i_ac_max", ("i_ac_max",)),
+            ("i_dc_min", ("i_dc_min",)),
+            ("i_dc_max", ("i_dc_max",)),
+        ),
+    )
     acac = ac_ppc.get("acac", _empty(len(ACAC_COLS)))
     acac_name = ac_ppc.get("acac_name", np.asarray([], dtype=object))
     acac_objects = list(getattr(ac_network, "acac_converters", []))
@@ -698,6 +771,7 @@ def build_hybrid_ppc_from_model(file_path, model):
         "acac_objects": acac_objects,
         "dcac_cols": DCAC_COLS,
         "acac_cols": ACAC_COLS,
+        "_device_limits": {"dcac": dcac_limits} if dcac_limits else {},
     }
     sanitize_dcac_voltage_setpoints(ppc)
     network = build_hybrid_model_from_ppc(ppc)

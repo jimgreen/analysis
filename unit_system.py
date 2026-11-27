@@ -184,6 +184,8 @@ def normalize_model_named_units(model) -> float:
     for node in ac_nodes.values():
         _scale_attr_in_dict(node, "vbase", u_scale)
         _scale_voltage_attr(node, "voltage", node, settings)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(node, v_attr, node, settings)
         _angle_deg_to_rad(node, "angle")
     ac_current_scales = {
         node_idx: i_scale * ac_current_base_ka(p_base_kW, float(node.vbase))
@@ -191,12 +193,17 @@ def normalize_model_named_units(model) -> float:
     }
 
     ac_branches = getattr(model, "ACBranch", [])
-    if _any_attr_value(ac_branches, ("i_p", "i_q", "j_p", "j_q", "i_c", "j_c")):
+    if _any_attr_value(
+        ac_branches,
+        ("i_p", "i_q", "j_p", "j_q", "i_c", "j_c", "p_min", "p_max", "q_min", "q_max", "s_max", "rate_a", "rated_capacity", "i_min", "i_max", "rated_current"),
+    ):
         for br in ac_branches:
-            _scale_power_attrs_in_dict(br, ("i_p", "i_q", "j_p", "j_q"), p_base)
+            _scale_power_attrs_in_dict(br, ("i_p", "i_q", "j_p", "j_q", "p_min", "p_max", "q_min", "q_max", "s_max", "rate_a", "rated_capacity"), p_base)
             i_scale_base = ac_current_scales.get(br.i_node)
             if i_scale_base is not None:
                 _scale_attr_in_dict(br, "i_c", i_scale_base)
+                for i_attr in ("i_min", "i_max", "rated_current"):
+                    _scale_attr_in_dict(br, i_attr, i_scale_base)
             j_scale_base = ac_current_scales.get(br.j_node)
             if j_scale_base is not None:
                 _scale_attr_in_dict(br, "j_c", j_scale_base)
@@ -206,10 +213,12 @@ def normalize_model_named_units(model) -> float:
             tr.gt = 0.0
         if not hasattr(tr, "bt") and hasattr(tr, "b"):
             tr.bt = float(tr.b) / 2.0
-        _scale_power_attrs_in_dict(tr, ("i_p", "i_q", "j_p", "j_q"), p_base)
+        _scale_power_attrs_in_dict(tr, ("i_p", "i_q", "j_p", "j_q", "p_min", "p_max", "q_min", "q_max", "s_max", "rate_a", "rated_capacity"), p_base)
         i_scale_base = ac_current_scales.get(tr.i_node)
         if i_scale_base is not None:
             _scale_attr_in_dict(tr, "i_c", i_scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(tr, i_attr, i_scale_base)
         j_scale_base = ac_current_scales.get(tr.j_node)
         if j_scale_base is not None:
             _scale_attr_in_dict(tr, "j_c", j_scale_base)
@@ -220,9 +229,13 @@ def normalize_model_named_units(model) -> float:
     for tr in three_winding_transformers:
         _scale_power_attrs_in_dict(
             tr,
-            ("i_p", "i_q", "j_p", "j_q", "k_p", "k_q"),
+            ("i_p", "i_q", "j_p", "j_q", "k_p", "k_q", "p_min", "p_max", "q_min", "q_max", "s_max", "rate_a", "rated_capacity"),
             p_base,
         )
+        i_scale_base = ac_current_scales.get(getattr(tr, "i_node", None))
+        if i_scale_base is not None:
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(tr, i_attr, i_scale_base)
         for terminal in ("i", "j", "k"):
             scale_base = ac_current_scales.get(getattr(tr, f"{terminal}_node", None))
             if scale_base is not None:
@@ -233,22 +246,31 @@ def normalize_model_named_units(model) -> float:
             load.pbase = 1.0
         if not hasattr(load, "qbase"):
             load.qbase = 1.0
-        _scale_power_attrs_in_dict(load, ("pbase", "qbase", "p", "q"), p_base)
+        _scale_power_attrs_in_dict(load, ("pbase", "qbase", "p", "q", "p_min", "p_max", "q_min", "q_max", "s_max", "rated_capacity"), p_base)
+        node = ac_nodes.get(load.node)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(load, v_attr, node, settings)
         scale_base = ac_current_scales.get(load.node)
         if scale_base is not None:
             _scale_attr_in_dict(load, "current", scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(load, i_attr, scale_base)
 
     for gen in getattr(model, "ACGenerator", []):
         node = ac_nodes.get(gen.node)
         _scale_power_attrs_in_dict(
             gen,
-            ("p_set", "q_set", "p_min", "p_max", "q_min", "q_max", "rated_capacity", "p", "q"),
+            ("p_set", "q_set", "p_min", "p_max", "q_min", "q_max", "s_max", "rated_capacity", "p", "q"),
             p_base,
         )
         _scale_voltage_attr(gen, "v_set", node, settings)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(gen, v_attr, node, settings)
         scale_base = ac_current_scales.get(gen.node)
         if scale_base is not None:
             _scale_attr_in_dict(gen, "current", scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(gen, i_attr, scale_base)
 
     for sc in getattr(model, "ACShuntCompensator", []):
         node = ac_nodes.get(sc.node)
@@ -269,48 +291,63 @@ def normalize_model_named_units(model) -> float:
     for node in dc_nodes.values():
         _scale_attr_in_dict(node, "vbase", u_scale)
         _scale_voltage_attr(node, "voltage", node, settings)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(node, v_attr, node, settings)
     dc_current_scales = {
         node_idx: i_scale * dc_current_base_ka(p_base_kW, float(node.vbase))
         for node_idx, node in dc_nodes.items()
     }
 
     dc_branches = getattr(model, "DCBranch", [])
-    if _any_attr_value(dc_branches, ("i_p", "j_p", "current")):
+    if _any_attr_value(dc_branches, ("i_p", "j_p", "current", "p_min", "p_max", "s_max", "rated_capacity", "i_min", "i_max", "rated_current")):
         for br in dc_branches:
-            _scale_power_attrs_in_dict(br, ("i_p", "j_p"), p_base)
+            _scale_power_attrs_in_dict(br, ("i_p", "j_p", "p_min", "p_max", "s_max", "rated_capacity"), p_base)
             scale_base = dc_current_scales.get(br.i_node)
             if scale_base is not None:
                 _scale_attr_in_dict(br, "current", scale_base)
+                for i_attr in ("i_min", "i_max", "rated_current"):
+                    _scale_attr_in_dict(br, i_attr, scale_base)
 
     for load in getattr(model, "DCLoad", []):
         if not hasattr(load, "pbase"):
             load.pbase = 1.0
-        _scale_power_attrs_in_dict(load, ("pbase", "p"), p_base)
+        _scale_power_attrs_in_dict(load, ("pbase", "p", "p_min", "p_max", "s_max", "rated_capacity"), p_base)
+        node = dc_nodes.get(load.node)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(load, v_attr, node, settings)
         scale_base = dc_current_scales.get(load.node)
         if scale_base is not None:
             _scale_attr_in_dict(load, "current", scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(load, i_attr, scale_base)
 
     for gen in getattr(model, "DCGenerator", []):
         node = dc_nodes.get(gen.node)
-        _scale_power_attrs_in_dict(gen, ("p_set", "p_min", "p_max", "rated_capacity", "p"), p_base)
+        _scale_power_attrs_in_dict(gen, ("p_set", "p_min", "p_max", "s_max", "rated_capacity", "p"), p_base)
         _scale_voltage_attr(gen, "v_set", node, settings)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(gen, v_attr, node, settings)
         scale_base = dc_current_scales.get(gen.node)
         if scale_base is not None:
             _scale_attr_in_dict(gen, "i_set", scale_base)
             _scale_attr_in_dict(gen, "current", scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(gen, i_attr, scale_base)
 
     dc_zero_switches = [*getattr(model, "DCZeroBranch", []), *getattr(model, "DCSwitch", [])]
-    if _any_attr_value(dc_zero_switches, ("p", "current")):
+    if _any_attr_value(dc_zero_switches, ("p", "current", "p_min", "p_max", "i_min", "i_max", "rated_current")):
         for dev in dc_zero_switches:
-            _scale_power_attrs_in_dict(dev, ("p",), p_base)
+            _scale_power_attrs_in_dict(dev, ("p", "p_min", "p_max"), p_base)
             scale_base = dc_current_scales.get(dev.i_node)
             if scale_base is not None:
                 _scale_attr_in_dict(dev, "current", scale_base)
+                for i_attr in ("i_min", "i_max", "rated_current"):
+                    _scale_attr_in_dict(dev, i_attr, scale_base)
 
     for conv in getattr(model, "DCDCConverter", []):
         i_node = dc_nodes.get(conv.i_node)
         j_node = dc_nodes.get(conv.j_node)
-        _scale_power_attrs_in_dict(conv, ("p_set", "i_p", "j_p"), p_base)
+        _scale_power_attrs_in_dict(conv, ("p_set", "i_p", "j_p", "p_min", "p_max", "s_max", "rated_capacity"), p_base)
         i_ctrl = str(getattr(conv, "i_control_type", "") or "").upper()
         j_ctrl = str(getattr(conv, "j_control_type", "") or "").upper()
         if not i_ctrl and not j_ctrl:
@@ -324,10 +361,14 @@ def normalize_model_named_units(model) -> float:
         j_ctrl = _DCDC_TERMINAL_CONTROL_ALIASES.get(j_ctrl, j_ctrl)
         v_node = j_node if j_ctrl == "V" and i_ctrl == "NONE" else i_node
         _scale_voltage_attr(conv, "v_set", v_node, settings)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(conv, v_attr, i_node, settings)
         i_scale_base = dc_current_scales.get(conv.i_node)
         if i_scale_base is not None:
             _scale_attr_in_dict(conv, "i_set", i_scale_base)
             _scale_attr_in_dict(conv, "i_c", i_scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(conv, i_attr, i_scale_base)
         j_scale_base = dc_current_scales.get(conv.j_node)
         if j_scale_base is not None:
             _scale_attr_in_dict(conv, "j_c", j_scale_base)
@@ -337,27 +378,39 @@ def normalize_model_named_units(model) -> float:
         dc_node = dc_nodes.get(conv.dc_node)
         _scale_power_attrs_in_dict(
             conv,
-            ("p_ac_set", "p_dc_set", "q_ac_set", "dc_p", "ac_p", "ac_q"),
+            ("p_ac_set", "p_dc_set", "q_ac_set", "dc_p", "ac_p", "ac_q", "p_min", "p_max", "p_ac_min", "p_ac_max", "p_dc_min", "p_dc_max", "q_min", "q_max", "q_ac_min", "q_ac_max", "s_max", "rated_capacity"),
             p_base,
         )
         _scale_voltage_attr(conv, "v_ac_set", ac_node, settings)
         _scale_voltage_attr(conv, "v_dc_set", dc_node, settings)
+        for v_attr in ("v_ac_min", "v_ac_max"):
+            _scale_voltage_attr(conv, v_attr, ac_node, settings)
+        for v_attr in ("v_dc_min", "v_dc_max"):
+            _scale_voltage_attr(conv, v_attr, dc_node, settings)
         dc_scale_base = dc_current_scales.get(conv.dc_node)
         if dc_scale_base is not None:
             _scale_attr_in_dict(conv, "dc_i", dc_scale_base)
+            for i_attr in ("i_dc_min", "i_dc_max"):
+                _scale_attr_in_dict(conv, i_attr, dc_scale_base)
         ac_scale_base = ac_current_scales.get(conv.ac_node)
         if ac_scale_base is not None:
             _scale_attr_in_dict(conv, "ac_i", ac_scale_base)
+            for i_attr in ("i_ac_min", "i_ac_max", "i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(conv, i_attr, ac_scale_base)
 
     for conv in getattr(model, "ACACConverter", []):
         i_node = ac_nodes.get(conv.i_node)
         j_node = ac_nodes.get(conv.j_node)
-        _scale_power_attrs_in_dict(conv, ("p_set", "i_q_set", "j_q_set", "i_p", "i_q", "j_p", "j_q"), p_base)
+        _scale_power_attrs_in_dict(conv, ("p_set", "i_q_set", "j_q_set", "i_p", "i_q", "j_p", "j_q", "p_min", "p_max", "q_min", "q_max", "s_max", "rated_capacity"), p_base)
         _scale_voltage_attr(conv, "i_v_set", i_node, settings)
         _scale_voltage_attr(conv, "j_v_set", j_node, settings)
+        for v_attr in ("v_min", "v_max", "vmin", "vmax"):
+            _scale_voltage_attr(conv, v_attr, i_node, settings)
         i_scale_base = ac_current_scales.get(conv.i_node)
         if i_scale_base is not None:
             _scale_attr_in_dict(conv, "i_i", i_scale_base)
+            for i_attr in ("i_min", "i_max", "rated_current"):
+                _scale_attr_in_dict(conv, i_attr, i_scale_base)
         j_scale_base = ac_current_scales.get(conv.j_node)
         if j_scale_base is not None:
             _scale_attr_in_dict(conv, "j_i", j_scale_base)

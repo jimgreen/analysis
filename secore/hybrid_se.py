@@ -4426,6 +4426,104 @@ class HybridStateEstimator:
         if scaled_correction < self.tol:
             converged = True
 
+        # 多能流体子系统零注入流量守恒增广拉格朗日（ALM）精修：消除跨能域高权重压力噪声对零注入节点的牵拉
+        if converged and me_zi_local.size > 0:
+            f_ref_me = 1.0
+            for fk_a, fest_a in self.fluid_estimators.items():
+                sl_a = self.fluid_state_slices.get(fk_a)
+                if sl_a is not None:
+                    _, fl_a, _ = fest_a._flow_state_arrays(x[sl_a], need_derivative=False)
+                    if fl_a.size:
+                        f_ref_me = max(f_ref_me, float(np.max(np.abs(fl_a))))
+            best_me_zi = float(np.max(np.abs(residual[me_zi_local])))
+            if np.isfinite(best_me_zi) and best_me_zi > 1.0e-5 * f_ref_me:
+                me_a_min = float(self.angle_min_rad)
+                me_a_max = float(self.angle_max_rad)
+
+                def _me_cand_valid(c_vec: np.ndarray) -> bool:
+                    if not np.all(np.isfinite(c_vec)):
+                        return False
+                    if me_v_cols.size:
+                        vp = c_vec[me_v_cols]
+                        if float(vp.min()) < me_v_min or float(vp.max()) > me_v_max:
+                            return False
+                    if me_a_cols.size:
+                        ap = c_vec[me_a_cols]
+                        if float(ap.min()) < me_a_min or float(ap.max()) > me_a_max:
+                            return False
+                    for fk_c, fest_c in self.fluid_estimators.items():
+                        sl_c = self.fluid_state_slices.get(fk_c)
+                        if sl_c is not None and fest_c.n_potential > 0:
+                            if np.any(c_vec[sl_c][: fest_c.n_potential] < 1.0e-12):
+                                return False
+                    return True
+
+                # 采用 Hestenes-Powell 乘子偏置向量 lambda_shift（满足 z_shifted = z + lambda_shift）
+                x_me_alm = x.copy()
+                ze_me_alm = z_est.copy()
+                res_me_true = residual.copy()
+                lambda_shift = np.zeros(me_zi_local.size, dtype=np.float64)
+                cand_res_buf = np.empty_like(residual)
+                for _alm_o in range(3):
+                    cur_zi_err = float(np.max(np.abs(res_me_true[me_zi_local])))
+                    if cur_zi_err <= 5.0e-6 * f_ref_me:
+                        break
+                    lambda_shift = lambda_shift + res_me_true[me_zi_local]
+                    for _alm_i in range(3):
+                        res_alm_me = res_me_true.copy()
+                        res_alm_me[me_zi_local] += lambda_shift
+                        obj_alm_me = self._weighted_objective(weight, res_alm_me)
+                        H_alm_me = self._multi_energy_jacobian_sparse(x_me_alm)[rows]
+                        dx_alm_me = None
+                        for beta_m in (0.0, 1e-5, 1e-3):
+                            try:
+                                dx_try_m, _, _ = _solve_me_step(H_alm_me, res_alm_me, beta_m)
+                                if dx_try_m is not None and dx_try_m.size == n_me_state and np.all(np.isfinite(dx_try_m)):
+                                    dx_alm_me = dx_try_m
+                                    break
+                            except Exception:
+                                continue
+                        if dx_alm_me is None:
+                            break
+                        if float(np.max(np.abs(dx_alm_me) / np.maximum(me_state_scales, 1.0))) < 1.0e-8:
+                            break
+                        s_me = 1.0
+                        ok_me = False
+                        for _ls_m in range(10):
+                            cand_m = x_me_alm + s_me * dx_alm_me
+                            if not _me_cand_valid(cand_m):
+                                s_me *= 0.5
+                                continue
+                            cand_ze_m = self._evaluate_multi_energy(cand_m)[rows]
+                            if not np.all(np.isfinite(cand_ze_m)):
+                                s_me *= 0.5
+                                continue
+                            self._multi_energy_measurement_residual(cand_ze_m, measurement_rows=rows, out=cand_res_buf)
+                            cand_ra_m = cand_res_buf.copy()
+                            cand_ra_m[me_zi_local] += lambda_shift
+                            cand_oa_m = self._weighted_objective(weight, cand_ra_m)
+                            if np.isfinite(cand_oa_m) and cand_oa_m <= obj_alm_me * (1.0 + 1e-11) + 1e-12:
+                                x_me_alm = cand_m
+                                ze_me_alm = cand_ze_m
+                                res_me_true = cand_res_buf.copy()
+                                ok_me = True
+                                break
+                            s_me *= 0.5
+                        if not ok_me:
+                            break
+                    new_me_zi = float(np.max(np.abs(res_me_true[me_zi_local])))
+                    if np.isfinite(new_me_zi) and new_me_zi < best_me_zi:
+                        best_me_zi = new_me_zi
+                        x = x_me_alm.copy()
+                        z_est[:] = ze_me_alm
+                        residual[:] = res_me_true
+                        objective = self._weighted_objective(weight, residual)
+                        residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+                        evaluated_at_final_x = False
+                        last_used_damping = max(last_used_damping, 1e-6)
+                    else:
+                        break
+
         # 若未在最终点求雅可比且需要诊断，则在最终点补求 H 与 gain（无阻尼收敛时直接复用 aat 因子）
         if not evaluated_at_final_x:
             if final_diagnostics or H is None:
@@ -6787,14 +6885,32 @@ class HybridStateEstimator:
                 where=np.abs(scale[active]) > 1e-12,
             )
 
-        from secore.meas_prefilter import prefilter_electric_measurements
+        from secore.meas_prefilter import (
+            build_hybrid_dcac_device_limits_lookup,
+            prefilter_electric_measurements,
+        )
 
+        net_obj = getattr(self, "network", None)
+        hybrid_ppc = getattr(net_obj, "ppc", None)
+        ac_ppc = getattr(net_obj, "_ac_ppc", None)
+        if ac_ppc is None and getattr(self, "_ac_sub_estimator", None) is not None:
+            ac_ppc = self._ac_sub_estimator._ac_ppc_dict()
+        dc_ppc = getattr(net_obj, "_dc_ppc", None)
+        if dc_ppc is None and getattr(self, "_dc_sub_estimator", None) is not None:
+            dc_ppc = self._dc_sub_estimator._dc_ppc_dict()
+        dcac_device_limits = build_hybrid_dcac_device_limits_lookup(
+            hybrid_ppc,
+            ac_ppc,
+            dc_ppc,
+            getattr(self, "dcac_converters", ()),
+        )
         prefilter_electric_measurements(
             table,
             self.params,
             raw_values=table.value,
             dead_power_scale=float(self._power_file_base()),
             side="hybrid",
+            device_limits_lookup=dcac_device_limits,
         )
         object_count = list.__len__(measurements) if isinstance(measurements, list) else 0
         if object_count == table.value.size and object_count > 0:
@@ -11244,6 +11360,40 @@ class HybridStateEstimator:
         a_min_bound = float(self.angle_min_rad)
         a_max_bound = float(self.angle_max_rad)
 
+        def _hybrid_dx_needs_lm_guard(dx_vec: np.ndarray, *, strict_step: bool = True) -> bool:
+            """判断交直流混合无阻尼步是否非有限或幅值剧烈过冲；健康幅值的贴墙跨界交由线搜索与活跃集投影处理。"""
+            if dx_vec.size == 0:
+                return False
+            if not np.all(np.isfinite(dx_vec)):
+                return True
+            if v_cols.size:
+                dv_slice = dx_vec[v_cols]
+                max_dv = float(np.max(np.abs(dv_slice)))
+                if max_dv > (0.50 if strict_step else 1.2):
+                    return True
+            if a_cols.size:
+                da_slice = dx_vec[a_cols]
+                max_da = float(np.max(np.abs(da_slice)))
+                if max_da > (1.0 if strict_step else 2.0):
+                    return True
+            return False
+
+        def _hybrid_state_out_of_bounds(state_vec: np.ndarray) -> bool:
+            """检查交直流混合电网电压标幺值与交流相角是否超出物理允许范围。"""
+            if v_cols.size:
+                v_part = state_vec[v_cols]
+                if not np.all(np.isfinite(v_part)):
+                    return True
+                if float(v_part.min()) < v_min_bound or float(v_part.max()) > v_max_bound:
+                    return True
+            if a_cols.size:
+                a_part = state_vec[a_cols]
+                if not np.all(np.isfinite(a_part)):
+                    return True
+                if float(a_part.min()) < a_min_bound or float(a_part.max()) > a_max_bound:
+                    return True
+            return False
+
         if (not self.flat_start) and (x0 is None):
             severe_hyb_warm = False
             if v_cols.size:
@@ -11267,7 +11417,7 @@ class HybridStateEstimator:
                         obj_hw = float(np.dot(w_hm, residual[real_hm] * residual[real_hm]))
                         obj_hf = float(np.dot(w_hm, cand_residual[real_hm] * cand_residual[real_hm]))
                         q75_hw = float(np.percentile(np.sqrt(w_hm) * np.abs(residual[real_hm]), 75))
-                        q75_hf = float(np.percentile(np.sqrt(w_hm) * np.abs(cand_residual[real_hm]), 75))
+                        q75_hf = float(np.percentile(np.sqrt(w_hm) * np.sqrt(1.0) * np.abs(cand_residual[real_hm]), 75))
                         if np.isfinite(obj_hf) and (
                             (obj_hw > 10.0 * max(obj_hf, 1.0) and obj_hw > 1.0e3)
                             or (q75_hw > 2.5 * max(q75_hf, 1.0) and q75_hw > 8.0)
@@ -11337,40 +11487,6 @@ class HybridStateEstimator:
             if len(parts) == 1:
                 return parts[0], True
             return hstack(parts, format="csc"), True
-
-        def _hybrid_dx_needs_lm_guard(dx_vec: np.ndarray, *, strict_step: bool = True) -> bool:
-            """判断交直流混合无阻尼步是否非有限或幅值剧烈过冲；健康幅值的贴墙跨界交由线搜索与活跃集投影处理。"""
-            if dx_vec.size == 0:
-                return False
-            if not np.all(np.isfinite(dx_vec)):
-                return True
-            if v_cols.size:
-                dv_slice = dx_vec[v_cols]
-                max_dv = float(np.max(np.abs(dv_slice)))
-                if max_dv > (0.50 if strict_step else 1.2):
-                    return True
-            if a_cols.size:
-                da_slice = dx_vec[a_cols]
-                max_da = float(np.max(np.abs(da_slice)))
-                if max_da > (1.0 if strict_step else 2.0):
-                    return True
-            return False
-
-        def _hybrid_state_out_of_bounds(state_vec: np.ndarray) -> bool:
-            """检查交直流混合电网电压标幺值与交流相角是否超出物理允许范围。"""
-            if v_cols.size:
-                v_part = state_vec[v_cols]
-                if not np.all(np.isfinite(v_part)):
-                    return True
-                if float(v_part.min()) < v_min_bound or float(v_part.max()) > v_max_bound:
-                    return True
-            if a_cols.size:
-                a_part = state_vec[a_cols]
-                if not np.all(np.isfinite(a_part)):
-                    return True
-                if float(a_part.min()) < a_min_bound or float(a_part.max()) > a_max_bound:
-                    return True
-            return False
 
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
@@ -11700,6 +11816,7 @@ class HybridStateEstimator:
                         self._dump_iteration_matrices(iteration, H, weight, gain)
                     start = time.perf_counter() if self.profile_enabled else None
                     cur_rhs_inf = float(np.max(np.abs(rhs))) if rhs.size else 0.0
+                    step_damping = float(force_lm_damping)
                     solve_gain = gain
                     if solve_gain is not None:
                         V_curv, has_any_curv = _build_hybrid_curvature_matrix(x)
@@ -11711,7 +11828,75 @@ class HybridStateEstimator:
                                 else (solve_gain + curv_term.toarray())
                             )
                             used_sw_curv = True
-                    dx, normal_factor_diag = normal_solver.solve(solve_gain, rhs, return_factor_diag=final_diagnostics)
+                    pinned_cols = detect_active_box_pinned_cols(
+                        x, rhs, v_cols, v_min_bound, v_max_bound, margin=1e-4
+                    )
+                    if pinned_cols.size > 0 and solve_gain is not None:
+                        dx_pin, pin_ok = solve_box_pinned_normal_equations(
+                            None,
+                            solve_gain,
+                            rhs,
+                            pinned_cols,
+                            damping=step_damping,
+                            solver_cache=box_pin_cache,
+                        )
+                        if pin_ok and step_damping == 0.0 and _hybrid_dx_needs_lm_guard(dx_pin, strict_step=True):
+                            for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                                dx_lm, lm_ok = solve_box_pinned_normal_equations(
+                                    None,
+                                    solve_gain,
+                                    rhs,
+                                    pinned_cols,
+                                    damping=beta_try,
+                                    solver_cache=box_pin_cache,
+                                )
+                                if lm_ok:
+                                    dx_pin = dx_lm
+                                    step_damping = beta_try
+                                    if not _hybrid_dx_needs_lm_guard(dx_pin, strict_step=False):
+                                        break
+                        if not pin_ok:
+                            for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                                dx_lm, lm_ok = solve_box_pinned_normal_equations(
+                                    None,
+                                    solve_gain,
+                                    rhs,
+                                    pinned_cols,
+                                    damping=beta_try,
+                                    solver_cache=box_pin_cache,
+                                )
+                                if lm_ok:
+                                    dx_pin = dx_lm
+                                    pin_ok = True
+                                    step_damping = beta_try
+                                    break
+                        if pin_ok:
+                            dx = dx_pin
+                            normal_factor_diag = None
+                            used_box_pin_step = True
+                        else:
+                            pinned_cols = np.empty(0, dtype=np.intp)
+                    if not used_box_pin_step:
+                        dx, normal_factor_diag = normal_solver.solve(
+                            solve_gain,
+                            rhs,
+                            return_factor_diag=final_diagnostics,
+                            damping=step_damping,
+                        )
+                        if step_damping == 0.0 and _hybrid_dx_needs_lm_guard(dx, strict_step=True):
+                            for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                                dx_lm, diag_lm = normal_solver.solve(
+                                    solve_gain,
+                                    rhs,
+                                    return_factor_diag=final_diagnostics,
+                                    damping=beta_try,
+                                )
+                                if dx_lm.size == dx.size and np.all(np.isfinite(dx_lm)):
+                                    dx = dx_lm
+                                    normal_factor_diag = diag_lm
+                                    step_damping = beta_try
+                                    if not _hybrid_dx_needs_lm_guard(dx, strict_step=False):
+                                        break
                     if start is not None:
                         self._record_profile_time("solve.linear_solve", time.perf_counter() - start)
                     if dx.size and not np.all(np.isfinite(dx)):
@@ -11904,9 +12089,13 @@ class HybridStateEstimator:
                         frozen_fail_count += 1
                         frozen_steps = max(scale_profile.frozen_max_steps, scale_profile.local_warm_frozen_max_steps)
                     continue
-                if force_lm_damping < 100.0 and solved_via_aat and aat_solver is not None:
+                if force_lm_damping < 100.0 and ((solved_via_aat and aat_solver is not None) or gain is not None):
                     if curvature_damping_active and step_damping > 0.0:
-                        step_solver_lm = box_pin_cache.get("solver") if used_box_pin_step else aat_solver
+                        step_solver_lm = (
+                            box_pin_cache.get("solver")
+                            if used_box_pin_step
+                            else (aat_solver if solved_via_aat else normal_solver)
+                        )
                         diag_reg_lm = (
                             step_solver_lm.unregularized_diagonal()
                             if (step_solver_lm is not None and bool(getattr(step_solver_lm, "_last_factor_scaled", False)))
@@ -11942,13 +12131,15 @@ class HybridStateEstimator:
                 # 确认已到达局部极小驻点并优雅收敛
                 if (
                     not _hybrid_state_out_of_bounds(x)
-                    and max_correction <= 5e-2
+                    and max_correction <= 5e-3
                     and rhs is not None
                     and rhs.size > 0
                 ):
                     diag_g_st = aat_solver.unregularized_diagonal() if (solved_via_aat and aat_solver is not None) else None
                     if diag_g_st is None and solved_via_aat and normal_operand is not None:
                         diag_g_st = np.asarray(normal_operand.power(2).sum(axis=1), dtype=np.float64).ravel()
+                    if diag_g_st is None and gain is not None:
+                        diag_g_st = np.asarray(gain.diagonal() if is_sparse_matrix(gain) else np.diag(gain), dtype=np.float64).ravel()
                     if diag_g_st is not None and diag_g_st.size == rhs.size:
                         eff_rhs_st = rhs.copy()
                         if v_cols.size:
@@ -11964,7 +12155,7 @@ class HybridStateEstimator:
                             va_g_st = max(va_g_st, float(np.max(scaled_vec_st[v_cols])))
                         if a_cols.size:
                             va_g_st = max(va_g_st, float(np.max(scaled_vec_st[a_cols])))
-                        if va_g_st <= max(5e-3, 5000.0 * self.tol):
+                        if va_g_st <= max(5e-4, 500.0 * self.tol):
                             converged = True
                 final_quantities_current = factor_is_current_weights
                 if verbose:
@@ -12034,7 +12225,7 @@ class HybridStateEstimator:
                 step_solver_lm = (
                     box_pin_cache.get("solver")
                     if used_box_pin_step
-                    else ((curv_aat_solver if used_sw_curv else aat_solver) if solved_via_aat else None)
+                    else ((curv_aat_solver if used_sw_curv else aat_solver) if solved_via_aat else normal_solver)
                 )
                 diag_reg_lm = (
                     step_solver_lm.unregularized_diagonal()
@@ -12080,7 +12271,7 @@ class HybridStateEstimator:
                 fullstep_osc_streak = 0
                 if accepted_step < 0.05 and objective_change <= max(1e-12, 1e-4 * (abs(previous_objective) + 1.0)):
                     slow_micro_streak += 1
-                    if slow_micro_streak >= 10 and solved_via_aat and aat_solver is not None:
+                    if slow_micro_streak >= 10 and ((solved_via_aat and aat_solver is not None) or gain is not None):
                         micro_cap = 100.0 if float(force_lm_damping) >= 9.9 else 10.0
                         force_lm_damping = min(micro_cap, max(float(force_lm_damping) * 5.0, 1.0))
                         curvature_damping_active = True
@@ -12090,7 +12281,7 @@ class HybridStateEstimator:
                 else:
                     slow_micro_streak = 0
                 backtrack_streak += 4
-                if backtrack_streak >= 12 and solved_via_aat and aat_solver is not None:
+                if backtrack_streak >= 12 and ((solved_via_aat and aat_solver is not None) or gain is not None):
                     if force_lm_damping < 10.0:
                         hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                         force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
@@ -12112,7 +12303,7 @@ class HybridStateEstimator:
                         and objective_change <= 1e-3 * (abs(previous_objective) + 1.0)
                     ):
                         fullstep_osc_streak += 1
-                        if fullstep_osc_streak >= 4 and solved_via_aat and aat_solver is not None:
+                        if fullstep_osc_streak >= 4 and ((solved_via_aat and aat_solver is not None) or gain is not None):
                             hint_base = min(2.0, max(0.1, float(_hint_lm_damping))) if float(_hint_lm_damping) > 0.0 else 0.1
                             force_lm_damping = min(10.0, max(force_lm_damping * 5.0, hint_base))
                             curvature_damping_active = True

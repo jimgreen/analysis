@@ -22,6 +22,16 @@ from model.meas_model import (
     measurement_table_status_code,
 )
 from model.meas_type import (
+    DEVICE_TYPE_ACACConverter,
+    DEVICE_TYPE_ACBranch,
+    DEVICE_TYPE_ACBreak,
+    DEVICE_TYPE_ACGenerator,
+    DEVICE_TYPE_ACLoad,
+    DEVICE_TYPE_ACNode,
+    DEVICE_TYPE_ACSwitch,
+    DEVICE_TYPE_ACThreeWindingTransformer,
+    DEVICE_TYPE_ACTransformer,
+    DEVICE_TYPE_ACZeroBranch,
     DEVICE_TYPE_DCACConverter,
     DEVICE_TYPE_DCBranch,
     DEVICE_TYPE_DCBreak,
@@ -35,6 +45,13 @@ from model.meas_type import (
     DEVICE_TYPE_DCZeroBranch,
     DEVICE_TYPE_DCZeroBranchConstraint,
     MEAS_TYPE_CODES,
+    MEAS_TYPE_ENTHALPY,
+    MEAS_TYPE_FLOW,
+    MEAS_TYPE_FLOW_FROM,
+    MEAS_TYPE_FLOW_TO,
+    MEAS_TYPE_H_FROM,
+    MEAS_TYPE_H_TO,
+    MEAS_TYPE_HEAT,
     MEAS_TYPE_I_AC,
     MEAS_TYPE_I_DC,
     MEAS_TYPE_I_FROM,
@@ -51,12 +68,24 @@ from model.meas_type import (
     MEAS_TYPE_P_OUT,
     MEAS_TYPE_P_THIRD,
     MEAS_TYPE_P_TO,
+    MEAS_TYPE_PRESSURE,
+    MEAS_TYPE_PRESSURE_FROM,
+    MEAS_TYPE_PRESSURE_TO,
     MEAS_TYPE_Q_AC,
     MEAS_TYPE_Q_FROM,
     MEAS_TYPE_Q_GEN,
     MEAS_TYPE_Q_LOAD,
     MEAS_TYPE_Q_THIRD,
     MEAS_TYPE_Q_TO,
+    MEAS_TYPE_T_FROM,
+    MEAS_TYPE_T_RETURN,
+    MEAS_TYPE_T_SUPPLY,
+    MEAS_TYPE_T_TO,
+    MEAS_TYPE_TEMPERATURE,
+    MEAS_TYPE_TR_FROM,
+    MEAS_TYPE_TR_TO,
+    MEAS_TYPE_TS_FROM,
+    MEAS_TYPE_TS_TO,
     MEAS_TYPE_V,
     MEAS_TYPE_V_AC,
     MEAS_TYPE_V_DC,
@@ -83,6 +112,7 @@ REASON_FLOW_OUT_OF_RANGE = "flow_out_of_range"
 REASON_TEMPERATURE_OUT_OF_RANGE = "temperature_out_of_range"
 REASON_ENTHALPY_OUT_OF_RANGE = "enthalpy_out_of_range"
 REASON_HEAT_OUT_OF_RANGE = "heat_out_of_range"
+REASON_DEVICE_LIMIT_EXCEEDED = "device_limit_exceeded"
 
 
 _ELECTRIC_VOLTAGE_CODES = np.asarray(
@@ -198,6 +228,160 @@ def _check_bounds_violation(
     return violated
 
 
+def resolve_device_limit_factor(params: object) -> Optional[float]:
+    """解析设备状态限值预过滤系数；开关关闭或配置为 None / <=0 时返回 None（表示关闭）。"""
+    if params is None:
+        return 2.0
+    if not bool(getattr(params, "enable_measurement_prefilter", True)):
+        return None
+    if not bool(getattr(params, "enable_device_limit_prefilter", True)):
+        return None
+    raw = getattr(params, "prefilter_device_limit_factor", 2.0)
+    if raw is None:
+        return None
+    val = float(raw)
+    if not math.isfinite(val) or val <= 0.0:
+        return None
+    return max(val, 1.0)
+
+
+def check_device_bounds_violation(
+    values: np.ndarray,
+    lower: Optional[np.ndarray],
+    upper: Optional[np.ndarray],
+    factor: float,
+    *,
+    symmetric_upper: bool = False,
+) -> np.ndarray:
+    """向量化判定量测值是否大幅超出设备对应状态限值区间 [lower, upper]。
+
+    规则（``k = max(factor, 1.0)``）：
+    1. 双侧均有限且 ``lo <= hi``（跳过 ``lo == hi == 0`` 占位）：
+       ``span = hi - lo``（若 ``span <= 1e-12`` 取 ``max(|lo|, |hi|)``），
+       允许闭区间 ``[lo - (k - 1) * span, hi + (k - 1) * span]``；
+    2. 仅上限有限且 ``|hi| > 1e-12``：
+       - 若 ``symmetric_upper=True`` 且 ``hi > 0``（双向功率/直流电流/双向流量额定上限），
+         允许 ``[-k * hi, k * hi]``；
+       - 否则仅检查上界 ``val > (k * hi if hi > 0 else hi + (k - 1) * |hi|)``；
+    3. 仅下限有限且 ``|lo| > 1e-12``：
+       仅检查下界 ``val < (k * lo if lo < 0 else lo / k)``。
+    """
+    vals = np.asarray(values, dtype=np.float64)
+    n = int(vals.size)
+    violated = np.zeros(n, dtype=bool)
+    if n == 0 or (lower is None and upper is None):
+        return violated
+    k = max(float(factor), 1.0)
+    lo = np.full(n, np.nan, dtype=np.float64) if lower is None else np.asarray(lower, dtype=np.float64)
+    hi = np.full(n, np.nan, dtype=np.float64) if upper is None else np.asarray(upper, dtype=np.float64)
+    has_lo = np.isfinite(lo)
+    has_hi = np.isfinite(hi)
+
+    both = has_lo & has_hi & (lo <= hi + 1e-12)
+    if np.any(both):
+        lo_b = lo[both]
+        hi_b = hi[both]
+        val_b = vals[both]
+        non_placeholder = (np.abs(lo_b) > 1e-12) | (np.abs(hi_b) > 1e-12)
+        if np.any(non_placeholder):
+            span = hi_b - lo_b
+            degenerate = span <= 1e-12
+            if np.any(degenerate):
+                span = np.where(degenerate, np.maximum(np.abs(lo_b), np.abs(hi_b)), span)
+            margin = (k - 1.0) * span
+            lo_eff = lo_b - margin
+            hi_eff = hi_b + margin
+            bad_b = non_placeholder & ((val_b < lo_eff) | (val_b > hi_eff))
+            if np.any(bad_b):
+                violated[np.flatnonzero(both)[bad_b]] = True
+
+    only_hi = (~has_lo) & has_hi & (np.abs(hi) > 1e-12)
+    if np.any(only_hi):
+        hi_o = hi[only_hi]
+        val_o = vals[only_hi]
+        hi_eff = np.where(hi_o > 0.0, k * hi_o, hi_o + (k - 1.0) * np.abs(hi_o))
+        if symmetric_upper:
+            pos_hi = hi_o > 0.0
+            bad_o = np.where(pos_hi, (val_o < -k * hi_o) | (val_o > hi_eff), val_o > hi_eff)
+        else:
+            bad_o = val_o > hi_eff
+        if np.any(bad_o):
+            violated[np.flatnonzero(only_hi)[bad_o]] = True
+
+    only_lo = has_lo & (~has_hi) & (np.abs(lo) > 1e-12)
+    if np.any(only_lo):
+        lo_o = lo[only_lo]
+        val_o = vals[only_lo]
+        lo_eff = np.where(lo_o < 0.0, k * lo_o, lo_o / k)
+        bad_o = val_o < lo_eff
+        if np.any(bad_o):
+            violated[np.flatnonzero(only_lo)[bad_o]] = True
+
+    return violated
+
+
+def _apply_device_limits_lookup(
+    *,
+    values: np.ndarray,
+    processable: np.ndarray,
+    dt_code: np.ndarray,
+    mt_code: np.ndarray,
+    device_pos: Optional[np.ndarray],
+    device_limits_lookup: Optional[Mapping[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]],
+    factor: Optional[float],
+) -> np.ndarray:
+    """按 (device_type_code, meas_type_code) 查找表批量执行设备状态限值越限检查，返回越限布尔掩码。"""
+    n_rows = int(values.size)
+    exceeded = np.zeros(n_rows, dtype=bool)
+    if (
+        n_rows == 0
+        or factor is None
+        or not device_limits_lookup
+        or device_pos is None
+        or not np.any(processable)
+    ):
+        return exceeded
+    dpos = np.asarray(device_pos, dtype=np.int64)
+    if int(dpos.size) != n_rows:
+        return exceeded
+    base_mask = processable & (dpos >= 0)
+    if not np.any(base_mask):
+        return exceeded
+
+    for (dt_k, mt_k), (lo_vec, hi_vec, sym_upper) in device_limits_lookup.items():
+        if lo_vec is None and hi_vec is None:
+            continue
+        sel = base_mask & (dt_code == int(dt_k)) & (mt_code == int(mt_k))
+        if not np.any(sel):
+            continue
+        rows = np.flatnonzero(sel)
+        pos_sel = dpos[rows]
+        lo_vals = None
+        hi_vals = None
+        if lo_vec is not None:
+            lo_arr = np.asarray(lo_vec, dtype=np.float64)
+            lo_vals = np.full(rows.size, np.nan, dtype=np.float64)
+            ok_lo = pos_sel < int(lo_arr.size)
+            if np.any(ok_lo):
+                lo_vals[ok_lo] = lo_arr[pos_sel[ok_lo].astype(np.intp, copy=False)]
+        if hi_vec is not None:
+            hi_arr = np.asarray(hi_vec, dtype=np.float64)
+            hi_vals = np.full(rows.size, np.nan, dtype=np.float64)
+            ok_hi = pos_sel < int(hi_arr.size)
+            if np.any(ok_hi):
+                hi_vals[ok_hi] = hi_arr[pos_sel[ok_hi].astype(np.intp, copy=False)]
+        bad = check_device_bounds_violation(
+            values[rows],
+            lo_vals,
+            hi_vals,
+            factor,
+            symmetric_upper=bool(sym_upper),
+        )
+        if np.any(bad):
+            exceeded[rows[bad]] = True
+    return exceeded
+
+
 def ensure_prefilter_reason_array(table: MeasurementTable) -> np.ndarray:
     """获取或初始化与 MeasurementTable 等长的逐行预过滤原因数组。"""
     n_rows = int(np.asarray(table.idx).size)
@@ -294,6 +478,7 @@ def prefilter_electric_measurements(
     side: str = "ac",
     row_subset_mask: Optional[np.ndarray] = None,
     reasons: Optional[np.ndarray] = None,
+    device_limits_lookup: Optional[Mapping[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """对电侧（AC / DC / Hybrid）标幺化后量测表执行统一预过滤。
 
@@ -508,6 +693,25 @@ def prefilter_electric_measurements(
                     set_prefilter_reasons(reasons, bad_mask, REASON_CURRENT_OUT_OF_RANGE)
                     processable[bad_rows] = False
 
+    # 6. 规则六：设备状态限值超倍预过滤（超过设备对应上下限区间系数则置为设备越限排除）
+    dev_limit_factor = resolve_device_limit_factor(params)
+    if dev_limit_factor is not None and device_limits_lookup and np.any(processable):
+        dev_exceeded = _apply_device_limits_lookup(
+            values=value,
+            processable=processable,
+            dt_code=dt_code,
+            mt_code=mt_code,
+            device_pos=getattr(table, "device_pos", None),
+            device_limits_lookup=device_limits_lookup,
+            factor=dev_limit_factor,
+        )
+        if np.any(dev_exceeded):
+            valid[dev_exceeded] = False
+            status[dev_exceeded] = MEAS_STATUS_INVALID
+            invalidated[dev_exceeded] = True
+            set_prefilter_reasons(reasons, dev_exceeded, REASON_DEVICE_LIMIT_EXCEEDED)
+            processable[dev_exceeded] = False
+
     return invalidated, reasons
 
 
@@ -520,6 +724,9 @@ def evaluate_fluid_measurement_prefilter(
     meas_type_code: np.ndarray,
     params: object,
     is_dead_or_inactive: Optional[np.ndarray] = None,
+    device_type_code: Optional[np.ndarray] = None,
+    device_pos: Optional[np.ndarray] = None,
+    device_limits_lookup: Optional[Mapping[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """对流体域（Gas/Hydro/Heat/Steam）量测数组执行向量化预过滤。
 
@@ -612,6 +819,22 @@ def evaluate_fluid_measurement_prefilter(
             bad_mask[bad_rows] = True
             set_prefilter_reasons(reasons, bad_mask, reason_tag)
 
+    # 6. 流体设备状态限值超倍预过滤
+    dev_limit_factor = resolve_device_limit_factor(params)
+    if dev_limit_factor is not None and device_limits_lookup and device_type_code is not None and np.any(keep):
+        dev_exceeded = _apply_device_limits_lookup(
+            values=vals,
+            processable=keep,
+            dt_code=np.asarray(device_type_code, dtype=np.int16),
+            mt_code=mt,
+            device_pos=device_pos,
+            device_limits_lookup=device_limits_lookup,
+            factor=dev_limit_factor,
+        )
+        if np.any(dev_exceeded):
+            keep[dev_exceeded] = False
+            set_prefilter_reasons(reasons, dev_exceeded, REASON_DEVICE_LIMIT_EXCEEDED)
+
     return keep, reasons
 
 
@@ -624,6 +847,9 @@ def check_single_fluid_measurement_prefilter(
     meas_type: str,
     params: object,
     is_dead_or_inactive: bool = False,
+    device_limit_lo: Optional[float] = None,
+    device_limit_hi: Optional[float] = None,
+    symmetric_upper: bool = False,
 ) -> str:
     """对象回退路径下的单条流体量测预过滤判定，返回空串表示通过，否则返回具体原因。"""
     st = int(status)
@@ -680,6 +906,21 @@ def check_single_fluid_measurement_prefilter(
         hi = _opt_finite_limit(params, "prefilter_heat_max")
         if (lo is not None and val < lo) or (hi is not None and val > hi):
             return REASON_HEAT_OUT_OF_RANGE
+
+    dev_limit_factor = resolve_device_limit_factor(params)
+    if dev_limit_factor is not None and (device_limit_lo is not None or device_limit_hi is not None):
+        lo_arr = np.asarray([np.nan if device_limit_lo is None else float(device_limit_lo)], dtype=np.float64)
+        hi_arr = np.asarray([np.nan if device_limit_hi is None else float(device_limit_hi)], dtype=np.float64)
+        if bool(
+            check_device_bounds_violation(
+                np.asarray([val], dtype=np.float64),
+                lo_arr,
+                hi_arr,
+                dev_limit_factor,
+                symmetric_upper=bool(symmetric_upper),
+            )[0]
+        ):
+            return REASON_DEVICE_LIMIT_EXCEEDED
     return ""
 
 
@@ -747,3 +988,632 @@ def tag_dead_island_unavailable_rows(
         zd_mask[zero_dead_rows] = True
         set_prefilter_reasons(reasons, zd_mask, REASON_DEAD_ISLAND)
     return reasons
+
+
+def _slice_limit_vec(
+    lim_dict: Optional[Mapping[str, np.ndarray]],
+    key: str,
+    rows: np.ndarray,
+) -> Optional[np.ndarray]:
+    if not lim_dict or key not in lim_dict or rows.size == 0:
+        return None
+    src = np.asarray(lim_dict[key], dtype=np.float64)
+    if src.size == 0:
+        return None
+    out = np.full(rows.size, np.nan, dtype=np.float64)
+    ok = (rows >= 0) & (rows < src.size)
+    if np.any(ok):
+        out[ok] = src[rows[ok].astype(np.intp, copy=False)]
+    return out if np.any(np.isfinite(out)) else None
+
+
+def _coalesce_limit_vecs(*vecs: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """按优先级合并多个同长限值数组（前者非有限位置由后者回退补齐）。"""
+    out: Optional[np.ndarray] = None
+    for v in vecs:
+        if v is None:
+            continue
+        arr = np.asarray(v, dtype=np.float64)
+        if out is None:
+            out = arr.copy()
+        else:
+            fill = (~np.isfinite(out)) & np.isfinite(arr)
+            if np.any(fill):
+                out[fill] = arr[fill]
+    if out is not None and np.any(np.isfinite(out)):
+        return out
+    return None
+
+
+def _node_limit_by_node_ids(
+    bus_table: Optional[np.ndarray],
+    bus_limits: Optional[Mapping[str, np.ndarray]],
+    key: str,
+    query_node_ids: np.ndarray,
+) -> Optional[np.ndarray]:
+    if bus_table is None or not bus_limits or key not in bus_limits or query_node_ids.size == 0:
+        return None
+    bus = np.asarray(bus_table, dtype=np.float64)
+    src = np.asarray(bus_limits[key], dtype=np.float64)
+    if bus.ndim != 2 or bus.shape[0] == 0 or src.size == 0 or not np.any(np.isfinite(src)):
+        return None
+    n_bus = min(bus.shape[0], src.size)
+    ids = bus[:n_bus, 0].astype(np.int64, copy=False)
+    order = np.argsort(ids)
+    sorted_ids = ids[order]
+    q = np.asarray(query_node_ids, dtype=np.int64)
+    loc = np.searchsorted(sorted_ids, q)
+    ok = (loc >= 0) & (loc < sorted_ids.size)
+    out = np.full(q.size, np.nan, dtype=np.float64)
+    if np.any(ok):
+        ok_idx = np.flatnonzero(ok)
+        matched = sorted_ids[loc[ok_idx]] == q[ok_idx]
+        if np.any(matched):
+            m_idx = ok_idx[matched]
+            out[m_idx] = src[order[loc[m_idx]]]
+    return out if np.any(np.isfinite(out)) else None
+
+
+def _register_lookup(
+    lookup: Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]],
+    dt_code: int,
+    mt_codes: Sequence[int],
+    lo: Optional[np.ndarray],
+    hi: Optional[np.ndarray],
+    *,
+    symmetric_upper: bool = False,
+) -> None:
+    if lo is None and hi is None:
+        return
+    for mt in mt_codes:
+        lookup[(int(dt_code), int(mt))] = (lo, hi, bool(symmetric_upper))
+
+
+def build_ac_device_limits_lookup(
+    ppc: Optional[Mapping[str, object]],
+    plan_rows_by_type_code: Optional[Mapping[int, np.ndarray]],
+) -> Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]:
+    """根据 AC PPC 与活网设备映射构建 (device_type_code, meas_type_code) -> (lo, hi, symmetric_upper) 查找表。"""
+    if not isinstance(ppc, Mapping) or not plan_rows_by_type_code:
+        return {}
+    dev_limits = ppc.get("_device_limits")
+    if not isinstance(dev_limits, Mapping) or not dev_limits:
+        return {}
+    lookup: Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]] = {}
+    bus_table = ppc.get("bus")
+    bus_lim = dev_limits.get("bus")
+
+    node_rows = np.asarray(plan_rows_by_type_code.get(DEVICE_TYPE_ACNode, ()), dtype=np.int64)
+    if node_rows.size and bus_lim:
+        _register_lookup(
+            lookup,
+            DEVICE_TYPE_ACNode,
+            (MEAS_TYPE_V,),
+            _slice_limit_vec(bus_lim, "v_min", node_rows),
+            _slice_limit_vec(bus_lim, "v_max", node_rows),
+        )
+
+    def _node_v_limits(table_key: str, rows: np.ndarray, node_col: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not bus_lim or rows.size == 0:
+            return None, None
+        arr = ppc.get(table_key)
+        if not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.shape[0] == 0:
+            return None, None
+        ok = (rows >= 0) & (rows < arr.shape[0])
+        if not np.any(ok):
+            return None, None
+        nids = np.full(rows.size, -1, dtype=np.int64)
+        nids[ok] = arr[rows[ok].astype(np.intp, copy=False), node_col].astype(np.int64, copy=False)
+        return (
+            _node_limit_by_node_ids(bus_table, bus_lim, "v_min", nids),
+            _node_limit_by_node_ids(bus_table, bus_lim, "v_max", nids),
+        )
+
+    # 双端元件：支路 / 变压器 / 零阻 / 开关 / 断路器 / ACAC 换流器
+    two_term_specs = (
+        (DEVICE_TYPE_ACBranch, "branch", 1, 2),
+        (DEVICE_TYPE_ACTransformer, "transformer", 1, 2),
+        (DEVICE_TYPE_ACZeroBranch, "zero_branch", 1, 2),
+        (DEVICE_TYPE_ACSwitch, "switch", 1, 2),
+        (DEVICE_TYPE_ACBreak, "break", 1, 2),
+        (DEVICE_TYPE_ACACConverter, "acac", 1, 2),
+    )
+    for dt_code, tbl_key, i_col, j_col in two_term_specs:
+        rows = np.asarray(plan_rows_by_type_code.get(dt_code, ()), dtype=np.int64)
+        if rows.size == 0:
+            continue
+        lim = dev_limits.get(tbl_key)
+        s_max = _slice_limit_vec(lim, "s_max", rows)
+        p_lo = _slice_limit_vec(lim, "p_min", rows)
+        p_hi = _coalesce_limit_vecs(_slice_limit_vec(lim, "p_max", rows), s_max)
+        q_lo = _slice_limit_vec(lim, "q_min", rows)
+        q_hi = _coalesce_limit_vecs(_slice_limit_vec(lim, "q_max", rows), s_max)
+        i_lo = _slice_limit_vec(lim, "i_min", rows)
+        i_hi = _slice_limit_vec(lim, "i_max", rows)
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO), p_lo, p_hi, symmetric_upper=True)
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_Q_FROM, MEAS_TYPE_Q_TO), q_lo, q_hi, symmetric_upper=True)
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO), i_lo, i_hi, symmetric_upper=False)
+        dev_v_lo = _slice_limit_vec(lim, "v_min", rows)
+        dev_v_hi = _slice_limit_vec(lim, "v_max", rows)
+        ni_lo, ni_hi = _node_v_limits(tbl_key, rows, i_col)
+        nj_lo, nj_hi = _node_v_limits(tbl_key, rows, j_col)
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_V_FROM,), _coalesce_limit_vecs(dev_v_lo, ni_lo), _coalesce_limit_vecs(dev_v_hi, ni_hi))
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_V_TO,), _coalesce_limit_vecs(dev_v_lo, nj_lo), _coalesce_limit_vecs(dev_v_hi, nj_hi))
+
+    # 三绕组变压器
+    rows3 = np.asarray(plan_rows_by_type_code.get(DEVICE_TYPE_ACThreeWindingTransformer, ()), dtype=np.int64)
+    if rows3.size:
+        lim3 = dev_limits.get("three_winding_transformer")
+        s3 = _slice_limit_vec(lim3, "s_max", rows3)
+        _register_lookup(
+            lookup,
+            DEVICE_TYPE_ACThreeWindingTransformer,
+            (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_P_THIRD),
+            _slice_limit_vec(lim3, "p_min", rows3),
+            _coalesce_limit_vecs(_slice_limit_vec(lim3, "p_max", rows3), s3),
+            symmetric_upper=True,
+        )
+        _register_lookup(
+            lookup,
+            DEVICE_TYPE_ACThreeWindingTransformer,
+            (MEAS_TYPE_Q_FROM, MEAS_TYPE_Q_TO, MEAS_TYPE_Q_THIRD),
+            _slice_limit_vec(lim3, "q_min", rows3),
+            _coalesce_limit_vecs(_slice_limit_vec(lim3, "q_max", rows3), s3),
+            symmetric_upper=True,
+        )
+        _register_lookup(
+            lookup,
+            DEVICE_TYPE_ACThreeWindingTransformer,
+            (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO, MEAS_TYPE_I_THIRD),
+            _slice_limit_vec(lim3, "i_min", rows3),
+            _slice_limit_vec(lim3, "i_max", rows3),
+            symmetric_upper=False,
+        )
+        dv3_lo = _slice_limit_vec(lim3, "v_min", rows3)
+        dv3_hi = _slice_limit_vec(lim3, "v_max", rows3)
+        for mt_v, ncol in ((MEAS_TYPE_V_FROM, 1), (MEAS_TYPE_V_TO, 2), (MEAS_TYPE_V_THIRD, 3)):
+            nv_lo, nv_hi = _node_v_limits("three_winding_transformer", rows3, ncol)
+            _register_lookup(
+                lookup,
+                DEVICE_TYPE_ACThreeWindingTransformer,
+                (mt_v,),
+                _coalesce_limit_vecs(dv3_lo, nv_lo),
+                _coalesce_limit_vecs(dv3_hi, nv_hi),
+            )
+
+    # 发电机与负荷
+    for dt_code, tbl_key, p_mt, q_mt, v_mt, i_mt, sym_p in (
+        (DEVICE_TYPE_ACGenerator, "gen", MEAS_TYPE_P_GEN, MEAS_TYPE_Q_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN, False),
+        (DEVICE_TYPE_ACLoad, "load", MEAS_TYPE_P_LOAD, MEAS_TYPE_Q_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD, True),
+    ):
+        rows = np.asarray(plan_rows_by_type_code.get(dt_code, ()), dtype=np.int64)
+        if rows.size == 0:
+            continue
+        lim = dev_limits.get(tbl_key)
+        s_max = _slice_limit_vec(lim, "s_max", rows)
+        _register_lookup(
+            lookup,
+            dt_code,
+            (p_mt,),
+            _slice_limit_vec(lim, "p_min", rows),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "p_max", rows), s_max),
+            symmetric_upper=sym_p,
+        )
+        _register_lookup(
+            lookup,
+            dt_code,
+            (q_mt,),
+            _slice_limit_vec(lim, "q_min", rows),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "q_max", rows), s_max),
+            symmetric_upper=True,
+        )
+        _register_lookup(
+            lookup,
+            dt_code,
+            (i_mt,),
+            _slice_limit_vec(lim, "i_min", rows),
+            _slice_limit_vec(lim, "i_max", rows),
+            symmetric_upper=False,
+        )
+        nv_lo, nv_hi = _node_v_limits(tbl_key, rows, 1)
+        _register_lookup(
+            lookup,
+            dt_code,
+            (v_mt,),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "v_min", rows), nv_lo),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "v_max", rows), nv_hi),
+        )
+
+    return lookup
+
+
+def build_dc_device_limits_lookup(
+    ppc: Optional[Mapping[str, object]],
+    plan_rows_by_type_code: Optional[Mapping[int, np.ndarray]],
+) -> Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]:
+    """根据 DC PPC 与活网设备映射构建设备状态限值查找表。"""
+    if not isinstance(ppc, Mapping) or not plan_rows_by_type_code:
+        return {}
+    dev_limits = ppc.get("_device_limits")
+    if not isinstance(dev_limits, Mapping) or not dev_limits:
+        return {}
+    lookup: Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]] = {}
+    bus_table = ppc.get("bus")
+    bus_lim = dev_limits.get("bus")
+
+    node_rows = np.asarray(plan_rows_by_type_code.get(DEVICE_TYPE_DCNode, ()), dtype=np.int64)
+    if node_rows.size and bus_lim:
+        _register_lookup(
+            lookup,
+            DEVICE_TYPE_DCNode,
+            (MEAS_TYPE_V,),
+            _slice_limit_vec(bus_lim, "v_min", node_rows),
+            _slice_limit_vec(bus_lim, "v_max", node_rows),
+        )
+
+    def _node_v_limits(table_key: str, rows: np.ndarray, node_col: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if not bus_lim or rows.size == 0:
+            return None, None
+        arr = ppc.get(table_key)
+        if not isinstance(arr, np.ndarray) or arr.ndim != 2 or arr.shape[0] == 0:
+            return None, None
+        ok = (rows >= 0) & (rows < arr.shape[0])
+        if not np.any(ok):
+            return None, None
+        nids = np.full(rows.size, -1, dtype=np.int64)
+        nids[ok] = arr[rows[ok].astype(np.intp, copy=False), node_col].astype(np.int64, copy=False)
+        return (
+            _node_limit_by_node_ids(bus_table, bus_lim, "v_min", nids),
+            _node_limit_by_node_ids(bus_table, bus_lim, "v_max", nids),
+        )
+
+    for dt_code, tbl_key in (
+        (DEVICE_TYPE_DCBranch, "branch"),
+        (DEVICE_TYPE_DCZeroBranch, "zero_branch"),
+        (DEVICE_TYPE_DCSwitch, "switch"),
+        (DEVICE_TYPE_DCBreak, "break"),
+        (DEVICE_TYPE_DCDCConverter, "dcdc"),
+    ):
+        rows = np.asarray(plan_rows_by_type_code.get(dt_code, ()), dtype=np.int64)
+        if rows.size == 0:
+            continue
+        lim = dev_limits.get(tbl_key)
+        s_max = _slice_limit_vec(lim, "s_max", rows)
+        _register_lookup(
+            lookup,
+            dt_code,
+            (MEAS_TYPE_P_FROM, MEAS_TYPE_P_TO, MEAS_TYPE_P_IN, MEAS_TYPE_P_OUT),
+            _slice_limit_vec(lim, "p_min", rows),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "p_max", rows), s_max),
+            symmetric_upper=True,
+        )
+        _register_lookup(
+            lookup,
+            dt_code,
+            (MEAS_TYPE_I_FROM, MEAS_TYPE_I_TO),
+            _slice_limit_vec(lim, "i_min", rows),
+            _slice_limit_vec(lim, "i_max", rows),
+            symmetric_upper=True,
+        )
+        dv_lo = _slice_limit_vec(lim, "v_min", rows)
+        dv_hi = _slice_limit_vec(lim, "v_max", rows)
+        ni_lo, ni_hi = _node_v_limits(tbl_key, rows, 1)
+        nj_lo, nj_hi = _node_v_limits(tbl_key, rows, 2)
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_V_FROM,), _coalesce_limit_vecs(dv_lo, ni_lo), _coalesce_limit_vecs(dv_hi, ni_hi))
+        _register_lookup(lookup, dt_code, (MEAS_TYPE_V_TO,), _coalesce_limit_vecs(dv_lo, nj_lo), _coalesce_limit_vecs(dv_hi, nj_hi))
+
+    for dt_code, tbl_key, p_mt, v_mt, i_mt, sym_p in (
+        (DEVICE_TYPE_DCGenerator, "gen", MEAS_TYPE_P_GEN, MEAS_TYPE_V_GEN, MEAS_TYPE_I_GEN, False),
+        (DEVICE_TYPE_DCLoad, "load", MEAS_TYPE_P_LOAD, MEAS_TYPE_V_LOAD, MEAS_TYPE_I_LOAD, True),
+    ):
+        rows = np.asarray(plan_rows_by_type_code.get(dt_code, ()), dtype=np.int64)
+        if rows.size == 0:
+            continue
+        lim = dev_limits.get(tbl_key)
+        s_max = _slice_limit_vec(lim, "s_max", rows)
+        _register_lookup(
+            lookup,
+            dt_code,
+            (p_mt,),
+            _slice_limit_vec(lim, "p_min", rows),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "p_max", rows), s_max),
+            symmetric_upper=sym_p,
+        )
+        _register_lookup(
+            lookup,
+            dt_code,
+            (i_mt,),
+            _slice_limit_vec(lim, "i_min", rows),
+            _slice_limit_vec(lim, "i_max", rows),
+            symmetric_upper=True,
+        )
+        nv_lo, nv_hi = _node_v_limits(tbl_key, rows, 1)
+        _register_lookup(
+            lookup,
+            dt_code,
+            (v_mt,),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "v_min", rows), nv_lo),
+            _coalesce_limit_vecs(_slice_limit_vec(lim, "v_max", rows), nv_hi),
+        )
+
+    return lookup
+
+
+def build_hybrid_dcac_device_limits_lookup(
+    hybrid_ppc: Optional[Mapping[str, object]],
+    ac_ppc: Optional[Mapping[str, object]],
+    dc_ppc: Optional[Mapping[str, object]],
+    dcac_converters: Sequence[object],
+) -> Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]:
+    """根据交直流混合 PPC 构建 DCACConverter 设备状态限值查找表（支持端口电压回退 AC/DC 节点限值）。"""
+    if not dcac_converters:
+        return {}
+    h_dev_lim = (hybrid_ppc.get("_device_limits") if isinstance(hybrid_ppc, Mapping) else None) or {}
+    dcac_lim = h_dev_lim.get("dcac") if isinstance(h_dev_lim, Mapping) else None
+    ac_bus_lim = ((ac_ppc.get("_device_limits") if isinstance(ac_ppc, Mapping) else None) or {}).get("bus")
+    dc_bus_lim = ((dc_ppc.get("_device_limits") if isinstance(dc_ppc, Mapping) else None) or {}).get("bus")
+    if not dcac_lim and not ac_bus_lim and not dc_bus_lim:
+        return {}
+
+    n_conv = len(dcac_converters)
+    rows = np.full(n_conv, -1, dtype=np.int64)
+    dcac_arr = hybrid_ppc.get("dcac") if isinstance(hybrid_ppc, Mapping) else None
+    if isinstance(dcac_arr, np.ndarray) and dcac_arr.ndim == 2 and dcac_arr.shape[0] > 0:
+        idx_to_row = {int(round(dcac_arr[r, 0])): r for r in range(dcac_arr.shape[0])}
+        for pos, conv in enumerate(dcac_converters):
+            rows[pos] = idx_to_row.get(int(getattr(conv, "idx", -1)), -1)
+
+    ac_nodes = np.asarray([int(getattr(conv, "ac_node", -1)) for conv in dcac_converters], dtype=np.int64)
+    dc_nodes = np.asarray([int(getattr(conv, "dc_node", -1)) for conv in dcac_converters], dtype=np.int64)
+
+    lookup: Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]] = {}
+    s_max = _slice_limit_vec(dcac_lim, "s_max", rows)
+    p_lo = _slice_limit_vec(dcac_lim, "p_min", rows)
+    p_hi = _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "p_max", rows), s_max)
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_P_AC,),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "p_ac_min", rows), p_lo),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "p_ac_max", rows), p_hi),
+        symmetric_upper=True,
+    )
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_P_DC,),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "p_dc_min", rows), p_lo),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "p_dc_max", rows), p_hi),
+        symmetric_upper=True,
+    )
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_Q_AC,),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "q_ac_min", rows), _slice_limit_vec(dcac_lim, "q_min", rows)),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "q_ac_max", rows), _slice_limit_vec(dcac_lim, "q_max", rows), s_max),
+        symmetric_upper=True,
+    )
+    ac_bus_tbl = ac_ppc.get("bus") if isinstance(ac_ppc, Mapping) else None
+    dc_bus_tbl = dc_ppc.get("bus") if isinstance(dc_ppc, Mapping) else None
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_V_AC,),
+        _coalesce_limit_vecs(
+            _slice_limit_vec(dcac_lim, "v_ac_min", rows),
+            _slice_limit_vec(dcac_lim, "v_min", rows),
+            _node_limit_by_node_ids(ac_bus_tbl, ac_bus_lim, "v_min", ac_nodes),
+        ),
+        _coalesce_limit_vecs(
+            _slice_limit_vec(dcac_lim, "v_ac_max", rows),
+            _slice_limit_vec(dcac_lim, "v_max", rows),
+            _node_limit_by_node_ids(ac_bus_tbl, ac_bus_lim, "v_max", ac_nodes),
+        ),
+    )
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_V_DC,),
+        _coalesce_limit_vecs(
+            _slice_limit_vec(dcac_lim, "v_dc_min", rows),
+            _node_limit_by_node_ids(dc_bus_tbl, dc_bus_lim, "v_min", dc_nodes),
+        ),
+        _coalesce_limit_vecs(
+            _slice_limit_vec(dcac_lim, "v_dc_max", rows),
+            _node_limit_by_node_ids(dc_bus_tbl, dc_bus_lim, "v_max", dc_nodes),
+        ),
+    )
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_I_AC,),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "i_ac_min", rows), _slice_limit_vec(dcac_lim, "i_min", rows)),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "i_ac_max", rows), _slice_limit_vec(dcac_lim, "i_max", rows)),
+        symmetric_upper=False,
+    )
+    _register_lookup(
+        lookup,
+        DEVICE_TYPE_DCACConverter,
+        (MEAS_TYPE_I_DC,),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "i_dc_min", rows), _slice_limit_vec(dcac_lim, "i_min", rows)),
+        _coalesce_limit_vecs(_slice_limit_vec(dcac_lim, "i_dc_max", rows), _slice_limit_vec(dcac_lim, "i_max", rows)),
+        symmetric_upper=True,
+    )
+    return lookup
+
+
+def build_fluid_device_limits_lookup(
+    network: object,
+    *,
+    node_dt: int,
+    pipe_dt: int,
+    valve_dt: int,
+    ctrl_dt: int,
+    src_dt: int,
+    sto_dt: int,
+    load_dt: int,
+    exch_dt: int = -1,
+) -> Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]]:
+    """根据 FluidNetwork 构建流体域 (device_type_code, meas_type_code) 设备状态限值查找表。"""
+    dev_limits = getattr(network, "device_limits", None)
+    if not isinstance(dev_limits, Mapping) or not any(dev_limits.values()):
+        return {}
+    lookup: Dict[Tuple[int, int], Tuple[Optional[np.ndarray], Optional[np.ndarray], bool]] = {}
+    node_lim = dev_limits.get("node") or {}
+    src_lim = dev_limits.get("source") or {}
+    load_lim = dev_limits.get("load") or {}
+    edge_lim = dev_limits.get("edge") or {}
+    exch_lim = dev_limits.get("exchanger") or {}
+
+    def _by_pos(lim_map: Mapping[str, np.ndarray], key: str, pos_arr: np.ndarray) -> Optional[np.ndarray]:
+        if key not in lim_map or pos_arr.size == 0:
+            return None
+        src = np.asarray(lim_map[key], dtype=np.float64)
+        out = np.full(pos_arr.size, np.nan, dtype=np.float64)
+        ok = (pos_arr >= 0) & (pos_arr < src.size)
+        if np.any(ok):
+            out[ok] = src[pos_arr[ok].astype(np.intp, copy=False)]
+        return out if np.any(np.isfinite(out)) else None
+
+    # 1. 节点限值
+    if node_dt >= 0 and node_lim:
+        _register_lookup(lookup, node_dt, (MEAS_TYPE_PRESSURE,), node_lim.get("pressure_min"), node_lim.get("pressure_max"))
+        _register_lookup(lookup, node_dt, (MEAS_TYPE_TEMPERATURE,), node_lim.get("temperature_min"), node_lim.get("temperature_max"))
+        _register_lookup(
+            lookup,
+            node_dt,
+            (MEAS_TYPE_T_SUPPLY,),
+            _coalesce_limit_vecs(node_lim.get("supply_temperature_min"), node_lim.get("temperature_min")),
+            _coalesce_limit_vecs(node_lim.get("supply_temperature_max"), node_lim.get("temperature_max")),
+        )
+        _register_lookup(
+            lookup,
+            node_dt,
+            (MEAS_TYPE_T_RETURN,),
+            _coalesce_limit_vecs(node_lim.get("return_temperature_min"), node_lim.get("temperature_min")),
+            _coalesce_limit_vecs(node_lim.get("return_temperature_max"), node_lim.get("temperature_max")),
+        )
+        _register_lookup(lookup, node_dt, (MEAS_TYPE_ENTHALPY,), node_lim.get("enthalpy_min"), node_lim.get("enthalpy_max"))
+
+    # 2. 边限值（Pipe / Valve / Pump / Compressor / PressureReducer 共享 edge_pos）
+    edge_i = np.asarray(getattr(network, "edge_i", ()), dtype=np.int64)
+    edge_j = np.asarray(getattr(network, "edge_j", ()), dtype=np.int64)
+    edge_dts = tuple(c for c in (pipe_dt, valve_dt, ctrl_dt) if c >= 0)
+    if edge_dts and edge_i.size:
+        ef_lo, ef_hi = edge_lim.get("flow_min"), edge_lim.get("flow_max")
+        ep_lo, ep_hi = edge_lim.get("pressure_min"), edge_lim.get("pressure_max")
+        et_lo, et_hi = edge_lim.get("temperature_min"), edge_lim.get("temperature_max")
+        eh_lo, eh_hi = edge_lim.get("enthalpy_min"), edge_lim.get("enthalpy_max")
+        eq_lo, eq_hi = edge_lim.get("heat_min"), edge_lim.get("heat_max")
+
+        p_from_lo = _coalesce_limit_vecs(ep_lo, _by_pos(node_lim, "pressure_min", edge_i))
+        p_from_hi = _coalesce_limit_vecs(ep_hi, _by_pos(node_lim, "pressure_max", edge_i))
+        p_to_lo = _coalesce_limit_vecs(ep_lo, _by_pos(node_lim, "pressure_min", edge_j))
+        p_to_hi = _coalesce_limit_vecs(ep_hi, _by_pos(node_lim, "pressure_max", edge_j))
+
+        t_from_lo = _coalesce_limit_vecs(et_lo, _by_pos(node_lim, "temperature_min", edge_i))
+        t_from_hi = _coalesce_limit_vecs(et_hi, _by_pos(node_lim, "temperature_max", edge_i))
+        t_to_lo = _coalesce_limit_vecs(et_lo, _by_pos(node_lim, "temperature_min", edge_j))
+        t_to_hi = _coalesce_limit_vecs(et_hi, _by_pos(node_lim, "temperature_max", edge_j))
+
+        ts_from_lo = _coalesce_limit_vecs(et_lo, _by_pos(node_lim, "supply_temperature_min", edge_i), _by_pos(node_lim, "temperature_min", edge_i))
+        ts_from_hi = _coalesce_limit_vecs(et_hi, _by_pos(node_lim, "supply_temperature_max", edge_i), _by_pos(node_lim, "temperature_max", edge_i))
+        ts_to_lo = _coalesce_limit_vecs(et_lo, _by_pos(node_lim, "supply_temperature_min", edge_j), _by_pos(node_lim, "temperature_min", edge_j))
+        ts_to_hi = _coalesce_limit_vecs(et_hi, _by_pos(node_lim, "supply_temperature_max", edge_j), _by_pos(node_lim, "temperature_max", edge_j))
+
+        tr_from_lo = _coalesce_limit_vecs(et_lo, _by_pos(node_lim, "return_temperature_min", edge_i), _by_pos(node_lim, "temperature_min", edge_i))
+        tr_from_hi = _coalesce_limit_vecs(et_hi, _by_pos(node_lim, "return_temperature_max", edge_i), _by_pos(node_lim, "temperature_max", edge_i))
+        tr_to_lo = _coalesce_limit_vecs(et_lo, _by_pos(node_lim, "return_temperature_min", edge_j), _by_pos(node_lim, "temperature_min", edge_j))
+        tr_to_hi = _coalesce_limit_vecs(et_hi, _by_pos(node_lim, "return_temperature_max", edge_j), _by_pos(node_lim, "temperature_max", edge_j))
+
+        h_from_lo = _coalesce_limit_vecs(eh_lo, _by_pos(node_lim, "enthalpy_min", edge_i))
+        h_from_hi = _coalesce_limit_vecs(eh_hi, _by_pos(node_lim, "enthalpy_max", edge_i))
+        h_to_lo = _coalesce_limit_vecs(eh_lo, _by_pos(node_lim, "enthalpy_min", edge_j))
+        h_to_hi = _coalesce_limit_vecs(eh_hi, _by_pos(node_lim, "enthalpy_max", edge_j))
+
+        for edt in edge_dts:
+            _register_lookup(lookup, edt, (MEAS_TYPE_FLOW, MEAS_TYPE_FLOW_FROM, MEAS_TYPE_FLOW_TO), ef_lo, ef_hi, symmetric_upper=True)
+            _register_lookup(lookup, edt, (MEAS_TYPE_PRESSURE_FROM, MEAS_TYPE_P_FROM), p_from_lo, p_from_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_PRESSURE_TO, MEAS_TYPE_P_TO), p_to_lo, p_to_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_T_FROM,), t_from_lo, t_from_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_T_TO,), t_to_lo, t_to_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_TS_FROM,), ts_from_lo, ts_from_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_TS_TO,), ts_to_lo, ts_to_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_TR_FROM,), tr_from_lo, tr_from_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_TR_TO,), tr_to_lo, tr_to_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_H_FROM,), h_from_lo, h_from_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_H_TO,), h_to_lo, h_to_hi)
+            _register_lookup(lookup, edt, (MEAS_TYPE_HEAT,), eq_lo, eq_hi, symmetric_upper=True)
+
+    # 3. 源与储（Source / Storage 共享 source_pos）
+    src_nodes = np.asarray(getattr(network, "source_node_pos", ()), dtype=np.int64)
+    src_dts = tuple(c for c in (src_dt, sto_dt) if c >= 0)
+    if src_dts and src_nodes.size:
+        sp_lo = _coalesce_limit_vecs(src_lim.get("pressure_min"), _by_pos(node_lim, "pressure_min", src_nodes))
+        sp_hi = _coalesce_limit_vecs(src_lim.get("pressure_max"), _by_pos(node_lim, "pressure_max", src_nodes))
+        st_lo = _coalesce_limit_vecs(src_lim.get("temperature_min"), _by_pos(node_lim, "temperature_min", src_nodes))
+        st_hi = _coalesce_limit_vecs(src_lim.get("temperature_max"), _by_pos(node_lim, "temperature_max", src_nodes))
+        sts_lo = _coalesce_limit_vecs(src_lim.get("supply_temperature_min"), src_lim.get("temperature_min"), _by_pos(node_lim, "supply_temperature_min", src_nodes), _by_pos(node_lim, "temperature_min", src_nodes))
+        sts_hi = _coalesce_limit_vecs(src_lim.get("supply_temperature_max"), src_lim.get("temperature_max"), _by_pos(node_lim, "supply_temperature_max", src_nodes), _by_pos(node_lim, "temperature_max", src_nodes))
+        str_lo = _coalesce_limit_vecs(src_lim.get("return_temperature_min"), src_lim.get("temperature_min"), _by_pos(node_lim, "return_temperature_min", src_nodes), _by_pos(node_lim, "temperature_min", src_nodes))
+        str_hi = _coalesce_limit_vecs(src_lim.get("return_temperature_max"), src_lim.get("temperature_max"), _by_pos(node_lim, "return_temperature_max", src_nodes), _by_pos(node_lim, "temperature_max", src_nodes))
+        sh_lo = _coalesce_limit_vecs(src_lim.get("enthalpy_min"), _by_pos(node_lim, "enthalpy_min", src_nodes))
+        sh_hi = _coalesce_limit_vecs(src_lim.get("enthalpy_max"), _by_pos(node_lim, "enthalpy_max", src_nodes))
+        for sdt in src_dts:
+            _register_lookup(lookup, sdt, (MEAS_TYPE_FLOW,), src_lim.get("flow_min"), src_lim.get("flow_max"), symmetric_upper=False)
+            _register_lookup(lookup, sdt, (MEAS_TYPE_PRESSURE,), sp_lo, sp_hi)
+            _register_lookup(lookup, sdt, (MEAS_TYPE_TEMPERATURE,), st_lo, st_hi)
+            _register_lookup(lookup, sdt, (MEAS_TYPE_T_SUPPLY,), sts_lo, sts_hi)
+            _register_lookup(lookup, sdt, (MEAS_TYPE_T_RETURN,), str_lo, str_hi)
+            _register_lookup(lookup, sdt, (MEAS_TYPE_ENTHALPY,), sh_lo, sh_hi)
+            _register_lookup(lookup, sdt, (MEAS_TYPE_HEAT,), src_lim.get("heat_min"), src_lim.get("heat_max"), symmetric_upper=True)
+
+    # 4. 负荷
+    load_nodes = np.asarray(getattr(network, "load_node_pos", ()), dtype=np.int64)
+    if load_dt >= 0 and load_nodes.size:
+        _register_lookup(lookup, load_dt, (MEAS_TYPE_FLOW,), load_lim.get("flow_min"), load_lim.get("flow_max"), symmetric_upper=False)
+        _register_lookup(
+            lookup,
+            load_dt,
+            (MEAS_TYPE_PRESSURE,),
+            _coalesce_limit_vecs(load_lim.get("pressure_min"), _by_pos(node_lim, "pressure_min", load_nodes)),
+            _coalesce_limit_vecs(load_lim.get("pressure_max"), _by_pos(node_lim, "pressure_max", load_nodes)),
+        )
+        _register_lookup(
+            lookup,
+            load_dt,
+            (MEAS_TYPE_TEMPERATURE,),
+            _coalesce_limit_vecs(load_lim.get("temperature_min"), _by_pos(node_lim, "temperature_min", load_nodes)),
+            _coalesce_limit_vecs(load_lim.get("temperature_max"), _by_pos(node_lim, "temperature_max", load_nodes)),
+        )
+        _register_lookup(
+            lookup,
+            load_dt,
+            (MEAS_TYPE_T_SUPPLY,),
+            _coalesce_limit_vecs(load_lim.get("supply_temperature_min"), load_lim.get("temperature_min"), _by_pos(node_lim, "supply_temperature_min", load_nodes), _by_pos(node_lim, "temperature_min", load_nodes)),
+            _coalesce_limit_vecs(load_lim.get("supply_temperature_max"), load_lim.get("temperature_max"), _by_pos(node_lim, "supply_temperature_max", load_nodes), _by_pos(node_lim, "temperature_max", load_nodes)),
+        )
+        _register_lookup(
+            lookup,
+            load_dt,
+            (MEAS_TYPE_T_RETURN,),
+            _coalesce_limit_vecs(load_lim.get("return_temperature_min"), load_lim.get("temperature_min"), _by_pos(node_lim, "return_temperature_min", load_nodes), _by_pos(node_lim, "temperature_min", load_nodes)),
+            _coalesce_limit_vecs(load_lim.get("return_temperature_max"), load_lim.get("temperature_max"), _by_pos(node_lim, "return_temperature_max", load_nodes), _by_pos(node_lim, "temperature_max", load_nodes)),
+        )
+        _register_lookup(
+            lookup,
+            load_dt,
+            (MEAS_TYPE_ENTHALPY,),
+            _coalesce_limit_vecs(load_lim.get("enthalpy_min"), _by_pos(node_lim, "enthalpy_min", load_nodes)),
+            _coalesce_limit_vecs(load_lim.get("enthalpy_max"), _by_pos(node_lim, "enthalpy_max", load_nodes)),
+        )
+        _register_lookup(lookup, load_dt, (MEAS_TYPE_HEAT,), load_lim.get("heat_min"), load_lim.get("heat_max"), symmetric_upper=True)
+
+    # 5. 换热器
+    if exch_dt >= 0 and exch_lim:
+        _register_lookup(lookup, exch_dt, (MEAS_TYPE_FLOW, MEAS_TYPE_FLOW_FROM, MEAS_TYPE_FLOW_TO), exch_lim.get("flow_min"), exch_lim.get("flow_max"), symmetric_upper=True)
+        _register_lookup(lookup, exch_dt, (MEAS_TYPE_HEAT,), exch_lim.get("heat_min"), exch_lim.get("heat_max"), symmetric_upper=True)
+        _register_lookup(lookup, exch_dt, (MEAS_TYPE_TEMPERATURE, MEAS_TYPE_T_FROM, MEAS_TYPE_T_TO), exch_lim.get("temperature_min"), exch_lim.get("temperature_max"))
+
+    return lookup
