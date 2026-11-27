@@ -6354,6 +6354,8 @@ class DCStateEstimator:
         boundary_proj_streak = 0
         lm_guard_streak = 0
         frozen_fail_count = 0
+        normal_operand = None
+        gain = None
 
         for iteration in range(1, self.max_iter + 1):
             if _dc_state_out_of_bounds(x):
@@ -6423,6 +6425,8 @@ class DCStateEstimator:
                     wb_local_shrunk = False
                     last_factor_x_disp = corr_wb
                     factor_is_current_weights = False
+                    normal_operand = None
+                    gain = None
                     used_woodbury_step = True
                     used_frozen_step = True
             elif (
@@ -6456,6 +6460,8 @@ class DCStateEstimator:
                         if is_local_probe:
                             wb_local_shrunk = True
                         last_factor_x_disp += corr_wb
+                        normal_operand = None
+                        gain = None
                         used_woodbury_step = True
                         used_frozen_step = True
                     else:
@@ -6641,7 +6647,7 @@ class DCStateEstimator:
                         solver_cache=box_pin_cache,
                     )
                     if pin_ok and step_damping == 0.0 and _dc_dx_needs_lm_guard(dx_pin, strict_step=True):
-                        for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                        for beta_try in tr_ctrl.lm_guard_damping_ladder():
                             dx_lm, lm_ok = solve_box_pinned_normal_equations(
                                 normal_operand,
                                 gain,
@@ -6694,7 +6700,7 @@ class DCStateEstimator:
                             last_undamped_spd_failed = not undamped_ok
                         # 若无阻尼步出现非有限值、病态电压跳变或将弱节点推入低/过电压危险区，提前用分级 LM 阻尼扶正方向
                         if step_damping == 0.0 and _dc_dx_needs_lm_guard(dx, strict_step=True):
-                            for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                            for beta_try in tr_ctrl.lm_guard_damping_ladder():
                                 dx_lm, _ = aat_solver.solve(
                                     normal_operand,
                                     rhs,

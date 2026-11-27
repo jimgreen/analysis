@@ -6005,6 +6005,7 @@ class NielsenTrustRegionController:
         self._just_zeroed: bool = False
         self._last_safe_nonzero: float = 0.0
         self._good_streak: int = 0
+        self._calm_streak: int = 0
         self._zero_bounce_count: int = 0
 
     def reset(self) -> None:
@@ -6016,7 +6017,28 @@ class NielsenTrustRegionController:
         self._just_zeroed = False
         self._last_safe_nonzero = 0.0
         self._good_streak = 0
+        self._calm_streak = 0
         self._zero_bounce_count = 0
+
+    def lm_guard_damping_ladder(
+        self,
+        base_ladder: Tuple[float, ...] = (1e-2, 1e-1, 1.0, 10.0),
+    ) -> Tuple[float, ...]:
+        """构造无阻尼步触发 LM 护栏时的试探阻尼序列。
+
+        若此前刚经历过低阻尼归零撞壁（``_zero_bounce_count > 0`` 且上次安全阻尼小于 ``1e-2``），
+        优先在 ``1e-2`` 之前插入贴近上次安全阻尼的低阻尼档位，避免一跃抬升数百倍浪费十余步重爬。
+        """
+        if self._zero_bounce_count > 0 and 0.0 < self._last_safe_nonzero < 1e-2:
+            b1 = max(1e-5, float(self._last_safe_nonzero))
+            b2 = min(1e-2, max(1e-4, b1 * 5.0))
+            cands = []
+            for v in (b1, b2) + tuple(base_ladder):
+                fv = float(v)
+                if not cands or fv > cands[-1] * 1.05:
+                    cands.append(fv)
+            return tuple(cands)
+        return tuple(base_ladder)
 
     def notify_damping_activated(self, new_lam: float, current_obj: float = np.inf) -> None:
         """外部由无阻尼态重新激活阻尼时调用，检测“归零即撞壁弹回”极限环。"""
@@ -6056,7 +6078,8 @@ class NielsenTrustRegionController:
         d_min = max(0.0, float(min_damping))
         d_max = max(d_min, float(max_damping))
 
-        # 目标函数相对上次反弹点下降 >= 10% 或连续 8 步完美二次匹配，自动释放下界记忆恢复二阶收敛
+        # 目标函数相对上次反弹点下降 >= 10%、连续 8 步严苛二次匹配，或连续 20 步良态满步零回溯/零失配时，
+        # 自动释放下界记忆恢复二阶收敛，防止微弱周期扰动导致 _good_streak 永久清零锁死阻尼下界
         if self.bounce_floor > 0.0 and (
             (
                 np.isfinite(current_obj)
@@ -6064,12 +6087,14 @@ class NielsenTrustRegionController:
                 and float(current_obj) <= 0.90 * self.bounce_ref_obj
             )
             or self._good_streak >= 8
+            or self._calm_streak >= 20
         ):
             self.bounce_floor = 0.0
             self.bounce_count = 0
             self.bounce_ref_obj = np.inf
             self.nu = 2.0
             self._good_streak = 0
+            self._calm_streak = 0
 
         eff_min = min(d_max, max(d_min, self.bounce_floor))
         eff_zero_cut = float(zero_cutoff)
@@ -6097,6 +6122,7 @@ class NielsenTrustRegionController:
 
         if is_backtrack or is_poor_model:
             self._good_streak = 0
+            self._calm_streak = 0
             if self._was_reduced:
                 # 严格仅对“缩减阻尼后立即碰壁弹回”的真实极限环计数并记录安全下界（上限 <= 0.25 * d_max）
                 self.bounce_count += 1
@@ -6123,12 +6149,17 @@ class NielsenTrustRegionController:
         # 良态步：重置退避倍率，受 eff_min 保护不跌穿已探明临界阻尼下界
         if alpha >= 0.8:
             self.nu = 2.0
+            if self.bounce_floor > 0.0 and rho_eff >= 0.50:
+                self._calm_streak += 1
+            else:
+                self._calm_streak = 0
             if self.bounce_floor > 0.0 and (0.85 <= rho <= 1.15) and not dx_growing:
                 self._good_streak += 1
             else:
                 self._good_streak = 0
         else:
             self._good_streak = 0
+            self._calm_streak = 0
         new_lam = float(base_new)
         if eff_min > 0.0 and new_lam < eff_min:
             new_lam = eff_min

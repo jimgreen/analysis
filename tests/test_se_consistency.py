@@ -6767,3 +6767,84 @@ def test_ac_lm_guard_handoff_and_fluid_mid_damping_escape(tmp_path):
     assert res.converged
     assert res.iterations < 80
 
+
+def test_woodbury_step_backtrack_no_unbound_normal_operand(tmp_path):
+    """验证 BDR 命中 Woodbury 步并连续回溯时，DC/AC/HYB 均不会抛出 normal_operand UnboundLocalError。"""
+    dc_dir = tmp_path / "dc_wb_unbound"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(16, dc_dir, seed=2045)
+    lines = dc_m.read_text(encoding="utf-8").splitlines()
+    edited = []
+    injected = 0
+    for ln in lines:
+        if ln.startswith("#") and " DCNode " in ln and " V " in ln and injected < 3:
+            parts = ln.split()
+            parts[-1] = f"{float(parts[-1]) * 1.45:.6f}"
+            edited.append(" ".join(parts))
+            injected += 1
+        else:
+            edited.append(ln)
+    dc_m.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+    est = DCStateEstimator(dc_e, dc_m, parameters=SE_PARAMS, flat_start=True)
+    est.prepare()
+    res1 = est.estimate()
+    assert res1.converged
+    # 显式传入 Woodbury 缓存（移除 1 条量测）构造首步直接走 Woodbury 低秩更新路径，校验无 UnboundLocalError
+    w_ov = np.asarray(est._active_measurement_table_ref().weight, dtype=np.float64).copy()
+    prev_w = w_ov.copy()
+    w_ov[0] = 0.0
+    prev_H = est.jacobian_sparse(res1.x, est.active_measurements)
+    res2 = est.estimate(
+        x0=res1.x,
+        _weight_override=w_ov,
+        _woodbury_removed_rows=[0],
+        _woodbury_prev_weights=prev_w,
+        _woodbury_prev_H=prev_H,
+    )
+    assert res2.converged
+
+
+def test_trust_region_calm_streak_releases_bounce_floor_and_guard_ladder():
+    """验证 3 步周期良态满步（rho 在 0.65/0.95/0.95 循环）连续 20 步可自动释放 bounce_floor 及低阻尼护栏档位。"""
+    from secore.se_math import NielsenTrustRegionController
+
+    ctrl = NielsenTrustRegionController()
+    rhs = np.array([1.0, -0.5], dtype=np.float64)
+    dx = np.array([0.05, -0.02], dtype=np.float64)
+    dg = np.array([100.0, 100.0], dtype=np.float64)
+
+    # 1. 手动锁定 bounce_floor，每 3 步插入 1 步 rho=0.65（仍属良态满步，但会清零严苛 _good_streak）
+    ctrl.bounce_floor = 0.5
+    ctrl.bounce_ref_obj = 100.0
+    lam = 0.5
+    pred = 0.5 * (float(np.dot(rhs, dx)) + lam * float(np.dot(dx * dx, dg)))
+    for k in range(21):
+        rho_target = 0.65 if (k % 3 == 0) else 0.95
+        nd, _ = ctrl.update(
+            lam,
+            rhs,
+            dx,
+            rho_target * pred,
+            1.0,
+            current_obj=99.9,
+            half_obj=True,
+            diag_reg=dg,
+            zero_cutoff=1e-3,
+            dx_growing=False,
+        )
+    # 连续 20 步良态满步后应打破 0->1->2->0 周期锁死并释放 bounce_floor
+    assert ctrl.bounce_floor == 0.0
+    assert nd < lam
+
+    # 2. 验证归零撞壁后 lm_guard_damping_ladder 能在 1e-2 之前插入低阻尼平滑过渡档位
+    ctrl2 = NielsenTrustRegionController()
+    assert ctrl2.lm_guard_damping_ladder() == (1e-2, 1e-1, 1.0, 10.0)
+    ctrl2._zero_bounce_count = 1
+    ctrl2._last_safe_nonzero = 2e-4
+    ladder = ctrl2.lm_guard_damping_ladder()
+    assert ladder[0] == pytest.approx(2e-4)
+    assert ladder[1] < 1e-2
+    assert ladder[-1] == pytest.approx(10.0)
+
+

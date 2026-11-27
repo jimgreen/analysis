@@ -10790,6 +10790,8 @@ class HybridStateEstimator:
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
         frozen_fail_count = 0
+        normal_operand = None
+        gain = None
 
         for iteration in range(1, self.max_iter + 1):
             if _hybrid_state_out_of_bounds(x):
@@ -10860,6 +10862,8 @@ class HybridStateEstimator:
                     wb_local_shrunk = False
                     last_factor_x_disp = corr_wb
                     factor_is_current_weights = False
+                    normal_operand = None
+                    gain = None
                     used_woodbury_step = True
                     used_frozen_step = True
                     solved_via_aat = True
@@ -10892,6 +10896,8 @@ class HybridStateEstimator:
                         if is_local_probe:
                             wb_local_shrunk = True
                         last_factor_x_disp += corr_wb
+                        normal_operand = None
+                        gain = None
                         used_woodbury_step = True
                         used_frozen_step = True
                         solved_via_aat = True

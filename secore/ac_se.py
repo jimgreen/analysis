@@ -10364,6 +10364,10 @@ class ACStateEstimator:
         boundary_proj_streak = 0
         lm_guard_streak = 0
         frozen_fail_count = 0
+        normal_operand = None
+        gain = None
+        prev_accepted_dx: Optional[np.ndarray] = None
+        damped_flip_streak = 0
 
         for iteration in range(1, iteration_limit + 1):
             if _state_out_of_bounds(x):
@@ -10433,6 +10437,8 @@ class ACStateEstimator:
                     wb_local_shrunk = False
                     last_factor_x_disp = corr_wb
                     factor_is_current_weights = False
+                    normal_operand = None
+                    gain = None
                     used_woodbury_step = True
                     used_frozen_step = True
             elif (
@@ -10465,6 +10471,8 @@ class ACStateEstimator:
                         if is_local_probe:
                             wb_local_shrunk = True
                         last_factor_x_disp += corr_wb
+                        normal_operand = None
+                        gain = None
                         used_woodbury_step = True
                         used_frozen_step = True
                     else:
@@ -10687,7 +10695,7 @@ class ACStateEstimator:
                         solver_cache=box_pin_cache,
                     )
                     if pin_ok and step_damping == 0.0 and _dx_needs_lm_guard(dx_pin, strict_step=True):
-                        for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                        for beta_try in tr_ctrl.lm_guard_damping_ladder():
                             dx_lm, lm_ok = solve_box_pinned_normal_equations(
                                 solve_operand,
                                 solve_gain,
@@ -10754,7 +10762,7 @@ class ACStateEstimator:
                             last_undamped_spd_failed = not undamped_ok
                         # 若无阻尼牛顿步出现非有限值、显著过冲或将弱盲节点推入低/过电压危险区，提前采用分级 LM 阻尼扶正方向
                         if step_damping == 0.0 and _dx_needs_lm_guard(dx, strict_step=True):
-                            for beta_try in (1e-2, 1e-1, 1.0, 10.0):
+                            for beta_try in tr_ctrl.lm_guard_damping_ladder():
                                 dx_lm, _ = aat_solver.solve(
                                     solve_operand,
                                     rhs,
@@ -11067,6 +11075,33 @@ class ACStateEstimator:
                     fullstep_osc_streak = 0
                 if abs(new_d - step_damping) > max(1e-12, 0.05 * max(new_d, step_damping)):
                     prev_step_accepted = False
+                # 带阻尼满步若出现高幅值严格正负号反向之字形乒乓（常见于高权重异构开关电流谷底），适度抬升阻尼抑制震荡
+                if (
+                    accepted_step is not None
+                    and accepted_step >= 0.8
+                    and max_correction > 0.1
+                    and max_correction >= 0.80 * last_step_max_correction
+                    and prev_accepted_dx is not None
+                    and prev_accepted_dx.size == dx.size
+                ):
+                    n_cur = float(np.linalg.norm(dx))
+                    n_prev = float(np.linalg.norm(prev_accepted_dx))
+                    if n_cur > 1e-12 and n_prev > 1e-12 and float(np.dot(dx, prev_accepted_dx)) < -0.5 * n_cur * n_prev:
+                        damped_flip_streak += 1
+                        if damped_flip_streak >= 6:
+                            force_lm_damping = min(10.0, max(step_damping * 4.0, 1e-2))
+                            curvature_damping_active = True
+                            tr_ctrl.notify_damping_activated(force_lm_damping, objective)
+                            damped_flip_streak = 0
+                            prev_step_accepted = False
+                    else:
+                        damped_flip_streak = 0
+                else:
+                    damped_flip_streak = 0
+                if accepted_step is not None and accepted_step >= 0.5 and dx.size > 0:
+                    prev_accepted_dx = dx.copy()
+                else:
+                    prev_accepted_dx = None
             elif used_lm_guard_step and step_damping > 0.0:
                 # 连续 3 步无阻尼方向触发 LM 护栏拦截时，正式移交信赖域控制器管控，避免每轮白做无阻尼分解与绕过停滞检测
                 lm_guard_streak += 1
