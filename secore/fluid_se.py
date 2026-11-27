@@ -3387,20 +3387,35 @@ class FluidStateEstimator:
                 )
             else:
                 kkt_inf = np.inf
-            if zi_softened and iteration >= 2 and (
-                rel_correction < max(1.0e-5, 10.0 * self.tol)
-                or (step_damping == 0.0 and max_correction < 10.0 * self.tol)
-                or (
-                    step_damping > 0.0
-                    and rel_correction < max(5e-5, 50.0 * self.tol)
-                    and kkt_inf <= max(1e-3, 500.0 * self.tol)
+            pred_drop = (
+                float(np.dot(rhs, dx))
+                if (rhs is not None and rhs.size == dx.size and np.all(np.isfinite(dx)))
+                else 0.0
+            )
+            conv_obj_tol = max(1e-12, 1e-9 * (abs(objective) + 1.0))
+            if (
+                zi_softened
+                and iteration >= 2
+                and pred_drop <= max(1e-6, 1e-4 * (abs(objective) + 1.0))
+                and (
+                    (
+                        (rel_correction < max(1.0e-5, 10.0 * self.tol) or (step_damping == 0.0 and max_correction < 10.0 * self.tol))
+                        and kkt_inf <= max(1e-3, 500.0 * self.tol)
+                    )
+                    or (
+                        step_damping > 0.0
+                        and rel_correction < max(5e-5, 50.0 * self.tol)
+                        and kkt_inf <= max(1e-3, 500.0 * self.tol)
+                    )
                 )
             ):
                 _activate_tight_zi()
                 continue
-            if step_damping == 0.0 and (
-                max_correction < self.tol
-                or rel_correction < self.tol
+            if (
+                step_damping == 0.0
+                and (max_correction < self.tol or rel_correction < self.tol)
+                and kkt_inf <= max(1e-5, 10.0 * self.tol)
+                and pred_drop <= conv_obj_tol
             ):
                 if zi_softened and iteration < self.max_iter:
                     _activate_tight_zi()
@@ -3412,6 +3427,7 @@ class FluidStateEstimator:
                 step_damping > 0.0
                 and rel_correction < max(1e-5, 10.0 * self.tol)
                 and kkt_inf <= max(1e-4, 100.0 * self.tol)
+                and pred_drop <= max(1e-8, 1e-7 * (abs(objective) + 1.0))
             ):
                 if zi_softened and iteration < self.max_iter:
                     _activate_tight_zi()
@@ -3819,7 +3835,7 @@ class FluidStateEstimator:
                                 continue
                         if dx_alm is None:
                             break
-                        if float(np.max(np.abs(dx_alm) / np.maximum(state_scales, 1.0))) < 1.0e-8:
+                        if float(np.max(np.abs(dx_alm) / np.maximum(state_scales, 1.0))) < 1.0e-12:
                             break
                         step_alm = 1.0
                         pot_min_alm = (

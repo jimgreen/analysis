@@ -85,6 +85,7 @@ from model.meas_model import (
     MeasurementTableView,
     ObservabilityResult,
     measurement_from_table_row,
+    populate_bad_data_device_names,
     measurement_table_bad_data_protected_mask,
     measurement_table_status_code,
     normalize_pseudo_measurement_arrays,
@@ -7735,6 +7736,7 @@ class DCStateEstimator:
                 )
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
+        populate_bad_data_device_names(bad_items, self.measurement_device_names)
         self._last_leverage_cache = (id(result), leverage, cached_factor)
         if profile_start is not None:
             self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
@@ -7856,6 +7858,7 @@ class DCStateEstimator:
             self._array_only_estimate_result = previous_array_only
             self._bad_data_fast_final_verify = previous_fast_verify
             self._array_only_runtime = True
+        populate_bad_data_device_names(removed, self.measurement_device_names)
         self.removed_bad_data = removed
         if skip_bad_data:
             bad_items = []
@@ -8619,6 +8622,8 @@ class DCStateEstimator:
                     ])
                     if not candidates:
                         if result.converged:
+                            populate_bad_data_device_names(bad_items, self.measurement_device_names)
+                            populate_bad_data_device_names(removed, self.measurement_device_names)
                             self._last_bad_data_cache = (id(final_res), float(base_threshold), list(bad_items), normalized)
                             return final_res, removed
                         if rescue_rounds < 6 and _try_dc_boundary_node_rescue():
@@ -9011,6 +9016,8 @@ class DCStateEstimator:
                         if full_normalized_valid
                         else None
                     )
+                    populate_bad_data_device_names(bad_items, self.measurement_device_names)
+                    populate_bad_data_device_names(removed, self.measurement_device_names)
                     return final_res, removed
                 if int(np.count_nonzero(active_mask)) - 1 < self.n_state or _is_critical_leverage_row(remove_pos):
                     protected_keys.add((int(worst.measurement.idx), str(worst.measurement.name)))
@@ -9117,6 +9124,8 @@ class DCStateEstimator:
             if full_normalized_valid
             else None
         )
+        populate_bad_data_device_names(bad_items, self.measurement_device_names)
+        populate_bad_data_device_names(removed, self.measurement_device_names)
         return final_res, removed
 
     def apply_state(self, x: np.ndarray) -> None:

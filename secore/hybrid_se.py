@@ -156,6 +156,7 @@ from model.meas_model import (
     is_pseudo_measurement,
     mark_measurement_pseudo,
     measurement_from_table_row,
+    populate_bad_data_device_names,
     measurement_table_bad_data_protected_mask,
     measurement_table_from_measurements,
     measurement_table_status_code,
@@ -4000,6 +4001,8 @@ class HybridStateEstimator:
         damp_cycle_count = 0
         min_cycle_damping = 0.0
         cycle_slow_streak = 0
+        healthy_fullstep_streak = 0
+        me_aa = AndersonAccelerator(m=5)
         curvature_damping_active = force_lm_damping > 0.0
         tried_undamped_escape = False
         prev_scaled_correction = np.inf
@@ -4012,13 +4015,16 @@ class HybridStateEstimator:
             nonlocal force_lm_damping, curvature_damping_active, backtrack_streak, fullstep_osc_streak
             nonlocal smooth_fullstep_streak, stagnation_streak, high_damp_stagnation_streak
             nonlocal high_damp_slow_streak, low_progress_streak, cycle_slow_streak, tried_undamped_escape
-            nonlocal z_est_valid, prev_accepted_step_pu
+            nonlocal z_est_valid, prev_accepted_step_pu, healthy_fullstep_streak, min_cycle_damping
             weight = target_me_weight
             uniform_weight = self._uniform_weight(weight)
             weights_are_uniform = uniform_weight is not None
             weighted_residual = None if weights_are_uniform else np.empty_like(weight)
             me_zi_softened = False
             force_lm_damping = 0.0
+            min_cycle_damping = 0.0
+            healthy_fullstep_streak = 0
+            me_aa.reset()
             curvature_damping_active = False
             backtrack_streak = 0
             fullstep_osc_streak = 0
@@ -4107,17 +4113,33 @@ class HybridStateEstimator:
                 if (eff_rhs is not None and diag_g is not None and eff_rhs.size > 0)
                 else np.inf
             )
-            if me_zi_softened and iteration >= 2 and (
-                scaled_correction < max(1.0e-5, 10.0 * self.tol)
-                or (
-                    step_damping > 0.0
-                    and scaled_correction < max(5e-5, 50.0 * self.tol)
-                    and kkt_inf <= max(1e-3, 500.0 * self.tol)
+            pred_drop_me = (
+                float(np.dot(eff_rhs, eff_dx))
+                if (eff_rhs is not None and eff_rhs.size == eff_dx.size and np.all(np.isfinite(eff_dx)))
+                else 0.0
+            )
+            conv_obj_tol_me = max(1e-12, 1e-9 * (abs(objective) + 1.0))
+            if (
+                me_zi_softened
+                and iteration >= 2
+                and pred_drop_me <= max(1e-6, 1e-4 * (abs(objective) + 1.0))
+                and (
+                    (scaled_correction < max(1.0e-5, 10.0 * self.tol) and kkt_inf <= max(1e-3, 500.0 * self.tol))
+                    or (
+                        step_damping > 0.0
+                        and scaled_correction < max(5e-5, 50.0 * self.tol)
+                        and kkt_inf <= max(1e-3, 500.0 * self.tol)
+                    )
                 )
             ):
                 _activate_me_tight_zi()
                 continue
-            if step_damping == 0.0 and scaled_correction < self.tol:
+            if (
+                step_damping == 0.0
+                and scaled_correction < self.tol
+                and kkt_inf <= max(1e-5, 10.0 * self.tol)
+                and pred_drop_me <= conv_obj_tol_me
+            ):
                 if me_zi_softened and iteration < self.max_iter:
                     _activate_me_tight_zi()
                     continue
@@ -4130,6 +4152,7 @@ class HybridStateEstimator:
                 step_damping > 0.0
                 and scaled_correction < max(1e-5, 10.0 * self.tol)
                 and kkt_inf <= max(1e-4, 100.0 * self.tol)
+                and pred_drop_me <= max(1e-8, 1e-7 * (abs(objective) + 1.0))
             ):
                 if me_zi_softened and iteration < self.max_iter:
                     _activate_me_tight_zi()
@@ -4227,6 +4250,8 @@ class HybridStateEstimator:
 
             if not accepted:
                 prev_accepted_step_pu = None
+                healthy_fullstep_streak = 0
+                me_aa.reset()
                 if tried_undamped_escape:
                     if me_zi_softened and iteration < self.max_iter:
                         _activate_me_tight_zi()
@@ -4249,10 +4274,69 @@ class HybridStateEstimator:
                 break
 
             obj_change = abs(previous_objective - objective)
+            # 满步 Anderson 二阶外推：打破紧零注入零空间与强粗差顶牛时的线性阻尼慢爬
+            if (
+                step_scale >= 0.95
+                and not used_cross_zero_halving
+                and scaled_correction > 10.0 * self.tol
+                and scaled_correction < 0.5
+            ):
+                aa_ratio_me = (
+                    (scaled_correction / prev_scaled_correction)
+                    if (np.isfinite(prev_scaled_correction) and prev_scaled_correction > 0.0)
+                    else 0.0
+                )
+                x_before_me = candidate - step_scale * dx if step_scale > 0.0 else x
+                # 直接使用本轮起点 (candidate - (candidate - x_prev))：在上方已将 x 更新为 candidate，故用 prev_accepted_step_pu 还原步前状态
+                if prev_accepted_step_pu is not None and prev_accepted_step_pu.size == x.size:
+                    x_prev_me = x - prev_accepted_step_pu * me_fixed_scale
+                    x_aa_me = me_aa.update_and_propose(
+                        x_prev_me,
+                        x,
+                        step_ratio=aa_ratio_me,
+                        damping=step_damping,
+                        allow_propose=True,
+                    )
+                    if x_aa_me is not None and np.all(np.isfinite(x_aa_me)):
+                        cand_aa = self._apply_multi_energy_state_bounds(x_aa_me, ref_x=x)
+                        if not _me_state_out_of_bounds(cand_aa):
+                            candidate_z_est[:] = self._evaluate_multi_energy(cand_aa)[rows]
+                            self._multi_energy_measurement_residual(
+                                candidate_z_est,
+                                measurement_rows=rows,
+                                out=candidate_residual,
+                            )
+                            aa_obj_me = self._weighted_objective(weight, candidate_residual)
+                            if np.isfinite(aa_obj_me) and aa_obj_me < objective - max(1e-12, 1e-10 * (abs(objective) + 1.0)):
+                                aa_jump_me = float(np.max(np.abs(cand_aa - x) / me_fixed_scale)) if x.size else 0.0
+                                x = cand_aa
+                                z_est, candidate_z_est = candidate_z_est, z_est
+                                residual, candidate_residual = candidate_residual, residual
+                                objective = aa_obj_me
+                                residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
+                                obj_change = abs(previous_objective - objective)
+                                me_aa.on_accepted(step_norm=aa_jump_me)
+                            else:
+                                me_aa.on_rejected()
+                        else:
+                            me_aa.on_rejected()
+            else:
+                me_aa.reset()
+
             # actual_scaled_dx 已在投影后按 ||candidate - x|| 精确计算，准确识别贴墙零位移驻点
             # 自适应阻尼调节：识别香蕉谷交替回溯与满步慢发散，并在满步显著压降目标时果断放松阻尼避免蒸汽焓等线性斜坡焊死重阻尼
             if step_scale >= 0.5 or used_cross_zero_halving:
                 backtrack_streak = max(0, backtrack_streak - 1)
+                if step_scale >= 0.9 and not used_cross_zero_halving and objective < previous_objective:
+                    healthy_fullstep_streak += 1
+                    # 连续健康满步下降说明已脱离前期非凸回溯区，逐步解锁 min_cycle_damping 防止焊死紧零注入零空间(特征值~1e-7)
+                    if min_cycle_damping > 0.0 and healthy_fullstep_streak >= 4:
+                        min_cycle_damping *= 0.1
+                        healthy_fullstep_streak = 0
+                        if min_cycle_damping < 1e-7:
+                            min_cycle_damping = 0.0
+                else:
+                    healthy_fullstep_streak = 0
                 if (
                     scaled_correction > max(self.tol, 1e-5)
                     and scaled_correction >= 0.95 * prev_scaled_correction
@@ -4299,6 +4383,7 @@ class HybridStateEstimator:
             else:
                 fullstep_osc_streak = 0
                 smooth_fullstep_streak = 0
+                healthy_fullstep_streak = 0
                 backtrack_streak += 2
                 if backtrack_streak >= 4 or step_scale < 1e-2:
                     if damp_relaxed_flag:
@@ -4320,7 +4405,7 @@ class HybridStateEstimator:
                 low_progress_streak += 1
             else:
                 low_progress_streak = 0
-            if min_cycle_damping > 0.0 and obj_change <= max(1e-10, 2e-3 * (abs(previous_objective) + 1.0)):
+            if min_cycle_damping > 0.0 and obj_change <= max(1e-10, 1e-2 * (abs(previous_objective) + 1.0)):
                 cycle_slow_streak += 1
             else:
                 cycle_slow_streak = 0
@@ -4485,7 +4570,7 @@ class HybridStateEstimator:
                                 continue
                         if dx_alm_me is None:
                             break
-                        if float(np.max(np.abs(dx_alm_me) / np.maximum(me_state_scales, 1.0))) < 1.0e-8:
+                        if float(np.max(np.abs(dx_alm_me) / np.maximum(me_state_scales, 1.0))) < 1.0e-12:
                             break
                         s_me = 1.0
                         ok_me = False
@@ -4703,7 +4788,9 @@ class HybridStateEstimator:
         self.iterations = int(result.iterations)
         self.observability_result = result.observability
         self.multi_energy_observability_result = result.observability
-        self.removed_bad_data = list(removed_bad_data or ())
+        rem_list = list(removed_bad_data or ())
+        populate_bad_data_device_names(rem_list, self.measurement_device_names)
+        self.removed_bad_data = rem_list
         if skip_bad_data:
             bad_items = []
             normalized = np.asarray([], dtype=np.float64)
@@ -5145,6 +5232,7 @@ class HybridStateEstimator:
             self._multi_energy_weight[:] = orig_me_weights
             self._multi_energy_z[:] = orig_me_z
 
+        populate_bad_data_device_names(removed, self.measurement_device_names)
         return result, removed
 
     def _prepare_uncoupled_direct_delegate(self, side: str, profile_start: float) -> "HybridStateEstimator":
@@ -12953,6 +13041,7 @@ class HybridStateEstimator:
                 )
             )
         bad_items.sort(key=lambda item: item.normalized_residual, reverse=True)
+        populate_bad_data_device_names(bad_items, self.measurement_device_names)
         self._last_leverage_cache = (id(result), leverage, cached_factor)
         if profile_start is not None:
             self._record_profile_time("bad_data.total", time.perf_counter() - profile_start)
@@ -13264,6 +13353,7 @@ class HybridStateEstimator:
         finally:
             self._array_only_estimate_result = previous_array_only
             self._bad_data_fast_final_verify = previous_fast_verify
+        populate_bad_data_device_names(removed, self.measurement_device_names)
         self.removed_bad_data = removed
         if skip_bad_data:
             bad_items = []
@@ -14641,6 +14731,8 @@ class HybridStateEstimator:
                     ])
                     if not candidates:
                         if result.converged:
+                            populate_bad_data_device_names(bad_items, self.measurement_device_names)
+                            populate_bad_data_device_names(removed, self.measurement_device_names)
                             self._last_bad_data_cache = (id(final_res), float(base_threshold), list(bad_items), normalized)
                             return final_res, removed
                         if rescue_rounds < 6 and _try_hybrid_boundary_node_rescue():
@@ -15174,6 +15266,8 @@ class HybridStateEstimator:
             if full_normalized_valid
             else None
         )
+        populate_bad_data_device_names(bad_items, self.measurement_device_names)
+        populate_bad_data_device_names(removed, self.measurement_device_names)
         return final_res, removed
 
     def print_state(self, x: np.ndarray, limit: int = 20) -> None:

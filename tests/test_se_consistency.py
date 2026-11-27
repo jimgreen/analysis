@@ -8707,6 +8707,93 @@ def test_hybrid_dirty_warm_start_and_lower_csc_fallback_regression(tmp_path: Pat
     assert res.iterations <= 20
 
 
+def test_fluid_flat_start_compressor_zi_and_summary_bdr_device_names_regression(tmp_path: Path):
+    """验证平启动流体压缩机零注入不假收敛锁定，且电侧 summary 模式回填坏数据真实设备名。"""
+    from lfcore.gas_lf import GasPowerFlowCalc
+    from model.gas_model import load_gas_network_from_e_file
+    from secore.gas_se import GasStateEstimator
+
+    # 1. 平启动气网 + RATIO 压缩机 + 纯零注入节点：不得在首两步因等压奇点大导数提前假收敛锁死在 0.1
+    gas_e = tmp_path / "gas_cmp_zi.e"
+    gas_m = tmp_path / "gas_cmp_zi.meas"
+    gas_e.write_text(
+        "\n".join(
+            [
+                "<GasMedium>",
+                "@ density compressibility molar_mass temperature flow_factor",
+                "# 0.78 0.96 0.017 288.15 1.0",
+                "</GasMedium>",
+                "<GasNode>",
+                "@ idx name pressure run_stat",
+                "# 1 gn_1 20.0 1",
+                "# 2 gn_2 19.8 1",
+                "# 3 gn_zi 19.6 1",
+                "# 4 gn_4 23.0 1",
+                "# 5 gn_dead_zi 19.6 1",
+                "</GasNode>",
+                "<GasSource>",
+                "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+                "# 1 gsrc_1 1 PRESSURE 20.0 0.0 1.0 0.0 500.0 1",
+                "</GasSource>",
+                "<GasLoad>",
+                "@ idx name node flow_set run_stat",
+                "# 1 gld_2 2 1.2 1",
+                "# 2 gld_4 4 2.5 1",
+                "</GasLoad>",
+                "<GasPipe>",
+                "@ idx name i_node j_node conductance run_stat",
+                "# 1 gp_1_2 1 2 60.0 1",
+                "# 2 gp_2_3 2 3 60.0 1",
+                "# 3 gp_2_5 2 5 60.0 1",
+                "</GasPipe>",
+                "<GasCompressor>",
+                "@ idx name i_node j_node control_type ratio flow_set run_stat",
+                "# 1 gcmp_1 3 4 RATIO 1.18 0.0 1",
+                "</GasCompressor>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    lf_g = GasPowerFlowCalc(load_gas_network_from_e_file(str(gas_e)), parameters=LF_PARAMS)
+    lf_g.prepare()
+    assert lf_g.run() == 0
+    gas_m.write_text(
+        "\n".join(
+            [
+                "<Measurement>",
+                "@ idx name dev_type dev_name meas_type weight valid value status",
+                f"# 1 m1 GasNode gn_1 PRESSURE 400.0 1 {float(lf_g.pressure[0]):.6f} 0",
+                f"# 2 m2 GasNode gn_2 PRESSURE 400.0 1 {float(lf_g.pressure[1]):.6f} 0",
+                f"# 3 m3 GasNode gn_4 PRESSURE 400.0 1 {float(lf_g.pressure[3]):.6f} 0",
+                f"# 4 m4 GasNode gn_dead_zi PRESSURE 400.0 1 {float(lf_g.pressure[4]) * 0.96:.6f} 0",
+                f"# 5 m5 GasPipe gp_1_2 FLOW_FROM 100.0 1 {float(lf_g.edge_flow[0]):.6f} 0",
+                f"# 6 m6 GasCompressor gcmp_1 FLOW_FROM 100.0 1 {float(lf_g.edge_flow[3]):.6f} 0",
+                "</Measurement>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    est_g = GasStateEstimator(load_gas_network_from_e_file(str(gas_e)), str(gas_m), parameters=SE_PARAMS, flat_start=True)
+    assert est_g.run(remove_bad_data=True, verbose=False) == 0
+    _, flow_g, _ = est_g._flow_state_arrays(est_g.result.x, need_derivative=False)
+    nb_g = np.asarray(est_g.network.incidence @ flow_g, dtype=np.float64)
+    assert abs(float(nb_g[2])) < 1e-4
+    assert abs(float(nb_g[4])) < 1e-4
+
+    # 2. 验证电侧 summary 模式剔除坏数据后回填真实设备名称而非 'pos:k'
+    ac_e, ac_m = _generate_ac_case(8, tmp_path, inject_bad=True)
+    est_ac = ACStateEstimator(e_file=ac_e, meas_file=ac_m, parameters=SE_PARAMS, flat_start=True)
+    se_res = est_ac.run(result_mode="summary", remove_bad_data=True, skip_bad_data=False, verbose=False)
+    assert se_res is not None
+    assert len(est_ac.removed_bad_data) >= 1
+    for item in est_ac.removed_bad_data:
+        assert item.measurement.device_name
+        assert not str(item.measurement.device_name).startswith("pos:")
+
+
+
 
 
 

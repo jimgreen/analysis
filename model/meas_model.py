@@ -312,6 +312,36 @@ def measurement_from_table_row(table: MeasurementTable, row: int) -> Measurement
     return measurement
 
 
+def populate_bad_data_device_names(items, device_names_fn) -> None:
+    """按需将极速数组模式下生成的 'pos:k' 占位设备名称回填为模型真实设备名称。"""
+    if not items or device_names_fn is None:
+        return
+    needed_codes = set()
+    pending = []
+    for item in items:
+        meas = getattr(item, "measurement", item)
+        dn = str(getattr(meas, "device_name", "") or "")
+        dpos = int(getattr(meas, "device_pos", -1))
+        dtc = int(getattr(meas, "device_type_code", 0))
+        if (not dn or dn.startswith("pos:")) and dpos >= 0 and dtc > 0:
+            needed_codes.add(dtc)
+            pending.append((meas, dtc, dpos))
+    if not pending:
+        return
+    try:
+        names_by_code = device_names_fn(needed_codes)
+    except Exception:
+        return
+    if not names_by_code:
+        return
+    for meas, dtc, dpos in pending:
+        arr = names_by_code.get(dtc)
+        if arr is not None and 0 <= dpos < len(arr):
+            real_name = str(arr[dpos])
+            if real_name:
+                meas.device_name = real_name
+
+
 class TableBackedMeasurementList(MeasurementList):
     """Measurement sequence backed by MeasurementTable, with lazy row objects."""
 
