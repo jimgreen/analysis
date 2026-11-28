@@ -22,8 +22,10 @@ from algorithm_parameters import (
     DEFAULT_SE_PARAMETER_FILE,
     StateEstimationParameters,
     load_se_parameters,
+    resolve_adaptive_bad_data_caps,
     resolve_auto_extreme_bad_data_caps,
     resolve_bad_data_limits,
+    resolve_effective_pseudo_cap,
 )
 from lfcore.common import allocate_limited_residual
 from model.fluid_model import FluidNetwork
@@ -58,6 +60,7 @@ from secore.se_math import (
     compute_active_column_degrees,
     compute_adaptive_bad_threshold,
     compute_normalized_residuals_for_bad_data,
+    compute_robust_outlier_norm_floor,
     filter_batch_preserving_column_coverage,
     measurement_leverage_for_bad_data,
     select_independent_bad_data_batch,
@@ -2697,7 +2700,11 @@ class FluidStateEstimator:
         # 在挂载零注入约束前，先基于纯外部真实量测检查显式受控支路是否缺乏直接流量测点支撑（仅靠 1e-10 热损导数）
         weak_reg_cols = np.empty(0, dtype=np.int64)
         fragile_upwind_h_cols = np.empty(0, dtype=np.int64)
-        max_add = int(self.params.targeted_pseudo_measurement_max)
+        max_add = resolve_effective_pseudo_cap(
+            int(self.params.targeted_pseudo_measurement_max),
+            int(self.state_count),
+            explicit_override=bool(getattr(self.params, "_explicit_pseudo_max", False)),
+        )
         if add_pseudo and self.n_regulated > 0:
             H_ext = self.jacobian_sparse(x)
             state_scales = self.state_base_scales()
@@ -3063,6 +3070,9 @@ class FluidStateEstimator:
         observability: Optional[ObservabilityResult] = None,
         _weight_override: Optional[np.ndarray] = None,
         _hint_lm_damping: float = 0.0,
+        _max_iter_cap: Optional[int] = None,
+        _huber_irls_k: Optional[float] = None,
+        _skip_terminal_alm: bool = False,
     ) -> EstimateResult:
         if not self.prepared:
             self.prepare()
@@ -3361,7 +3371,21 @@ class FluidStateEstimator:
             gain = None
             return dx_raw, rhs_vec, diag_g, pinned_pot
 
-        for iteration in range(1, self.max_iter + 1):
+        eff_fluid_max_iter = (
+            min(int(self.max_iter), max(1, int(_max_iter_cap)))
+            if _max_iter_cap is not None
+            else int(self.max_iter)
+        )
+        huber_base_weight: Optional[np.ndarray] = None
+        huber_real_mask: Optional[np.ndarray] = None
+        if _huber_irls_k is not None and float(_huber_irls_k) > 0.0:
+            huber_base_weight = target_weight.copy()
+            huber_real_mask = (huber_base_weight > 0.0) & (huber_base_weight <= 1.0e5)
+            if zi_plan_rows.size > 0:
+                valid_zi = zi_plan_rows[(zi_plan_rows >= 0) & (zi_plan_rows < huber_real_mask.size)]
+                huber_real_mask[valid_zi] = False
+
+        for iteration in range(1, eff_fluid_max_iter + 1):
             if cached_z_est is not None:
                 z_est = cached_z_est
                 residual = cached_residual
@@ -3370,6 +3394,15 @@ class FluidStateEstimator:
             else:
                 z_est = self.evaluate(x)
                 residual = z - z_est
+                if huber_base_weight is not None and huber_real_mask is not None:
+                    hk_f = float(_huber_irls_k)
+                    base_cur_w = weight if zi_softened else huber_base_weight
+                    s_hub = np.sqrt(np.maximum(huber_base_weight, 0.0)) * np.abs(residual)
+                    big_h = huber_real_mask & (s_hub > hk_f)
+                    if np.any(big_h):
+                        w_hub = base_cur_w.copy()
+                        w_hub[big_h] = huber_base_weight[big_h] * (hk_f / s_hub[big_h])
+                        weight = w_hub
                 objective = float(np.dot(weight, residual * residual))
             H = self.jacobian_sparse(x)
 
@@ -3497,9 +3530,9 @@ class FluidStateEstimator:
                 step_damping > 0.0
                 and (
                     (
-                        rel_correction < max(1e-5, 10.0 * self.tol)
-                        and kkt_inf <= max(1e-4, 100.0 * self.tol)
-                        and pred_drop <= max(1e-8, 1e-7 * (abs(objective) + 1.0))
+                        rel_correction < max(2e-5, 20.0 * self.tol)
+                        and kkt_inf <= max(3e-4, 300.0 * self.tol)
+                        and (pred_drop <= max(1e-8, 1e-6 * (abs(objective) + 1.0)) or self.state_count >= 5000)
                     )
                     or (
                         not zi_softened
@@ -3916,13 +3949,16 @@ class FluidStateEstimator:
 
         # 增广拉格朗日乘子（ALM）零注入流量守恒精修：在不继续放大惩罚权重、保持正规方程良态的前提下，
         # 通过 1~3 轮乘子偏置更新消除高管导/强压力噪声对纯零注入节点的残余质量牵拉
+        fluid_alm_skipped = False
         if converged and zi_active_rows.size > 0:
             z_est_chk = cached_z_est if cached_z_est is not None else self.evaluate(x)
             res_chk = z - z_est_chk
             _, flow_chk, _ = self._flow_state_arrays(x, need_derivative=False)
             f_ref_alm = max(float(np.max(np.abs(flow_chk))) if flow_chk.size else 1.0, 1.0)
             best_zi_err = float(np.max(np.abs(res_chk[zi_active_rows])))
-            if np.isfinite(best_zi_err) and best_zi_err > 1.0e-5 * f_ref_alm:
+            if np.isfinite(best_zi_err) and best_zi_err > 1.0e-5 * f_ref_alm and _skip_terminal_alm:
+                fluid_alm_skipped = True
+            elif np.isfinite(best_zi_err) and best_zi_err > 1.0e-5 * f_ref_alm:
                 x_alm = x.copy()
                 z_est_alm = z_est_chk.copy()
                 alm_shift = np.zeros(zi_active_rows.size, dtype=np.float64)
@@ -3987,6 +4023,19 @@ class FluidStateEstimator:
                     else:
                         break
 
+        # 仅当终轮无阻尼且未开启 Huber 重加权时，缓存求解器与标幺线性因子句柄供坏数据杠杆复用
+        if _huber_irls_k is None and last_used_damping == 0.0 and evaluated_at_final_x:
+            self._last_aat_solver = aat_solver if use_aat else None
+            self._last_linear_factor = (
+                aat_solver.last_linear_factor
+                if (use_aat and aat_solver is not None and aat_solver.last_linear_factor is not None)
+                else normal_solver.last_linear_factor
+            )
+        else:
+            self._last_aat_solver = None
+            self._last_linear_factor = None
+
+        need_explicit_gain = (self.state_count <= 5000) or (self._last_linear_factor is None)
         if not evaluated_at_final_x:
             if cached_z_est is not None:
                 z_est = cached_z_est
@@ -3999,16 +4048,17 @@ class FluidStateEstimator:
             if max_correction < self.tol:
                 converged = True
             H = self.jacobian_sparse(x)
-            gain = (H.T @ (diags(weight) @ H)).tocsr()
+            gain = (H.T @ (diags(weight) @ H)).tocsr() if need_explicit_gain else None
         else:
-            if gain is None or getattr(gain, "format", None) != "csr" or gain.shape != (self.state_count, self.state_count) or gain.nnz == 0:
+            if need_explicit_gain and (
+                gain is None
+                or getattr(gain, "format", None) != "csr"
+                or gain.shape != (self.state_count, self.state_count)
+                or gain.nnz == 0
+            ):
                 gain = (H.T @ (diags(weight) @ H)).tocsr()
-
-        # 仅当终轮无阻尼且使用 aat_solver 成功分解时，缓存求解器供坏数据杠杆复用
-        if use_aat and aat_solver is not None and last_used_damping == 0.0 and evaluated_at_final_x:
-            self._last_aat_solver = aat_solver
-        else:
-            self._last_aat_solver = None
+            elif not need_explicit_gain:
+                gain = None
 
         active_table = getattr(self.active_measurements, "table", None)
         if active_table is None or int(active_table.idx.size) != len(self.active_measurements):
@@ -4030,6 +4080,10 @@ class FluidStateEstimator:
         )
         result._final_lm_damping = float(lm_damping)
         result._state_base_scales = state_scales
+        if fluid_alm_skipped:
+            result._alm_skipped = True
+        if _max_iter_cap is not None and not converged and iteration >= min(int(self.max_iter), max(1, int(_max_iter_cap))):
+            result._iter_capped = True
         self.result = result
         self._write_back_state(x)
         return result
@@ -4070,9 +4124,14 @@ class FluidStateEstimator:
 
         # 使用精确杠杆 h_ii = diag(H G^-1 H^T) = diag(H_pu G_pu^-1 H_pu^T) 在标幺良态空间计算标准化残差
         leverage = None
-        if result.H is not None and result.gain is not None and result.H.shape[0] == n_meas and self.state_count > 0:
+        if result.H is not None and result.H.shape[0] == n_meas and self.state_count > 0:
             cached_solver = getattr(self, "_last_aat_solver", None)
             cached_fac = cached_solver.last_cholmod_factor if cached_solver is not None else None
+            cached_lin_fac = (
+                getattr(self, "_last_linear_factor", None)
+                if result is self.result
+                else cached_fac
+            )
             cached_op = cached_solver.last_normal_operand if cached_solver is not None else None
             state_scales = getattr(result, "_state_base_scales", None)
             if state_scales is None or np.asarray(state_scales).size != int(result.H.shape[1]):
@@ -4082,14 +4141,22 @@ class FluidStateEstimator:
             H_pu = H_csr.copy()
             if H_pu.nnz > 0:
                 H_pu.data = H_csr.data * state_scales[H_csr.indices]
-            D_s = diags(state_scales, format="csc")
-            gain_pu = (D_s @ result.gain.tocsc() @ D_s).tocsr()
+            if cached_lin_fac is not None and self.state_count > 1024 and cached_fac is None:
+                gain_pu = None
+            else:
+                base_g = result.gain if result.gain is not None else (H_csr.T @ (diags(weights) @ H_csr)).tocsr()
+                D_s = diags(state_scales, format="csc")
+                gain_pu = (D_s @ base_g.tocsc() @ D_s).tocsr()
             try:
                 leverage = measurement_leverage_for_bad_data(
                     H_pu,
                     gain_pu,
                     cholmod_factor=cached_fac,
                     aat_operand=cached_op,
+                    linear_factor=cached_lin_fac,
+                    weights=weights,
+                    residual=result.residual,
+                    is_pseudo=is_protected,
                     dense_state_limit=256,
                     sparse_threshold=256,
                     sparse_state_limit=500_000,
@@ -4102,6 +4169,16 @@ class FluidStateEstimator:
                 np.asarray(result.residual, dtype=np.float64),
                 weights,
                 leverage,
+                is_pseudo=is_protected,
+            )
+            from secore.se_math import unmask_pseudo_paired_gross_errors
+            unmask_pseudo_paired_gross_errors(
+                result.H,
+                np.asarray(result.residual, dtype=np.float64),
+                weights,
+                leverage,
+                normalized,
+                critical_mask,
                 is_pseudo=is_protected,
             )
             # 掩蔽权重为 0（已剔除）的行不再上报
@@ -4211,14 +4288,14 @@ class FluidStateEstimator:
                 max_remove=eff_max_remove,
                 max_remove_per_round=eff_max_per_round,
             )
-            ext_total_cap, ext_round_cap = resolve_auto_extreme_bad_data_caps(
+            ext_total_cap, ext_round_cap = resolve_adaptive_bad_data_caps(
                 n_real_valid,
                 max_remove=max_remove,
                 max_remove_per_round=max_remove_per_round,
                 param_max_remove=self.params.max_remove,
                 param_max_remove_per_round=self.params.max_remove_per_round,
             )
-            ext_norm_floor = max(15.0, 4.0 * float(threshold_value))
+            ext_norm_floor = max(6.0, 2.0 * float(threshold_value))
 
             cur_weight = base_weight.copy()
             active_mask = cur_weight > 0.0
@@ -4226,19 +4303,45 @@ class FluidStateEstimator:
             removed_rows_set = set()
             blocked_rows_set = set()
 
-            res = self.estimate(observability=obs, _weight_override=cur_weight)
-            if not res.converged and not self.params.flat_start:
+            init_f_cap = min(int(self.max_iter), 22) if (self.state_count >= 5000 and total_cap > 0) else None
+            res = self.estimate(
+                observability=obs,
+                _weight_override=cur_weight,
+                _max_iter_cap=init_f_cap,
+                _skip_terminal_alm=(total_cap > 0),
+            )
+            if not res.converged and not self.params.flat_start and self.state_count < 5000:
                 flat_init_res = self.estimate(
                     x0=self.initial_state(flat_start=True),
                     observability=obs,
                     _weight_override=cur_weight,
                     _hint_lm_damping=0.0,
+                    _max_iter_cap=init_f_cap,
                 )
                 if flat_init_res.converged or (
                     np.isfinite(flat_init_res.objective)
                     and (not np.isfinite(res.objective) or flat_init_res.objective < res.objective)
                 ):
                     res = flat_init_res
+            if not res.converged and total_cap > 0 and self.state_count >= 64 and int(self.max_iter) >= 6:
+                hub_init_x = (
+                    self.initial_state(flat_start=True)
+                    if (not np.all(np.isfinite(res.x)))
+                    else res.x
+                )
+                hub_res = self.estimate(
+                    x0=hub_init_x,
+                    observability=obs,
+                    _weight_override=cur_weight,
+                    _hint_lm_damping=0.0,
+                    _max_iter_cap=min(int(self.max_iter), 12),
+                    _huber_irls_k=3.5,
+                    _skip_terminal_alm=True,
+                )
+                if np.all(np.isfinite(hub_res.x)) and np.all(np.isfinite(hub_res.residual)):
+                    # 在 Huber 稳健状态点按原始 cur_weight 重新评估真实目标与雅可比，精准浮出全部强粗差
+                    hub_res.objective = float(np.dot(cur_weight, hub_res.residual * hub_res.residual))
+                    res = hub_res
             if total_cap <= 0 or (not res.converged and not (obs.observable and np.isfinite(res.objective))):
                 self.identify_bad_data(res, threshold=threshold_value, weight_override=cur_weight)
                 return res, removed_items
@@ -4251,7 +4354,9 @@ class FluidStateEstimator:
             norm_res = np.empty(0, dtype=np.float64)
             col_degrees: Optional[np.ndarray] = None
             row_to_item: Dict[int, BadDataItem] = {}
+            fluid_round_idx = 0
             while len(removed_items) < ext_total_cap:
+                fluid_round_idx += 1
                 if need_identify:
                     bad_list, norm_res = self.identify_bad_data(
                         res,
@@ -4264,22 +4369,41 @@ class FluidStateEstimator:
                 if not bad_list:
                     break
                 extreme_only = len(removed_items) >= total_cap
+                cur_fluid_ext_floor = (
+                    compute_robust_outlier_norm_floor(
+                        res.residual,
+                        cur_weight,
+                        float(threshold_value),
+                        protected_mask=is_protected,
+                        n_state=self.state_count,
+                    )
+                    if extreme_only
+                    else ext_norm_floor
+                )
                 cand_rows = [
                     int(it.row_pos)
                     for it in bad_list
                     if int(it.row_pos) not in removed_rows_set
                     and int(it.row_pos) not in blocked_rows_set
                     and not bool(is_protected[int(it.row_pos)])
-                    and (not extreme_only or float(it.normalized_residual) >= ext_norm_floor)
+                    and (not extreme_only or float(it.normalized_residual) >= cur_fluid_ext_floor)
                 ]
                 if not cand_rows:
                     break
                 cand_norms = [float(norm_res[r]) for r in cand_rows]
-                eff_total = ext_total_cap if extreme_only else total_cap
-                eff_round = ext_round_cap if extreme_only else round_cap
+                auto_burst_f = (
+                    (max_remove is None and self.params.max_remove is None)
+                    and ext_round_cap > round_cap
+                    and sum(1 for cn in cand_norms if cn >= ext_norm_floor) > round_cap
+                )
+                eff_total = ext_total_cap if (extreme_only or auto_burst_f) else total_cap
+                eff_round = ext_round_cap if (extreme_only or auto_burst_f) else round_cap
                 remaining = eff_total - len(removed_items)
                 batch_limit = min(eff_round, remaining)
                 # 选择图上相互独立的坏数据子批，避免单条坏数据连带邻域引发误报
+                use_fast_hops_f = auto_burst_f or (
+                    max_remove is None and self.params.max_remove is None and self.state_count >= 2000
+                )
                 selected_pos = select_independent_bad_data_batch(
                     res.H,
                     cand_rows,
@@ -4287,7 +4411,15 @@ class FluidStateEstimator:
                     threshold_value,
                     min_batch_norm=max(threshold_value, 4.5),
                     max_batch=batch_limit,
-                    min_hops=3,
+                    min_hops=(
+                        1
+                        if (use_fast_hops_f and len(cand_rows) >= 64 and cand_norms[0] >= max(6.0, 1.5 * float(threshold_value)))
+                        else (
+                            2
+                            if (use_fast_hops_f and len(cand_rows) >= 16 and cand_norms[0] >= max(4.5, 1.2 * float(threshold_value)))
+                            else 3
+                        )
+                    ),
                 )
                 selected = [cand_rows[k] for k in selected_pos] if selected_pos else [cand_rows[0]]
 
@@ -4302,24 +4434,25 @@ class FluidStateEstimator:
                 if not safe_rows:
                     break
 
-                # 结构满秩前置拦截：若删批后导致系统结构降秩（临界对/孤立支路），折半收缩或跳过临界行
+                # 结构满秩前置拦截：中小规模执行精确二分图匹配，超大规模依赖列覆盖守卫 + 试算回滚避免每轮跑 12 万阶匹配
                 trial_rows = list(safe_rows)
-                while trial_rows:
-                    t_mask = active_mask.copy()
-                    t_w = cur_weight.copy()
-                    t_mask[trial_rows] = False
-                    t_w[trial_rows] = 0.0
-                    if check_active_structural_full_rank(res.H, t_mask, t_w):
-                        break
-                    if len(trial_rows) == 1:
-                        blocked_rows_set.add(trial_rows[0])
-                        trial_rows = []
-                        break
-                    trial_rows = trial_rows[: max(1, len(trial_rows) // 2)]
-                if not trial_rows:
-                    if len(blocked_rows_set) >= 32:
-                        break
-                    continue
+                if self.state_count < 5000:
+                    while trial_rows:
+                        t_mask = active_mask.copy()
+                        t_w = cur_weight.copy()
+                        t_mask[trial_rows] = False
+                        t_w[trial_rows] = 0.0
+                        if check_active_structural_full_rank(res.H, t_mask, t_w):
+                            break
+                        if len(trial_rows) == 1:
+                            blocked_rows_set.add(trial_rows[0])
+                            trial_rows = []
+                            break
+                        trial_rows = trial_rows[: max(1, len(trial_rows) // 2)]
+                    if not trial_rows:
+                        if len(blocked_rows_set) >= 32:
+                            break
+                        continue
 
                 # 带回滚与折半退避的重估：防止误删隐式临界测点导致压力坍塌、单点压力爆炸或发散
                 pw = max(float(self.network.potential_power), 1e-12)
@@ -4338,19 +4471,34 @@ class FluidStateEstimator:
                     t_weight = cur_weight.copy()
                     t_weight[trial_rows] = 0.0
                     hint_damp = float(getattr(res, "_final_lm_damping", 0.0))
+                    mid_batch_cap = (
+                        min(int(self.max_iter), 12)
+                        if (fluid_round_idx <= 8 and self.state_count >= 5000 and (len(cand_rows) - len(trial_rows)) >= 32)
+                        else None
+                    )
                     trial_res = self.estimate(
                         x0=res.x,
                         observability=obs,
                         _weight_override=t_weight,
                         _hint_lm_damping=hint_damp,
+                        _max_iter_cap=mid_batch_cap,
+                        _skip_terminal_alm=True,
                     )
-                    # 热启动未能收敛时自动以平启动重试一次，避免被高阻尼坏初值锁死
-                    if not trial_res.converged:
+                    trial_iter_capped = bool(getattr(trial_res, "_iter_capped", False))
+                    # 小中规模或热启动目标恶化时才以平启动重试，避免大尺度管网每轮批删双倍全量分解
+                    need_flat_retry = (not trial_res.converged and not trial_iter_capped) and (
+                        self.state_count < 2000
+                        or not np.isfinite(trial_res.objective)
+                        or (np.isfinite(res.objective) and trial_res.objective >= res.objective)
+                        or (len(cand_rows) <= len(trial_rows))
+                    )
+                    if need_flat_retry:
                         flat_res = self.estimate(
                             x0=self.initial_state(flat_start=True),
                             observability=obs,
                             _weight_override=t_weight,
                             _hint_lm_damping=0.0,
+                            _max_iter_cap=mid_batch_cap,
                         )
                         if flat_res.converged or (
                             np.isfinite(flat_res.objective)
@@ -4373,12 +4521,14 @@ class FluidStateEstimator:
                             and trial_max_p > 1.25 * prev_max_p
                         )
                     )
-                    # 允许首轮未收敛后通过删坏恢复收敛；已收敛后若删坏导致发散、压力坍塌/爆炸或目标严重恶化则回滚折半
+                    # 允许首轮未收敛后通过删坏恢复收敛；中间限步轮次只要目标下降且无压力坍塌则放行延续；终轮统一精算
+                    trial_iter_capped = bool(getattr(trial_res, "_iter_capped", False))
                     trial_ok = (
                         np.isfinite(trial_res.objective)
                         and not pressure_abnormal
                         and (
                             trial_res.converged
+                            or (trial_iter_capped and trial_res.objective <= res.objective * 1.02 + 1e-6)
                             or (not res.converged and trial_res.objective < res.objective)
                         )
                         and (
@@ -4406,6 +4556,8 @@ class FluidStateEstimator:
                         if res.converged:
                             unconverged_streak = 0
                             unconverged_total_rounds = 0
+                        elif bool(getattr(res, "_iter_capped", False)):
+                            unconverged_streak = 0
                         else:
                             unconverged_total_rounds += 1
                             if np.isfinite(prev_obj_accepted) and res.objective <= 0.85 * prev_obj_accepted:
@@ -4427,6 +4579,19 @@ class FluidStateEstimator:
                 if unconverged_streak >= 3 or unconverged_total_rounds >= 10:
                     break
 
+            if getattr(res, "_iter_capped", False) or (res.converged and getattr(res, "_alm_skipped", False)):
+                final_f_cap = 3 if (res.converged and getattr(res, "_alm_skipped", False)) else None
+                final_f_res = self.estimate(
+                    x0=res.x,
+                    observability=obs,
+                    _weight_override=cur_weight,
+                    _hint_lm_damping=0.0 if res.converged else float(getattr(res, "_final_lm_damping", 0.0)),
+                    _max_iter_cap=final_f_cap,
+                    _skip_terminal_alm=False,
+                )
+                if final_f_res.converged or (not res.converged and np.isfinite(final_f_res.objective) and final_f_res.objective <= res.objective):
+                    res = final_f_res
+                    need_identify = True
             self.bad_data = removed_items
             if need_identify:
                 self.identify_bad_data(res, threshold=threshold_value, weight_override=cur_weight)

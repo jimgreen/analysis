@@ -2077,7 +2077,14 @@ class CholmodAAtNormalEquationSolver:
         if float(damping) > 0.0:
             gain = gain + SP_EYE(gain.shape[0], format="csc", dtype=np.float64) * float(damping)
         self._active_backend = "fallback"
-        sol, diag = self._fallback_solver.solve(gain.tocsc(), rhs_solve, return_factor_diag=return_factor_diag)
+        sol, diag = self._fallback_solver.solve(
+            gain.tocsc(),
+            rhs_solve,
+            return_factor_diag=return_factor_diag,
+            damping=0.0,
+        )
+        if float(damping) > 0.0:
+            self._fallback_solver._last_superlu_factor = None
         if col_scale is not None:
             sol = np.asarray(sol, dtype=np.float64) * col_scale
         return sol, diag
@@ -2090,6 +2097,18 @@ class CholmodAAtNormalEquationSolver:
         if self._active_backend == "pardiso" and self._pardiso_factor is not None:
             return self._pardiso_factor
         return self._cholmod_factor
+
+    @property
+    def last_linear_factor(self):
+        """返回最近一次无阻尼精确分解的可调用线性求解因子（含 PARDISO、CHOLMOD 或 SciPy SuperLU 包装器）。"""
+        fac = self.last_cholmod_factor
+        if fac is not None:
+            return fac
+        if self._last_factor_scaled:
+            return None
+        if self._active_backend == "fallback":
+            return self._fallback_solver.last_linear_factor
+        return None
 
     def refresh_unregularized_factor(self, A_csc) -> bool:
         """在收敛点处对未缩放稀疏操作数 A_csc 原位刷新无阻尼精确因子（兼容此前曾触发列均衡缩放的情形）。"""
@@ -2166,12 +2185,19 @@ class CholmodAAtNormalEquationSolver:
         return None
 
     def solve_with_cached_factor(self, rhs: np.ndarray) -> Optional[np.ndarray]:
-        """直接复用当前 PARDISO 或 CHOLMOD 数值因子执行稀疏前代/回代，不重新分解。"""
+        """直接复用当前 PARDISO、CHOLMOD 或 SuperLU 数值因子执行稀疏前代/回代，不重新分解。"""
         if self._active_backend == "pardiso" and self._pardiso_factor is not None and not self._pardiso_disabled:
             try:
                 return np.asarray(self._pardiso_factor.solve(rhs), dtype=np.float64)
             except Exception:
                 return None
+        if self._active_backend == "fallback" and not self._last_factor_scaled:
+            fb_fac = self._fallback_solver.last_linear_factor
+            if fb_fac is not None:
+                try:
+                    return np.asarray(fb_fac(rhs), dtype=np.float64)
+                except Exception:
+                    return None
         if self._cholmod_factor is None or self._cholmod_disabled:
             return None
         try:
@@ -3026,23 +3052,174 @@ def inverse_gain_for_bad_data(gain: np.ndarray, dense_state_limit: int = 5000):
         return np.linalg.pinv(gain)
 
 
+def _estimate_leverage_hybrid_superlu(
+    H,
+    gain,
+    *,
+    linear_factor=None,
+    weights: Optional[np.ndarray] = None,
+    residual: Optional[np.ndarray] = None,
+    is_pseudo: Optional[np.ndarray] = None,
+    n_projections: int = 16,
+) -> Optional[np.ndarray]:
+    """无 CHOLMOD 大规模稀疏系统 O(nnz) 随机投影杠杆率估计 + 双通道关键候选精确回代精修。
+
+    数学原理：对加权投影矩阵 ``P = W^{1/2} H G^{-1} H^T W^{1/2}``，利用对称幂等性 ``P^2 = P``，
+    令 ``Z`` 为 ``(m, q)`` 维 Rademacher 随机矩阵，仅需复用单次稀疏 LU 因子批量求解
+    ``U = G^{-1} (H^T W^{1/2} Z)``，则 ``V = H U`` 的行平方和 ``sum_k V_{i,k}^2`` 为 ``H_{ii}``
+    的严格非负无偏估计；随后对近似高归一化残差候选行以及与异常大残差伪量测配对的高杠杆真实测点行，
+    调用 ``exact_leverage_for_candidate_rows`` 执行机器精度精确回代覆写，兼顾十万节点速度与零漏检精度。
+    """
+    if H is None or not is_sparse_matrix(H):
+        return None
+    H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+    m, n = int(H_csr.shape[0]), int(H_csr.shape[1])
+    if m == 0 or n == 0:
+        return np.zeros(m, dtype=np.float64)
+    if weights is None:
+        return None
+    w_arr = np.asarray(weights, dtype=np.float64).ravel()
+    if w_arr.size != m:
+        return None
+
+    fac = linear_factor
+    if fac is None:
+        if gain is None or not is_sparse_matrix(gain):
+            return None
+        gain_csc = gain if getattr(gain, "format", None) == "csc" else gain.tocsc()
+        if _is_strictly_lower_csc(gain_csc):
+            gain_csc = full_normal_equation_from_lower(gain_csc)
+        lu_obj = None
+        try:
+            lu_obj = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
+        except Exception:
+            try:
+                lu_obj = SP_SPLU(gain_csc)
+            except Exception:
+                lu_obj = None
+        if lu_obj is None:
+            return None
+        fac = _SuperLUFactorAdapter(lu_obj, n)
+
+    try:
+        q = max(16, int(n_projections))
+        rng = np.random.default_rng(20260628)
+        scale_q = 1.0 / math.sqrt(float(q))
+        z_rad = np.where(rng.integers(0, 2, size=(m, q), dtype=np.int8) == 1, scale_q, -scale_q)
+        w_pos = np.maximum(w_arr, 0.0)
+        sqrt_w = np.sqrt(w_pos)
+        B = np.asarray(H_csr.T @ (sqrt_w[:, None] * z_rad), dtype=np.float64)
+        U = np.asarray(fac(B), dtype=np.float64)
+        if U.ndim == 1:
+            U = U[:, None]
+        if U.shape != (n, q) or not np.all(np.isfinite(U)):
+            return None
+        V = np.asarray(H_csr @ U, dtype=np.float64)
+        raw_est_lev = np.einsum("ij,ij->i", V, V)
+        if not np.all(np.isfinite(raw_est_lev)):
+            return None
+        # 对未进入精确回代的背景行采用向全局平均杠杆率的收缩估计（上界 0.72），抑制随机投影涨落引发的假阳性
+        avg_h = min(0.60, float(n) / max(float(m), 1.0))
+        h_raw_dimless = np.minimum(w_pos * np.maximum(raw_est_lev, 0.0), 0.85)
+        h_bg_dimless = np.minimum(0.45 * h_raw_dimless + 0.55 * avg_h, 0.72)
+        est_lev = np.where(w_pos > 0.0, h_bg_dimless / np.maximum(w_pos, 1e-12), 0.0)
+
+        if residual is not None:
+            res_arr = np.asarray(residual, dtype=np.float64).ravel()
+            if res_arr.size == m:
+                prot = (
+                    np.asarray(is_pseudo, dtype=bool).ravel()
+                    if (is_pseudo is not None and np.asarray(is_pseudo).size == m)
+                    else np.zeros(m, dtype=bool)
+                )
+                real_active = (w_pos > 0.0) & (~prot)
+                cand_parts: List[np.ndarray] = []
+
+                # 通道 1：基线近似归一化残差显著候选行
+                approx_omega = np.maximum(1.0 / np.maximum(w_pos, 1e-12) - est_lev, 1e-12)
+                approx_norm = np.where(real_active, np.abs(res_arr) / np.sqrt(approx_omega), 0.0)
+                c1 = np.flatnonzero(approx_norm > 1.8)
+                if c1.size > 256:
+                    c1 = c1[np.argpartition(approx_norm[c1], -256)[-256:]]
+                if c1.size > 0:
+                    cand_parts.append(c1)
+
+                # 通道 2：反向追踪与大残差低权伪量测共享状态列的高杠杆真实测点（破解 >=50% 缺测杠杆遮蔽）
+                w_res_abs = sqrt_w * np.abs(res_arr)
+                strained_low_w = (w_pos > 0.0) & (w_pos <= 0.5) & (w_res_abs > 0.28)
+                if np.any(strained_low_w):
+                    strained_cols = np.unique(H_csr[np.flatnonzero(strained_low_w)].indices)
+                    if strained_cols.size > 0:
+                        H_csc = _get_cached_csc_for_graph(H_csr)
+                        c_indptr = H_csc.indptr
+                        c_indices = H_csc.indices
+                        adj_chunks = [
+                            c_indices[int(c_indptr[col_i]) : int(c_indptr[col_i + 1])]
+                            for col_i in strained_cols.tolist()
+                            if int(c_indptr[col_i + 1]) > int(c_indptr[col_i])
+                        ]
+                        if adj_chunks:
+                            paired_rows = np.unique(
+                                adj_chunks[0] if len(adj_chunks) == 1 else np.concatenate(adj_chunks)
+                            )
+                            paired_rows = paired_rows[real_active[paired_rows]]
+                            if paired_rows.size > 384:
+                                h_dimless_est = np.minimum(w_pos[paired_rows] * raw_est_lev[paired_rows], 0.999999)
+                                score_p = w_res_abs[paired_rows] / np.sqrt(np.maximum(1.0 - h_dimless_est, 1e-7))
+                                paired_rows = paired_rows[np.argpartition(score_p, -384)[-384:]]
+                            if paired_rows.size > 0:
+                                cand_parts.append(paired_rows)
+
+                # 通道 3：高近似杠杆且自身存在非平凡残差的真实测点补充核验
+                high_h_mask = real_active & ((w_pos * raw_est_lev) > 0.82) & (w_res_abs > 1.0e-4)
+                c3 = np.flatnonzero(high_h_mask)
+                if c3.size > 128:
+                    h_d3 = np.minimum(w_pos[c3] * raw_est_lev[c3], 0.999999)
+                    s3 = w_res_abs[c3] / np.sqrt(np.maximum(1.0 - h_d3, 1e-7))
+                    c3 = c3[np.argpartition(s3, -128)[-128:]]
+                if c3.size > 0:
+                    cand_parts.append(c3)
+
+                if cand_parts:
+                    refine_rows = np.unique(
+                        cand_parts[0] if len(cand_parts) == 1 else np.concatenate(cand_parts)
+                    ).astype(np.intp, copy=False)
+                    if refine_rows.size > 224:
+                        h_d_ref = np.minimum(w_pos[refine_rows] * raw_est_lev[refine_rows], 0.999999)
+                        s_ref = w_res_abs[refine_rows] / np.sqrt(np.maximum(1.0 - h_d_ref, 1e-7))
+                        top_idx = np.argpartition(s_ref, -224)[-224:]
+                        refine_rows = np.sort(refine_rows[top_idx])
+                    exact_sub = exact_leverage_for_candidate_rows(
+                        H_csr,
+                        refine_rows,
+                        fac,
+                        chunk_size=max(64, int(refine_rows.size)),
+                    )
+                    if exact_sub is not None and exact_sub.size == refine_rows.size:
+                        est_lev[refine_rows] = exact_sub
+        return est_lev
+    except Exception:
+        return None
+
+
 def measurement_leverage_for_bad_data(
     H,
     gain,
     *,
     cholmod_factor=None,
     aat_operand=None,
+    linear_factor=None,
+    weights: Optional[np.ndarray] = None,
+    residual: Optional[np.ndarray] = None,
+    is_pseudo: Optional[np.ndarray] = None,
     dense_state_limit: int = 5000,
     sparse_threshold: Optional[int] = None,
     sparse_state_limit: Optional[int] = None,
 ) -> Optional[np.ndarray]:
     """Compute exact diag(H G^-1 H^T) using sparse selected inversion for medium/large sparse SPD gains.
 
-    稀疏 CHOLMOD 选元求逆仅依赖稀疏因子的非零模式，默认支持至 ``sparse_state_limit``（未显式传参时：
-    若保持默认 ``dense_state_limit == 5000`` 则放宽至 ``100000``；若调用方显式压低 ``dense_state_limit``
-    则沿用该上限以保持兼容）。小中规模（按 ``SEScaleProfile`` 依稀疏度自适应，默认稀疏图 ``<= 768``、
-    稠密图 ``<= 512``）且已缓存 ``cholmod_factor`` 时，直接利用 ``cholmod_factor(I)`` 求精确逆矩阵，
-    免去重新组装 ``gain`` 与重复分解。
+    稀疏 CHOLMOD 选元求逆仅依赖稀疏因子的非零模式，默认支持至 ``sparse_state_limit``；
+    当环境未安装 CHOLMOD 且规模较大时，自动切换基于稀疏 LU 复用的 O(nnz) 随机投影 + 关键候选精确回代引擎。
     """
     n_state = int(H.shape[1])
     if n_state == 0:
@@ -3058,10 +3235,11 @@ def measurement_leverage_for_bad_data(
         if sparse_state_limit is not None
         else (scale_prof.sparse_leverage_max_state if int(dense_state_limit) == 5000 else int(dense_state_limit))
     )
+    is_cholmod_compatible = cholmod_factor is not None and not getattr(cholmod_factor, "is_superlu_factor", False)
     if (
         n_state <= eff_sparse_threshold
         and n_state <= dense_state_limit
-        and cholmod_factor is not None
+        and is_cholmod_compatible
         and not getattr(cholmod_factor, "is_woodbury_solver", False)
     ):
         try:
@@ -3075,10 +3253,10 @@ def measurement_leverage_for_bad_data(
     if (
         is_sparse_matrix(H)
         and eff_sparse_threshold < n_state <= effective_sparse_limit
-        and (cholmod_factor is not None or CHOLMOD_CHOLESKY is not None)
+        and (is_cholmod_compatible or CHOLMOD_CHOLESKY is not None)
     ):
         try:
-            factor = cholmod_factor
+            factor = cholmod_factor if is_cholmod_compatible else None
             if factor is not None and getattr(factor, "is_mkl_pardiso_factor", False):
                 factor = factor.materialize_cholmod_factor(ordering_method=scale_prof.aat_ordering_method)
             if factor is None:
@@ -3095,6 +3273,19 @@ def measurement_leverage_for_bad_data(
                     return leverage
         except Exception:
             pass
+    # 无 CHOLMOD 的中大规模稀疏矩阵（n_state > 1024 或超出 dense_state_limit）：走 O(nnz) 混合精确杠杆率引擎
+    if is_sparse_matrix(H) and weights is not None and (n_state > 1024 or n_state > dense_state_limit):
+        eff_lin_fac = linear_factor if linear_factor is not None else cholmod_factor
+        hyb_lev = _estimate_leverage_hybrid_superlu(
+            H,
+            gain,
+            linear_factor=eff_lin_fac,
+            weights=weights,
+            residual=residual,
+            is_pseudo=is_pseudo,
+        )
+        if hyb_lev is not None:
+            return hyb_lev
     if n_state > dense_state_limit:
         return None
     if gain is None:
@@ -3115,12 +3306,7 @@ def is_critical_leverage_row(
     *,
     critical_ratio: float = DEFAULT_CRITICAL_REDUNDANCY_RATIO,
 ) -> bool:
-    """按无量纲相对冗余度 ``S_ii = 1 - w_i * H_ii`` 判定单行是否为临界/准临界量测。
-
-    ``cur_leverage`` 存储带量纲的 ``H_ii = diag(H G^-1 H^T)``（量纲同 ``R_ii = 1/w_i``），
-    必须乘以权重 ``w_i`` 还原为无量纲杠杆率 ``h_ii = w_i * H_ii in [0, 1]``，
-    才能避免高权量测漏判、低权量测误判。
-    """
+    """按无量纲相对冗余度 ``S_ii = 1 - w_i * H_ii`` 判定单行是否为临界/准临界量测。"""
     if cur_leverage is None or weights is None:
         return False
     pos = int(row_pos)
@@ -3286,6 +3472,82 @@ def compute_normalized_residuals_for_bad_data(
         # 硬物理等式约束（零注入/功率平衡/开关零阻等式）绝不参与坏数据排除
         normalized[pseudo_arr] = 0.0
     return normalized, critical_mask
+
+
+def unmask_pseudo_paired_gross_errors(
+    H,
+    residual: np.ndarray,
+    weights: np.ndarray,
+    leverage: Optional[np.ndarray],
+    normalized: np.ndarray,
+    critical_mask: np.ndarray,
+    *,
+    is_pseudo: Optional[np.ndarray] = None,
+    min_pseudo_wres: float = 1.5,
+) -> np.ndarray:
+    """对存在低权伪量测兜底（删后仍满秩）且配对伪量测出现显著越界残差的高权真实粗差解除准临界屏蔽。
+
+    仅当某状态列同时连接低权支撑行（``0 < w_p <= 0.5`` 且 ``sqrt(w_p)*|r_p| > min_pseudo_wres``）与
+    被 ``1e-4`` 相对冗余度屏蔽的高权非保护真实测点（``w_i > 25`` 且 ``1 - w_i * H_ii > 1e-9``）时，
+    解除该真实测点的 ``critical_mask`` 并恢复精确归一化残差，返回被解封的行下标数组。
+    """
+    if (
+        H is None
+        or leverage is None
+        or not is_sparse_matrix(H)
+        or not np.any(critical_mask)
+    ):
+        return np.empty(0, dtype=np.intp)
+    res = np.asarray(residual, dtype=np.float64).ravel()
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    lev = np.asarray(leverage, dtype=np.float64).ravel()
+    m = int(res.size)
+    if int(H.shape[0]) != m or w.size != m or lev.size != m:
+        return np.empty(0, dtype=np.intp)
+    w_pos = np.maximum(w, 0.0)
+    strained_low = (w_pos > 0.0) & (w_pos <= 0.5) & (np.sqrt(w_pos) * np.abs(res) > float(min_pseudo_wres))
+    if not np.any(strained_low):
+        return np.empty(0, dtype=np.intp)
+    H_csr = H if getattr(H, "format", None) == "csr" else H.tocsr()
+    low_rows = np.flatnonzero(strained_low)
+    backed_cols = np.unique(H_csr[low_rows].indices)
+    if backed_cols.size == 0:
+        return np.empty(0, dtype=np.intp)
+    H_csc = _get_cached_csc_for_graph(H_csr)
+    c_indptr = H_csc.indptr
+    c_indices = H_csc.indices
+    # 仅保留活跃支撑度数 >= 2 的状态列，确保剔除配对真实测点后仍有伪量测兜底
+    active_row_flag = w_pos > 0.0
+    valid_backed_cols = []
+    cand_chunks = []
+    for col_i in backed_cols.tolist():
+        r_sl = c_indices[int(c_indptr[col_i]) : int(c_indptr[col_i + 1])]
+        if r_sl.size >= 2 and int(np.count_nonzero(active_row_flag[r_sl])) >= 2:
+            valid_backed_cols.append(col_i)
+            cand_chunks.append(r_sl)
+    if not cand_chunks:
+        return np.empty(0, dtype=np.intp)
+    cand_rows = np.unique(cand_chunks[0] if len(cand_chunks) == 1 else np.concatenate(cand_chunks))
+    prot = (
+        np.asarray(is_pseudo, dtype=bool).ravel()
+        if (is_pseudo is not None and np.asarray(is_pseudo).size == m)
+        else np.zeros(m, dtype=bool)
+    )
+    R_diag = 1.0 / np.maximum(w_pos, 1e-12)
+    raw_omega = R_diag - lev
+    unmask_ok = (
+        critical_mask[cand_rows]
+        & (~prot[cand_rows])
+        & (w_pos[cand_rows] > 25.0)
+        & (raw_omega[cand_rows] > 1.0e-9 * R_diag[cand_rows])
+    )
+    unmasked_rows = cand_rows[unmask_ok].astype(np.intp, copy=False)
+    if unmasked_rows.size > 0:
+        critical_mask[unmasked_rows] = False
+        normalized[unmasked_rows] = np.abs(res[unmasked_rows]) / np.sqrt(
+            np.maximum(raw_omega[unmasked_rows], 1e-12)
+        )
+    return unmasked_rows
 
 
 def update_leverage_after_row_removal(
@@ -3496,7 +3758,7 @@ def exact_leverage_for_candidate_rows(
             except Exception:
                 pass
 
-        rhs_buf = np.zeros((n, min(k, step)), dtype=np.float64)
+        rhs_buf = np.zeros((n, min(k, step)), dtype=np.float64, order="F")
         for start in range(0, k, step):
             end = min(start + step, k)
             b = end - start
@@ -3573,11 +3835,10 @@ def select_independent_bad_data_batch(
 
     blocked_cols = np.zeros(n_cols, dtype=bool)
     selected: List[int] = []
-    block_hops = max(2, int(min_hops) - 1)
+    block_hops = max(0, int(min_hops) - 1)
     # 星型枢纽拓扑（Hub-Star）防全网广播阈值：常规变电站注入行/母线列度数远小于 128；
-    # 若存在 >128 元的超稠密星型枢纽行/列，仍封锁该枢纽列自身（禁止同批删两条直连枢纽的量测），
-    # 但禁止穿过星型中心向其余数百条独立辐射馈线做二次全网封锁，避免批删退化为 O(K) 轮逐一单删。
-    _HUB_DEG_CAP = 128
+    # 大规模分区骨干网（n_cols >= 4000）中区域汇集母线度数常在 35~90，收紧至 32 避免单点跨区锁死整个 500 节点分区。
+    _HUB_DEG_CAP = 32 if n_cols >= 4000 else 128
     row_deg = csr_indptr[1:] - csr_indptr[:-1]
     col_deg = csc_indptr[1:] - csc_indptr[:-1]
     has_super_hub = bool(
@@ -3639,7 +3900,7 @@ def select_independent_bad_data_batch(
         if len(selected) >= int(max_batch):
             break
         if idx > 0 and float(candidate_norms[idx]) < norm_gate:
-            break
+            continue
         r_pos = int(candidate_rows[idx])
         if r_pos < 0 or r_pos >= n_rows:
             if not selected:
@@ -5119,6 +5380,34 @@ def cholmod_lower_csc_available() -> bool:
     )
 
 
+class _SuperLUFactorAdapter:
+    """将 SciPy SuperLU 稀疏分解对象封装为支持单/多右端批量回代的通用可调用因子。"""
+
+    is_superlu_factor: bool = True
+    is_woodbury_solver: bool = False
+    is_mkl_pardiso_factor: bool = False
+
+    def __init__(self, lu_obj, n_state: int):
+        self._lu = lu_obj
+        self.shape = (int(n_state), int(n_state))
+
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        arr = np.asarray(rhs, dtype=np.float64)
+        if arr.ndim == 2:
+            arr_f = arr if arr.flags.f_contiguous else np.asfortranarray(arr)
+            try:
+                return np.asarray(self._lu.solve(arr_f), dtype=np.float64)
+            except Exception:
+                out = np.empty_like(arr, dtype=np.float64)
+                for col_i in range(arr.shape[1]):
+                    out[:, col_i] = np.asarray(self._lu.solve(arr[:, col_i]), dtype=np.float64)
+                return out
+        return np.asarray(self._lu.solve(arr), dtype=np.float64)
+
+    def __call__(self, rhs: np.ndarray) -> np.ndarray:
+        return self.solve(rhs)
+
+
 class NormalEquationSolver:
     """Solve repeated normal equations, reusing CHOLMOD symbolic analysis when available."""
 
@@ -5127,9 +5416,19 @@ class NormalEquationSolver:
         self._cholmod_pattern = None
         self._cholmod_shape_nnz = None
         self._cholmod_disabled = False
+        self._last_superlu_factor: Optional[_SuperLUFactorAdapter] = None
         self._last_factor_scaled = False
         self._last_unscaled_diag: Optional[np.ndarray] = None
         self.assume_fixed_pattern = bool(assume_fixed_pattern)
+
+    @property
+    def last_linear_factor(self):
+        """返回最近一次无阻尼精确分解的可调用因子（CHOLMOD 或 SuperLU 包装器）。"""
+        if self._last_factor_scaled:
+            return None
+        if self._cholmod_factor is not None and not self._cholmod_disabled:
+            return self._cholmod_factor
+        return self._last_superlu_factor
 
     def unregularized_diagonal(self) -> Optional[np.ndarray]:
         """返回最近一次启用 Jacobi 列均衡阻尼前的原始正规矩阵对角元。"""
@@ -5183,6 +5482,7 @@ class NormalEquationSolver:
         """求解正规方程，支持可选 Marquardt 对角阻尼与异构权重列均衡。"""
         self._last_factor_scaled = False
         self._last_unscaled_diag = None
+        self._last_superlu_factor = None
         col_scale = None
         rhs_solve = np.asarray(rhs, dtype=np.float64)
         beta = float(damping)
@@ -5227,7 +5527,11 @@ class NormalEquationSolver:
                 except Exception:
                     if _is_strictly_lower_csc(gain_csc):
                         gain_csc = full_normal_equation_from_lower(gain_csc)
-            sol, fdiag = _solve_normal_equations_no_cholmod(gain_csc, rhs_solve, return_factor_diag)
+            sol, fdiag, lu_fac = _solve_normal_equations_no_cholmod(
+                gain_csc, rhs_solve, return_factor_diag, return_lu_factor=True
+            )
+            if beta == 0.0 and col_scale is None and lu_fac is not None:
+                self._last_superlu_factor = _SuperLUFactorAdapter(lu_fac, int(gain_csc.shape[0]))
             if col_scale is not None:
                 sol = np.asarray(sol, dtype=np.float64) * col_scale
             return sol, fdiag
@@ -5257,31 +5561,37 @@ def _solve_normal_equations_no_cholmod(
     gain_csc,
     rhs: np.ndarray,
     return_factor_diag: bool,
-) -> Tuple[np.ndarray, np.ndarray]:
+    *,
+    return_lu_factor: bool = False,
+):
     if _is_strictly_lower_csc(gain_csc):
         gain_csc = full_normal_equation_from_lower(gain_csc)
     if int(gain_csc.shape[0]) <= 192:
-        return _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
+        sol_d, fdiag_d = _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
+        return (sol_d, fdiag_d, None) if return_lu_factor else (sol_d, fdiag_d)
     try:
         lu = SP_SPLU(gain_csc, diag_pivot_thresh=0.0, permc_spec="MMD_AT_PLUS_A")
         factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
-        return lu.solve(rhs), factor_diag
+        sol_lu = lu.solve(rhs)
+        return (sol_lu, factor_diag, lu) if return_lu_factor else (sol_lu, factor_diag)
     except Exception:
         pass
     try:
         lu = SP_SPLU(gain_csc)
         factor_diag = np.abs(lu.U.diagonal()) if return_factor_diag else None
-        return lu.solve(rhs), factor_diag
+        sol_lu = lu.solve(rhs)
+        return (sol_lu, factor_diag, lu) if return_lu_factor else (sol_lu, factor_diag)
     except Exception:
         pass
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SP_MATRIX_RANK_WARNING)
             dx = SP_SPSOLVE(gain_csc, rhs)
-        return dx, None
+        return (dx, None, None) if return_lu_factor else (dx, None)
     except Exception:
         pass
-    return _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
+    sol_fb, fdiag_fb = _solve_dense_normal_equations(gain_csc.toarray(), rhs, return_factor_diag)
+    return (sol_fb, fdiag_fb, None) if return_lu_factor else (sol_fb, fdiag_fb)
 
 
 def _solve_dense_normal_equations(
@@ -6611,6 +6921,64 @@ def projected_box_kkt_residual(
     else:
         core_kkt = all_kkt
     return core_kkt, all_kkt
+
+
+def compute_robust_outlier_norm_floor(
+    residual: Optional[np.ndarray],
+    weight: Optional[np.ndarray],
+    threshold: float,
+    *,
+    protected_mask: Optional[np.ndarray] = None,
+    n_state: int = 0,
+) -> float:
+    """基于加权残差鲁棒中位数尺度（Hampel-MAD）计算自适应弹性坏数据归一化残差门槛。
+
+    - 自动剔除伪量测、零注入紧约束（``w > 1e6``）及零冗余（``|r| <= 1e-7``）行对中位数的稀释；
+    - 按冗余自由度比例 ``sqrt(1 - 0.85 * n_state / m_eff)`` 折算等效标准化残差背景尺度 ``sigma_bg``；
+    - 低背景噪声下门槛平滑降至 ``max(5.5, 1.8 * threshold)`` 以召回中等幅度粗差，
+      高背景噪声/过紧权重下自动按 ``4.2 * sigma_bg`` 抬升以严防雪崩误删。
+    """
+    thr = max(1.0, float(threshold))
+    fallback_floor = max(6.0, 2.0 * thr)
+    if residual is None or weight is None:
+        return fallback_floor
+    r_arr = np.asarray(residual, dtype=np.float64).ravel()
+    w_arr = np.asarray(weight, dtype=np.float64).ravel()
+    if r_arr.size == 0 or r_arr.size != w_arr.size:
+        return fallback_floor
+    valid = np.isfinite(r_arr) & np.isfinite(w_arr) & (w_arr > 1e-3) & (w_arr <= 1.0e6)
+    if protected_mask is not None:
+        pm = np.asarray(protected_mask, dtype=bool).ravel()
+        if pm.size == r_arr.size:
+            valid &= ~pm
+    if not np.any(valid):
+        return fallback_floor
+    w_val = w_arr[valid]
+    r_val = np.abs(r_arr[valid])
+    # 异构权重场景（如高精度母线电压 w=1e4 与普通功率量测 w=1e2 并存）下，
+    # 仅在样本量最大的主导权重数量级桶上估计全局背景噪声尺度，防止少数高权测点虚抬全网门槛漏删普通桶粗差
+    if w_val.size >= 20 and (float(w_val.max()) / max(float(w_val.min()), 1e-12)) >= 1.0e3:
+        w_bkt = np.floor(np.log10(np.maximum(w_val, 1e-12))).astype(np.int64)
+        uniq_b, cnt_b = np.unique(w_bkt, return_counts=True)
+        dom_b = int(uniq_b[int(np.argmax(cnt_b))])
+        dom_m = w_bkt == dom_b
+        if int(np.count_nonzero(dom_m)) >= 12:
+            w_val = w_val[dom_m]
+            r_val = r_val[dom_m]
+    u_all = np.sqrt(w_val) * r_val
+    nz = u_all > 1.0e-6
+    u_nz = u_all[nz]
+    if u_nz.size < 6:
+        return fallback_floor
+    m_eff = float(u_nz.size)
+    dof_scale = float(np.sqrt(np.clip(1.0 - 0.85 * float(max(0, int(n_state))) / max(m_eff, 1.0), 0.30, 1.0)))
+    u_std = u_nz / dof_scale
+    med_s = float(np.median(u_std)) / 0.6745
+    q70_s = float(np.percentile(u_std, 70)) / 1.0364
+    q82_s = float(np.percentile(u_std, 82)) / 1.3408
+    sigma_bg = max(1.0, med_s, q70_s, q82_s)
+    cap_floor = max(25.0, 8.0 * thr)
+    return float(min(max(5.5, 1.8 * thr, 4.5 * sigma_bg), cap_floor))
 
 
 

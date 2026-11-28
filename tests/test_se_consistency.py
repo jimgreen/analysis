@@ -393,6 +393,9 @@ def test_hybrid_selected_inversion_with_cholmod_backfill_matches_dense(tmp_path:
     """交直流混合网络稀疏选择逆（含 CHOLMOD 因子缓存与缺失对回代）应与稠密求逆机器精度一致。"""
     from secore.se_math import CHOLMOD_CHOLESKY
 
+    if CHOLMOD_CHOLESKY is None:
+        pytest.skip("当前环境未安装 scikit-sparse CHOLMOD")
+
     ef, mf = _generate_hybrid_case(120, 80, tmp_path, inject_bad=True)
     est = HybridStateEstimator(e_file=ef, meas_file=mf, parameters=SE_PARAMS, flat_start=True)
     res = est.estimate(verbose=False, final_diagnostics=True)
@@ -2586,7 +2589,6 @@ def test_mkl_pardiso_factor_solve_leverage_and_woodbury_equivalence(monkeypatch)
 def test_native_kernels_equivalence_and_env_fallback(monkeypatch):
     """验证 secore._native 三个原生算子与纯 Python 路径机器精度等价及 SE_NATIVE_KERNELS=off 回退。"""
     from scipy import sparse
-    from sksparse.cholmod import analyze_AAt
     from secore.mkl_pardiso import build_upper_csr_from_aat
     from secore.native_kernels import (
         assemble_aat_upper_csr_native,
@@ -2602,6 +2604,7 @@ def test_native_kernels_equivalence_and_env_fallback(monkeypatch):
 
     if not is_native_kernels_available():
         pytest.skip("当前环境未编译 secore._native 扩展")
+    from sksparse.cholmod import analyze_AAt
 
     rng = np.random.default_rng(20261124)
     n = 180
@@ -9068,6 +9071,267 @@ def test_anderson_rolling_window_and_gas_compressor_zi_bridge_regression(tmp_pat
     nb_g = np.asarray(est_g.network.incidence @ flow_g, dtype=np.float64)
     assert abs(float(nb_g[1])) < 1e-4
     assert abs(float(nb_g[2])) < 1e-4
+
+
+def test_full_kirchhoff_alm_and_robust_adaptive_bdr_caps_regression(tmp_path: Path):
+    """验证全有效基尔霍夫功率/换流器损耗守恒终末 ALM 精修与鲁棒 MAD 坏数据弹性配额。"""
+    from model.meas_type import (
+        DEVICE_TYPE_ACPowerBalance,
+        DEVICE_TYPE_DCACConverter,
+        DEVICE_TYPE_DCPowerBalance,
+        MEAS_TYPE_P_LOSS_BALANCE,
+    )
+    from secore.se_math import compute_robust_outlier_norm_floor
+
+    # 1. 参数配额与鲁棒 MAD 门槛测试
+    assert algorithm_parameters.resolve_adaptive_bad_data_caps(100) == (12, 2)
+    assert algorithm_parameters.resolve_adaptive_bad_data_caps(2000) == (240, 30)
+    assert algorithm_parameters.resolve_adaptive_bad_data_caps(2000, max_remove=5, max_remove_per_round=2) == (5, 2)
+    assert algorithm_parameters.resolve_adaptive_bad_data_caps(2000, param_max_remove=6) == (6, 6)
+
+    rng_m = np.random.default_rng(202612)
+    w_unit = np.full(120, 100.0, dtype=np.float64)
+    r_low_bg = rng_m.normal(0.0, 0.08, size=120)
+    r_high_bg = rng_m.normal(0.0, 0.45, size=120)
+    fl_low = compute_robust_outlier_norm_floor(r_low_bg, w_unit, 3.0, n_state=30)
+    fl_high = compute_robust_outlier_norm_floor(r_high_bg, w_unit, 3.0, n_state=30)
+    assert 5.5 <= fl_low <= 7.5
+    assert fl_high >= 15.0
+
+    # 2. 含显式负荷/发电机状态与换流器的 Hybrid 混联网络：全有效守恒行残差均应闭合至 < 5e-5
+    hyb_e, hyb_m = _generate_hybrid_case(8, 4, tmp_path)
+    m_lines = hyb_m.read_text(encoding="utf-8").splitlines()
+    # 删掉部分母线负荷侧支路量测制造盲区显式负荷状态，并叠加偏置牵拉
+    kept = []
+    dropped = 0
+    for ln in m_lines:
+        if ln.startswith("#") and (" P_FROM " in ln or " Q_FROM " in ln) and dropped < 4:
+            parts = ln.split()
+            parts[7] = "0"
+            ln = " ".join(parts)
+            dropped += 1
+        elif ln.startswith("#") and " ACBranch " in ln and " P_TO " in ln:
+            parts = ln.split()
+            parts[8] = f"{float(parts[8]) + 65.0:.4f}"
+            ln = " ".join(parts)
+        kept.append(ln)
+    hyb_m.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    est_h = HybridStateEstimator(
+        hyb_e,
+        hyb_m,
+        parameters=SE_PARAMS.with_overrides(max_iter=100, max_remove=None),
+        flat_start=True,
+    )
+    est_h.run(result_mode="summary", remove_bad_data=True, skip_bad_data=False, verbose=False)
+    res_h = est_h.estimate_result
+    assert res_h.converged
+    tbl_h = res_h.measurement_table
+    dt_h = np.asarray(tbl_h.device_type_code, dtype=np.int16)
+    mt_h = np.asarray(tbl_h.meas_type_code, dtype=np.int16)
+    val_h = np.asarray(tbl_h.valid, dtype=bool) & (np.asarray(tbl_h.weight, dtype=np.float64) > 0.0)
+    cons_h = val_h & (
+        np.isin(dt_h, (DEVICE_TYPE_ACPowerBalance, DEVICE_TYPE_DCPowerBalance))
+        | ((dt_h == DEVICE_TYPE_DCACConverter) & (mt_h == MEAS_TYPE_P_LOSS_BALANCE))
+    )
+    assert np.any(cons_h)
+    assert float(np.max(np.abs(res_h.residual[cons_h]))) < 5.0e-5
+
+    # 3. 全自动模式 (max_remove=None) 下注入多个中等幅度粗差（突破常规 0.5%=1 个名额且 |r_N| < 15）应全部识别剔除
+    ac_dir = tmp_path / "ac_multi_bad"
+    ac_dir.mkdir(parents=True, exist_ok=True)
+    ac_e, ac_m = _generate_ac_case(16, ac_dir, seed=2066, inject_bad=False)
+    ac_lines = ac_m.read_text(encoding="utf-8").splitlines()
+    injected_ids = set()
+    p_from_seen = 0
+    out_ac_lines = []
+    for ln in ac_lines:
+        if ln.startswith("#") and " ACBranch " in ln and " P_FROM " in ln:
+            p_from_seen += 1
+            if p_from_seen in (2, 6, 11, 16):
+                parts = ln.split()
+                injected_ids.add(int(parts[1]))
+                parts[6] = "25.0"
+                parts[8] = f"{float(parts[8]) + 185.0:.6f}"
+                ln = " ".join(parts)
+        out_ac_lines.append(ln)
+    assert len(injected_ids) == 4
+    ac_m.write_text("\n".join(out_ac_lines) + "\n", encoding="utf-8")
+    est_ac = ACStateEstimator(
+        ac_e,
+        ac_m,
+        parameters=SE_PARAMS.with_overrides(max_iter=80, max_remove=None),
+        flat_start=True,
+    )
+    est_ac.run(result_mode="summary", remove_bad_data=True, skip_bad_data=False, verbose=False)
+    assert est_ac.estimate_result.converged
+    rem_ids = {int(it.measurement.idx) for it in (est_ac.removed_bad_data or ())}
+    assert rem_ids == injected_ids
+
+
+def test_large_scale_no_cholmod_superlu_leverage_pseudo_masking_and_dc_alm_regression(tmp_path: Path):
+    """验证第六轮超大规模无 CHOLMOD 随机投影精确杠杆率、高权重伪量测配对粗差反遮蔽与单域 DC 终末 ALM 精修。"""
+    from scipy.sparse import csc_matrix, csr_matrix, diags
+    from model.meas_type import DEVICE_TYPE_DCPowerBalance
+    from secore.se_math import (
+        NormalEquationSolver,
+        compute_normalized_residuals_for_bad_data,
+        measurement_leverage_for_bad_data,
+        unmask_pseudo_paired_gross_errors,
+    )
+
+    # 1. 验证伪量测配额与自适应坏数据配额的大规模弹性伸缩及显式覆盖契约
+    assert algorithm_parameters.resolve_effective_pseudo_cap(50, 80000, explicit_override=False) == 120000
+    assert algorithm_parameters.resolve_effective_pseudo_cap(50, 80000, explicit_override=True) == 50
+    assert algorithm_parameters.resolve_effective_pseudo_cap(0, 80000, explicit_override=False) == 0
+    tot_150k, rnd_150k = algorithm_parameters.resolve_adaptive_bad_data_caps(150000)
+    assert tot_150k == 33000
+    assert rnd_150k == 6000
+
+    # 2. 验证 n_state=1400 (>1024) 稀疏系统下 SuperLU 因子复用 + 伪量测配对高杠杆粗差 (h_ii=0.999998) 精确检出
+    n_st = 1400
+    rows_i, cols_j, vals_v = [], [], []
+    w_list, z_true_list, is_pseudo_list = [], [], []
+    # 前 1399 个状态各有 2 条常规测量支撑
+    for c in range(n_st - 1):
+        for k_rep in range(2):
+            r_id = len(w_list)
+            rows_i.append(r_id)
+            cols_j.append(c)
+            vals_v.append(1.0)
+            w_list.append(100.0 if k_rep == 0 else 25.0)
+            z_true_list.append(1.0)
+            is_pseudo_list.append(False)
+    # 最后一个盲区状态 c = 1399：1 条超高权重真实粗差测点 (w=5000) + 1 条低权靶向伪量测 (w=0.01)
+    bad_real_row = len(w_list)
+    rows_i.append(bad_real_row)
+    cols_j.append(n_st - 1)
+    vals_v.append(1.0)
+    w_list.append(5000.0)
+    z_true_list.append(65.0)  # 注入 +65 p.u. 巨型粗差
+    is_pseudo_list.append(False)
+
+    pseudo_pair_row = len(w_list)
+    rows_i.append(pseudo_pair_row)
+    cols_j.append(n_st - 1)
+    vals_v.append(1.0)
+    w_list.append(0.01)
+    z_true_list.append(0.0)
+    is_pseudo_list.append(True)
+
+    m_tot = len(w_list)
+    H_sp = csr_matrix((np.asarray(vals_v, dtype=np.float64), (rows_i, cols_j)), shape=(m_tot, n_st))
+    w_vec = np.asarray(w_list, dtype=np.float64)
+    z_vec = np.asarray(z_true_list, dtype=np.float64)
+    prot_vec = np.asarray(is_pseudo_list, dtype=bool)
+    gain_sp = (H_sp.T @ diags(w_vec) @ H_sp).tocsc()
+    rhs_sp = np.asarray(H_sp.T @ (w_vec * z_vec), dtype=np.float64)
+
+    ne_solver = NormalEquationSolver(assume_fixed_pattern=True)
+    x_hat, _ = ne_solver.solve(gain_sp, rhs_sp, return_factor_diag=False)
+    res_vec = z_vec - np.asarray(H_sp @ x_hat, dtype=np.float64)
+    # 未补偿杠杆时粗差自身加权残差仅 ~0.009，远低于阈值 3.0
+    assert float(abs(res_vec[bad_real_row]) * np.sqrt(w_vec[bad_real_row])) < 0.02
+
+    lev_est = measurement_leverage_for_bad_data(
+        H_sp,
+        gain_sp,
+        linear_factor=ne_solver.last_linear_factor,
+        weights=w_vec,
+        residual=res_vec,
+        is_pseudo=prot_vec,
+        dense_state_limit=500,  # 强制走无 CHOLMOD 大规模随机投影 + 双通道精确回代路径
+    )
+    assert lev_est is not None
+    exact_h_bad = 1.0 / (5000.0 + 0.01)
+    assert lev_est[bad_real_row] == pytest.approx(exact_h_bad, rel=1e-9)
+    norm_res, crit_mask = compute_normalized_residuals_for_bad_data(
+        res_vec, w_vec, lev_est, is_pseudo=prot_vec
+    )
+    unmasked = unmask_pseudo_paired_gross_errors(
+        H_sp, res_vec, w_vec, lev_est, norm_res, crit_mask, is_pseudo=prot_vec
+    )
+    assert int(bad_real_row) in set(unmasked.tolist())
+    assert not bool(crit_mask[bad_real_row])
+    assert float(norm_res[bad_real_row]) == pytest.approx(0.1 * 65.0 * np.sqrt(5000.0 / 5000.01), rel=1e-5)
+    assert float(norm_res[bad_real_row]) > 6.0
+
+    # 3. 验证单域 DC 含盲区与功率粗差牵拉时终末 ALM 将 DCPowerBalance 守恒残差闭合至 < 5e-5
+    dc_dir = tmp_path / "dc_alm_zi"
+    dc_dir.mkdir(parents=True, exist_ok=True)
+    dc_e, dc_m = _generate_dc_case(12, dc_dir, seed=2088, inject_bad=False)
+    dc_lines = dc_m.read_text(encoding="utf-8").splitlines()
+    out_dc = []
+    dropped_dc = 0
+    for ln in dc_lines:
+        if ln.startswith("#") and " DCBranch " in ln and " P_FROM " in ln and dropped_dc < 4:
+            parts = ln.split()
+            parts[7] = "0"
+            ln = " ".join(parts)
+            dropped_dc += 1
+        elif ln.startswith("#") and " DCBranch " in ln and " P_TO " in ln:
+            parts = ln.split()
+            parts[6] = "2500.0"
+            parts[8] = f"{float(parts[8]) + 45.0:.4f}"
+            ln = " ".join(parts)
+        out_dc.append(ln)
+    dc_m.write_text("\n".join(out_dc) + "\n", encoding="utf-8")
+    est_dc = DCStateEstimator(
+        dc_e,
+        dc_m,
+        parameters=SE_PARAMS.with_overrides(max_iter=80, max_remove=None),
+        flat_start=True,
+    )
+    est_dc.run(result_mode="summary", remove_bad_data=True, skip_bad_data=False, verbose=False)
+    res_dc = est_dc.estimate_result
+    assert res_dc.converged
+    tbl_dc = res_dc.measurement_table
+    bal_dc = (np.asarray(tbl_dc.device_type_code, dtype=np.int16) == DEVICE_TYPE_DCPowerBalance) & np.asarray(tbl_dc.valid, dtype=bool)
+    if np.any(bal_dc):
+        assert float(np.max(np.abs(res_dc.residual[bal_dc]))) < 5.0e-5
+
+    # 4. 验证多能联合估计合并量测表严格保留原始 .meas 真实量测 idx（含 valid=0 跳号场景下 removed_bad_data.idx 精准对齐）
+    root_dir = Path(__file__).resolve().parents[1]
+    me_e = root_dir / "data" / "hybrid_ac_gas" / "hybrid_ac_gas.e"
+    me_m = root_dir / "data" / "hybrid_ac_gas" / "hybrid_ac_gas.meas"
+    if me_e.exists() and me_m.exists():
+        me_dir = tmp_path / "me_idx_preserve"
+        me_dir.mkdir(parents=True, exist_ok=True)
+        dst_e = me_dir / "case.e"
+        dst_m = me_dir / "case.meas"
+        dst_e.write_text(me_e.read_text(encoding="utf-8"), encoding="utf-8")
+        raw_me_lines = me_m.read_text(encoding="utf-8").splitlines()
+        mod_lines = []
+        corrupted_idx = None
+        dropped_first = False
+        for ln in raw_me_lines:
+            if ln.startswith("#"):
+                ps = ln.split()
+                if not dropped_first and len(ps) >= 9 and ps[7] == "1":
+                    ps[7] = "0"  # 制造首个有效测点跳号缺口，检验后续测点 idx 是否被错误顺移重编
+                    dropped_first = True
+                    ln = " ".join(ps)
+                elif corrupted_idx is None and len(ps) >= 9 and ps[7] == "1" and "GasPipe" in ps[3]:
+                    corrupted_idx = int(ps[1])
+                    ps[6] = "400.0"
+                    ps[8] = f"{float(ps[8]) + 250.0:.4f}"
+                    ln = " ".join(ps)
+            mod_lines.append(ln)
+        dst_m.write_text("\n".join(mod_lines) + "\n", encoding="utf-8")
+        if corrupted_idx is not None:
+            me_est = HybridStateEstimator(
+                dst_e,
+                dst_m,
+                parameters=SE_PARAMS.with_overrides(max_iter=60, max_remove=10, bad_threshold=3.0),
+                flat_start=True,
+            )
+            me_est.run(result_mode="summary", remove_bad_data=True, skip_bad_data=False, verbose=False)
+            me_tbl = me_est._multi_energy_measurement_table
+            assert int(np.unique(me_tbl.idx).size) == int(me_tbl.idx.size)
+            rem_ids = {int(it.measurement.idx) for it in me_est.removed_bad_data}
+            assert corrupted_idx in rem_ids
+
+
+
 
 
 

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -99,6 +100,66 @@ def resolve_auto_extreme_bad_data_caps(
     return ext_total, min(ext_round, ext_total)
 
 
+def resolve_adaptive_bad_data_caps(
+    measurement_count: int,
+    max_remove: Optional[int] = None,
+    max_remove_per_round: Optional[int] = None,
+    *,
+    param_max_remove: Optional[int] = None,
+    param_max_remove_per_round: Optional[int] = None,
+) -> Tuple[int, int]:
+    """在未显式指定剔除上限的全自动模式下，为经鲁棒 MAD 检出的高置信度粗差推导自适应弹性配额上限。
+
+    小中规模保持 ``12% / 1.5%`` 紧凑比例，超大规模（``n_meas > 4000``）随有效量测规模平滑伸缩，
+    消除固定小常数（500 / 50）在数万至十万节点高粗差断面下的硬截断；显式配置始终优先不予突破。
+    """
+    base_total, base_round = resolve_bad_data_limits(
+        measurement_count,
+        max_remove=max_remove,
+        max_remove_per_round=max_remove_per_round,
+        param_max_remove=param_max_remove,
+        param_max_remove_per_round=param_max_remove_per_round,
+    )
+    if base_total <= 0:
+        return 0, 0
+    n_meas = max(0, int(measurement_count))
+    explicit_total = (max_remove is not None and int(max_remove) >= 0) or (
+        param_max_remove is not None and int(param_max_remove) >= 0
+    )
+    explicit_round = (max_remove_per_round is not None and int(max_remove_per_round) > 0) or (
+        param_max_remove_per_round is not None and int(param_max_remove_per_round) > 0
+    )
+    if explicit_total:
+        adapt_total = base_total
+    elif n_meas <= 4000:
+        adapt_total = max(base_total, max(3, int(math.ceil(n_meas * 0.12))))
+    else:
+        adapt_total = max(base_total, min(60000, max(500, int(math.ceil(n_meas * 0.22)))))
+    if explicit_round:
+        adapt_round = base_round
+    elif n_meas <= 3300:
+        adapt_round = max(base_round, max(2, int(math.ceil(n_meas * 0.015))))
+    else:
+        adapt_round = max(base_round, min(8192, max(50, int(math.ceil(n_meas * 0.04)))))
+    return adapt_total, min(adapt_round, adapt_total)
+
+
+def resolve_effective_pseudo_cap(
+    param_max: int,
+    state_count: int,
+    *,
+    explicit_override: bool = False,
+) -> int:
+    """推导自动可观测性修复的靶向伪量测上限：显式覆盖或 0 禁用严格保留，默认小常数随状态维数自适应扩容。"""
+    raw = max(0, int(param_max))
+    if raw == 0 or explicit_override:
+        return raw
+    n_st = max(0, int(state_count))
+    if n_st <= raw:
+        return raw
+    return max(raw, int(math.ceil(n_st * 1.5)))
+
+
 def _to_bool(value: Any) -> bool:
     text = str(value).strip().lower()
     if text in {"1", "true", "yes", "y", "on"}:
@@ -196,6 +257,7 @@ class StateEstimationParameters:
     prefilter_enthalpy_max: Optional[float] = 6000.0
     prefilter_heat_min: Optional[float] = -1e7
     prefilter_heat_max: Optional[float] = 1e7
+    _explicit_pseudo_max: bool = False
 
     @property
     def pseudo_measurement_weight(self) -> float:
@@ -317,6 +379,7 @@ class StateEstimationParameters:
             prefilter_enthalpy_max=_opt_float(self.prefilter_enthalpy_max, prefilter_enthalpy_max),
             prefilter_heat_min=_opt_float(self.prefilter_heat_min, prefilter_heat_min),
             prefilter_heat_max=_opt_float(self.prefilter_heat_max, prefilter_heat_max),
+            _explicit_pseudo_max=bool(self._explicit_pseudo_max or (targeted_pseudo_measurement_max is not None)),
         )
 
 
