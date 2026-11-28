@@ -6227,8 +6227,8 @@ class AndersonAccelerator:
             self.reset()
             return None
         d_cur = float(damping)
-        if self._last_damping is not None and abs(d_cur - self._last_damping) > max(1e-12, 0.05 * max(d_cur, self._last_damping)):
-            # 阻尼发生显著变化时不动点映射已改变，必须重置切空间窗口
+        if self._last_damping is not None and abs(d_cur - self._last_damping) > max(5e-5, 0.25 * max(d_cur, self._last_damping)):
+            # 阻尼发生显著量级变化时不动点映射已改变，重置切空间窗口
             self.reset()
         self._last_damping = d_cur
 
@@ -6274,13 +6274,14 @@ class AndersonAccelerator:
         except np.linalg.LinAlgError:
             return None
         gamma = gamma_s / norms_v
-        if (not np.all(np.isfinite(gamma))) or float(np.linalg.norm(gamma)) > self.max_gamma_norm:
+        f_norm = max(float(np.linalg.norm(f_cur)), 1e-30)
+        if (not np.all(np.isfinite(gamma))) or float(np.linalg.norm(gamma_s)) > self.max_gamma_norm * f_norm:
             return None
 
         dX = np.column_stack(self._dx_hist)[:, valid_cols]
         extrap_disp = -((dX + dF_v) @ gamma)
         f_inf = float(np.max(np.abs(f_cur)))
-        if (not np.all(np.isfinite(extrap_disp))) or float(np.max(np.abs(extrap_disp))) > max(2.0, 500.0 * f_inf):
+        if (not np.all(np.isfinite(extrap_disp))) or float(np.max(np.abs(extrap_disp))) > max(2.0, 2000.0 * f_inf):
             return None
         x_aa = np.asarray(x_next, dtype=np.float64) + extrap_disp
         if not np.all(np.isfinite(x_aa)):
@@ -6292,9 +6293,10 @@ class AndersonAccelerator:
         if step_norm is None or (not np.isfinite(float(step_norm))) or float(step_norm) > 0.02:
             self.reset()
         else:
-            # 仅清空上一锚点对，防止外推跳转向量被误算作不动点差分，同时保留已累积的高维切空间
+            # 清空上一锚点对并重置慢步计数，强制后续先走纯不动点步向滚动窗口注入新切向量，避免在旧低维子空间原地重复投影
             self._last_x = None
             self._last_f = None
+            self._slow_streak = 0
 
     def on_rejected(self) -> None:
         """外推点未降低目标函数时清空窗口并重新积累，防止连续无效试探。"""

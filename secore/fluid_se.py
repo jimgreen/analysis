@@ -3154,15 +3154,45 @@ class FluidStateEstimator:
                 np.maximum(1e-12, (soft_scale * soft_ref_e) / zi_init_sq),
             )
 
-        def _activate_tight_zi() -> None:
-            """从软启动阶段切换至目标零注入紧权重，并重置二阶加速与停滞计数器。"""
-            nonlocal weight, zi_softened, tr_ctrl, lm_damping, curvature_damping_active
+        micro_damp_full_streak = 0
+        micro_damp_resets = 0
+        zi_mid_bridged = False
+        zi_bridge_start_iter = 0
+
+        def _activate_tight_zi(cur_iter: int = 0) -> None:
+            """从软启动阶段切换至目标零注入紧权重（若平启动奇异导数曾将软权重压至近似零且零注入失衡显著，先经普通测点权重级温和桥接预对齐）。"""
+            nonlocal weight, zi_softened, zi_mid_bridged, zi_bridge_start_iter, tr_ctrl, lm_damping, curvature_damping_active
             nonlocal backtrack_streak, fullstep_osc_streak, stagnation_streak, low_progress_streak
             nonlocal high_damp_stagnation_streak, high_damp_slow_streak, damped_slow_progress_streak
             nonlocal damped_window_steps, damped_window_ref_obj, tried_undamped_escape, pre_escape_max_correction
             nonlocal cached_z_est, cached_residual, cached_objective
-            weight = target_weight
-            zi_softened = False
+            nonlocal micro_damp_full_streak, micro_damp_resets
+            if (
+                not zi_mid_bridged
+                and zi_active_rows.size > 0
+                and float(np.min(weight[zi_active_rows])) < 1e-2
+            ):
+                cur_zi_r = z[zi_active_rows] - self.evaluate(x)[zi_active_rows]
+                if np.all(np.isfinite(cur_zi_r)) and float(np.max(np.abs(cur_zi_r))) > 1.0:
+                    zi_mid_bridged = True
+                    zi_bridge_start_iter = int(cur_iter) if cur_iter > 0 else int(iteration)
+                    zi_softened = True
+                    real_m_b = np.ones(target_weight.size, dtype=bool)
+                    real_m_b[zi_active_rows] = False
+                    pos_real_w = target_weight[real_m_b & (target_weight > 0.0) & (target_weight <= 1e6)]
+                    mid_zi_w = float(np.clip(np.median(pos_real_w), 1.0, 100.0)) if pos_real_w.size else 10.0
+                    prev_zi_w = weight[zi_active_rows].copy()
+                    weight = target_weight.copy()
+                    weight[zi_active_rows] = np.minimum(
+                        target_weight[zi_active_rows],
+                        np.maximum(prev_zi_w, mid_zi_w),
+                    )
+                else:
+                    weight = target_weight
+                    zi_softened = False
+            else:
+                weight = target_weight
+                zi_softened = False
             aa_accel.reset()
             tr_ctrl = NielsenTrustRegionController()
             lm_damping = 0.0
@@ -3178,6 +3208,8 @@ class FluidStateEstimator:
             damped_window_ref_obj = np.inf
             tried_undamped_escape = False
             pre_escape_max_correction = np.inf
+            micro_damp_full_streak = 0
+            micro_damp_resets = 0
             cached_z_est = cached_residual = cached_objective = None
 
         def _solve_step(H_cur: csr_matrix, res_cur: np.ndarray, damping_val: float):
@@ -3250,7 +3282,14 @@ class FluidStateEstimator:
                             damping=0.0,
                         )
                     dx_pu = np.asarray(dx_raw, dtype=np.float64)
-                    if dx_pu.size and float(np.max(np.abs(dx_pu))) > 200.0:
+                    if dx_pu.size:
+                        dyn_jump_ref = np.maximum(1.0, np.abs(x) / np.maximum(1.0, state_scales))
+                        if self.n_regulated > 0:
+                            reg_sl = slice(self.base_regulated_flow, self.base_supply_temperature)
+                            dyn_jump_ref[reg_sl] = np.maximum(dyn_jump_ref[reg_sl], 20.0)
+                    else:
+                        dyn_jump_ref = np.ones(0, dtype=np.float64)
+                    if dx_pu.size and float(np.max(np.abs(dx_pu) / dyn_jump_ref)) > 200.0:
                         # 无阻尼步出现超巨幅标幺跳变（近奇异方向）：自动启用微幅阻尼重算安全方向
                         col_scale = 1.0 / np.sqrt(np.maximum(diag_pu, 1e-12))
                         A_scaled = A_pu.copy()
@@ -3393,24 +3432,54 @@ class FluidStateEstimator:
                 else 0.0
             )
             conv_obj_tol = max(1e-12, 1e-9 * (abs(objective) + 1.0))
-            if (
+            soft_rel_gate = max(5e-4, 50.0 * self.tol) if zi_mid_bridged else max(1.0e-5, 10.0 * self.tol)
+            bridge_budget_done = bool(
+                zi_mid_bridged and zi_softened and (iteration - zi_bridge_start_iter) >= max(30, int(0.65 * self.max_iter))
+            )
+            if bridge_budget_done or (
                 zi_softened
                 and iteration >= 2
-                and pred_drop <= max(1e-6, 1e-4 * (abs(objective) + 1.0))
+                and pred_drop <= max(1e-6, (1e-3 if zi_mid_bridged else 1e-4) * (abs(objective) + 1.0))
                 and (
                     (
-                        (rel_correction < max(1.0e-5, 10.0 * self.tol) or (step_damping == 0.0 and max_correction < 10.0 * self.tol))
+                        (rel_correction < soft_rel_gate or (step_damping == 0.0 and max_correction < 10.0 * self.tol))
                         and kkt_inf <= max(1e-3, 500.0 * self.tol)
                     )
                     or (
                         step_damping > 0.0
-                        and rel_correction < max(5e-5, 50.0 * self.tol)
+                        and rel_correction < max(soft_rel_gate, 5e-5, 50.0 * self.tol)
                         and kkt_inf <= max(1e-3, 500.0 * self.tol)
                     )
                 )
             ):
-                _activate_tight_zi()
+                _activate_tight_zi(iteration)
                 continue
+            def _try_apply_final_dx() -> bool:
+                nonlocal x, z_est, residual, objective, cached_z_est, cached_residual, cached_objective
+                if pred_drop <= 0.0 or dx.size == 0 or not np.all(np.isfinite(dx)):
+                    return False
+                pf_end = (
+                    np.maximum(minimum, 0.25 * x[: self.n_potential])
+                    if (self.n_potential > 0 and float(self.network.potential_power) > 1.0)
+                    else minimum
+                )
+                cand_end = np.clip(x + dx, state_lo, state_hi)
+                if self.n_potential > 0:
+                    cand_end[: self.n_potential] = np.maximum(cand_end[: self.n_potential], pf_end)
+                cz_end = self.evaluate(cand_end)
+                cr_end = z - cz_end
+                co_end = float(np.dot(weight, cr_end * cr_end))
+                if np.isfinite(co_end) and co_end <= objective + max(1e-14, 1e-11 * (abs(objective) + 1.0)):
+                    x = cand_end
+                    z_est = cz_end
+                    residual = cr_end
+                    objective = co_end
+                    cached_z_est = None
+                    cached_residual = None
+                    cached_objective = np.nan
+                    return True
+                return False
+
             if (
                 step_damping == 0.0
                 and (max_correction < self.tol or rel_correction < self.tol)
@@ -3420,20 +3489,34 @@ class FluidStateEstimator:
                 if zi_softened and iteration < self.max_iter:
                     _activate_tight_zi()
                     continue
+                stepped_end = _try_apply_final_dx()
                 converged = True
-                evaluated_at_final_x = True
+                evaluated_at_final_x = not stepped_end
                 break
             if (
                 step_damping > 0.0
-                and rel_correction < max(1e-5, 10.0 * self.tol)
-                and kkt_inf <= max(1e-4, 100.0 * self.tol)
-                and pred_drop <= max(1e-8, 1e-7 * (abs(objective) + 1.0))
+                and (
+                    (
+                        rel_correction < max(1e-5, 10.0 * self.tol)
+                        and kkt_inf <= max(1e-4, 100.0 * self.tol)
+                        and pred_drop <= max(1e-8, 1e-7 * (abs(objective) + 1.0))
+                    )
+                    or (
+                        not zi_softened
+                        and iteration >= 8
+                        and step_damping <= 5e-5
+                        and rel_correction < 0.05 * self.tol
+                        and kkt_inf <= max(5e-4, 500.0 * self.tol)
+                        and pred_drop <= 5e-3 * (abs(objective) + 1.0)
+                    )
+                )
             ):
                 if zi_softened and iteration < self.max_iter:
                     _activate_tight_zi()
                     continue
+                stepped_end = _try_apply_final_dx()
                 converged = True
-                evaluated_at_final_x = True
+                evaluated_at_final_x = not stepped_end
                 break
 
             accepted = False
@@ -3533,6 +3616,8 @@ class FluidStateEstimator:
             actual_rel_dx = accepted_step * rel_correction
             gn_actual_drop = prev_objective - cached_objective
             # 支柱 2：连续满步慢线性收敛时尝试 Type-II Anderson 加速（严格目标单调保护）
+            dyn_aa_scale = np.maximum(fixed_scale, np.abs(x))
+            dyn_rel_correction = float(np.max(np.abs(dx) / dyn_aa_scale)) if dx.size else 0.0
             if accepted_step >= 0.95 and max_correction > 10.0 * self.tol:
                 aa_ratio = (
                     (max_correction / prev_max_correction)
@@ -3544,7 +3629,7 @@ class FluidStateEstimator:
                     x,
                     step_ratio=aa_ratio,
                     damping=step_damping,
-                    allow_propose=(rel_correction < 0.5 and step_damping < 10.0),
+                    allow_propose=(dyn_rel_correction < 0.5 and step_damping < 10.0),
                 )
                 if x_aa is not None and bool(np.all((x_aa >= state_lo) & (x_aa <= state_hi))) and (
                     self.n_potential == 0 or bool(np.all(x_aa[: self.n_potential] >= minimum))
@@ -3553,7 +3638,7 @@ class FluidStateEstimator:
                     aa_r = z - aa_z
                     aa_obj = float(np.dot(weight, aa_r * aa_r))
                     if np.isfinite(aa_obj) and aa_obj < cached_objective - max(1e-12, 1e-10 * (abs(cached_objective) + 1.0)):
-                        aa_jump = float(np.max(np.abs(x_aa - x) / fixed_scale)) if x_aa.size else 0.0
+                        aa_jump = float(np.max(np.abs(x_aa - x) / dyn_aa_scale)) if x_aa.size else 0.0
                         x = x_aa
                         cached_z_est = aa_z
                         cached_residual = aa_r
@@ -3589,6 +3674,27 @@ class FluidStateEstimator:
                 if lm_damping <= 0.0:
                     curvature_damping_active = False
                     backtrack_streak = 0
+                    micro_damp_full_streak = 0
+                elif (
+                    not zi_softened
+                    and singular_fail_count == 0
+                    and 0.0 < lm_damping <= 1e-4
+                    and accepted_step >= 0.95
+                    and cached_objective < prev_objective
+                ):
+                    micro_damp_full_streak += 1
+                    if micro_damp_full_streak >= 8 and micro_damp_resets < 2:
+                        # 紧零注入高权对角元下微幅相对阻尼会显著压扁真实测点切向步长，连续健康满步下降后释放微阻尼恢复二阶收敛
+                        lm_damping = 0.0
+                        curvature_damping_active = False
+                        backtrack_streak = 0
+                        tr_ctrl.reset()
+                        micro_damp_full_streak = 0
+                        micro_damp_resets += 1
+                else:
+                    micro_damp_full_streak = 0
+            else:
+                micro_damp_full_streak = 0
             if accepted_step >= 0.5:
                 backtrack_streak = max(0, backtrack_streak - 1)
                 # 仅在无阻尼或非良态二次收敛（rho 偏离 1）时检测满步振荡，避免把阻尼缩减导致的合理步长放大误判为振荡
@@ -3673,7 +3779,11 @@ class FluidStateEstimator:
                 and (damped_window_ref_obj - cached_objective) <= (0.01 if step_damping == 0.0 else 0.05) * (abs(damped_window_ref_obj) + 1.0)
             )
             if tried_undamped_escape:
-                if obj_change <= max(1e-10, 5e-4 * (abs(prev_objective) + 1.0)):
+                if (
+                    obj_change <= max(1e-10, 2e-3 * (abs(prev_objective) + 1.0))
+                    or (accepted_step < 0.5 and obj_change <= max(1e-10, 1e-2 * (abs(prev_objective) + 1.0)))
+                    or undamped_escape_count >= 3
+                ):
                     if np.isfinite(pre_escape_max_correction):
                         max_correction = min(max_correction, pre_escape_max_correction)
                     early_stationary = True
@@ -3688,16 +3798,20 @@ class FluidStateEstimator:
                     damped_window_steps = 0
                     damped_window_ref_obj = np.inf
             elif (
-                obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
-                and actual_rel_dx <= max(1e-6, self.tol)
+                (
+                    obj_change <= max(1e-12, 1e-9 * (abs(prev_objective) + 1.0))
+                    and actual_rel_dx <= max(1e-6, self.tol)
+                )
+                or (step_damping >= 10.0 and actual_rel_dx <= 1e-8)
             ):
                 stagnation_streak += 1
                 if stagnation_streak >= 3:
-                    if step_damping > 0.0:
+                    if step_damping > 0.0 and undamped_escape_count < 2:
                         lm_damping = 0.0
                         curvature_damping_active = False
                         tr_ctrl.reset()
                         tried_undamped_escape = True
+                        undamped_escape_count += 1
                         pre_escape_max_correction = max_correction
                         stagnation_streak = 0
                         high_damp_stagnation_streak = 0

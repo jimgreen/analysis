@@ -6053,11 +6053,12 @@ class ACStateEstimator:
                 p90_stiff = max(float(np.percentile(real_stiff, 90)), 100.0)
                 max_stiff = float(np.max(real_stiff))
 
-        ref_stiff = max(p90_stiff, 0.25 * max_stiff)
-        cond_stiff_cap = min(max(2.5e7 * min_stiff, 1.5e3 * ref_stiff), 2.5e11)
+        ref_stiff = max(p90_stiff, 0.5 * max_stiff)
+        cond_stiff_cap = min(max(5.0e7 * min_stiff, 5.0e3 * max_stiff), 5.0e11)
         target_stiff = min(max(1.0e4 * ref_stiff, 1.0e6), cond_stiff_cap)
-        max_zi_w = min(max(1.0e7, 200.0 * max_w), 2.5e8)
-        zi_node_w = np.clip(target_stiff / y_row_sq, 100.0, max_zi_w)
+        max_zi_w = min(max(1.5e7, 200.0 * max_w), 2.5e8)
+        min_zi_w = min(max(1.0e4, 10.0 * max_w), max_zi_w)
+        zi_node_w = np.clip(target_stiff / y_row_sq, min_zi_w, max_zi_w)
         ext_node_w = float(np.clip(max(10.0, 2.0 * med_w), 10.0, 500.0))
         node_w = np.where(zi_bus_mask, zi_node_w, ext_node_w)
 
@@ -10472,6 +10473,49 @@ class ACStateEstimator:
                     return True
             return False
 
+        if (not self.flat_start) and (x0 is None):
+            severe_ac_warm = False
+            if self.base_switch_re > self.n_angle:
+                vp_ac = x[self.n_angle : self.base_switch_re]
+                if vp_ac.size and (float(vp_ac.min()) < 0.82 or float(vp_ac.max()) > 1.18):
+                    severe_ac_warm = True
+            if (not severe_ac_warm) and self.n_angle > 0:
+                ap_ac = x[: self.n_angle]
+                if ap_ac.size and float(np.max(np.abs(ap_ac))) > 0.35:
+                    severe_ac_warm = True
+            if severe_ac_warm:
+                x_flat_ac = self.initial_state(flat=True)
+                if not _state_out_of_bounds(x_flat_ac):
+                    self.evaluate(x, measurement_plan_tables, out=z_est)
+                    self._measurement_residual(z, z_est, measurement_plan_tables, out=residual)
+                    self.evaluate(x_flat_ac, measurement_plan_tables, out=cand_z_est)
+                    self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                    real_acm = (weight > 0.0) & (weight < 5000.0)
+                    if not np.any(real_acm):
+                        real_acm = (weight > 0.0) & (weight <= 1.0e6)
+                    if np.any(real_acm):
+                        w_acm = weight[real_acm]
+                        obj_aw = float(np.dot(w_acm, residual[real_acm] * residual[real_acm]))
+                        obj_af = float(np.dot(w_acm, cand_residual[real_acm] * cand_residual[real_acm]))
+                        wr_aw = np.sqrt(w_acm) * np.abs(residual[real_acm])
+                        wr_af = np.sqrt(w_acm) * np.abs(cand_residual[real_acm])
+                        q75_aw = float(np.percentile(wr_aw, 75))
+                        q75_af = float(np.percentile(wr_af, 75))
+                        med_aw = float(np.median(wr_aw))
+                        med_af = float(np.median(wr_af))
+                        k85_ac = max(1, int(0.85 * wr_aw.size))
+                        trim_aw = float(np.mean(np.partition(wr_aw, k85_ac - 1)[:k85_ac] ** 2))
+                        trim_af = float(np.mean(np.partition(wr_af, k85_ac - 1)[:k85_ac] ** 2))
+                        if np.isfinite(obj_af) and (
+                            (obj_aw > 10.0 * max(obj_af, 1.0) and obj_aw > 1.0e3)
+                            or (q75_aw > 2.5 * max(q75_af, 1.0) and q75_aw > 8.0)
+                            or (trim_aw > 4.0 * max(trim_af, 1.0) and trim_aw > 16.0)
+                            or (med_aw > 1.8 * max(med_af, 1.0) and med_aw > 3.5)
+                        ):
+                            x = x_flat_ac
+                            cached_initial_H = None
+                            z_est_dirty = True
+
         v_cols_box = (
             np.arange(self.n_angle, self.base_switch_re, dtype=np.intp)
             if self.base_switch_re > self.n_angle
@@ -11584,6 +11628,80 @@ class ACStateEstimator:
             objective = self._weighted_objective(weight, residual)
             if start is not None:
                 self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        # 交流纯联络零注入母线终末增广拉格朗日（ALM）精修：不放大正规方程条件数即可消除高低阻混联下强粗差牵拉
+        if converged and (not coarse_stopped):
+            ac_tbl_alm = self._common_measurement_plan_table(measurement_plan_tables).table
+            if ac_tbl_alm is not None and int(ac_tbl_alm.idx.size) == n_meas:
+                ac_zi_rows = np.flatnonzero(
+                    (np.asarray(ac_tbl_alm.device_type_code, dtype=np.int16) == DEVICE_TYPE_ACPowerBalance)
+                    & (weight >= 5000.0)
+                )
+                if ac_zi_rows.size > 0:
+                    best_ac_zi = float(np.max(np.abs(residual[ac_zi_rows])))
+                    if np.isfinite(best_ac_zi) and best_ac_zi > 5.0e-5:
+                        x_aa_z = x.copy()
+                        ze_aa_z = z_est.copy()
+                        res_aa_true = residual.copy()
+                        lam_ac_z = np.zeros(ac_zi_rows.size, dtype=np.float64)
+                        alm_ac_solver = NormalEquationSolver(assume_fixed_pattern=False)
+                        for _ac_o in range(3):
+                            if float(np.max(np.abs(res_aa_true[ac_zi_rows]))) <= 1.0e-5:
+                                break
+                            lam_ac_z = lam_ac_z + res_aa_true[ac_zi_rows]
+                            for _ac_i in range(2):
+                                res_ac_s = res_aa_true.copy()
+                                res_ac_s[ac_zi_rows] += lam_ac_z
+                                obj_ac_s = self._weighted_objective(weight, res_ac_s)
+                                H_ac_a = self.jacobian_sparse(x_aa_z, measurement_plan_tables)
+                                g_ac_a, rhs_ac_a = build_normal_equations(H_ac_a, res_ac_s, weight)
+                                dx_ac_a = None
+                                for b_ac_a in (0.0, 1e-6, 1e-4):
+                                    try:
+                                        dx_t_ac, _ = alm_ac_solver.solve(g_ac_a, rhs_ac_a, return_factor_diag=False, damping=b_ac_a)
+                                        if dx_t_ac is not None and dx_t_ac.size == x_aa_z.size and np.all(np.isfinite(dx_t_ac)):
+                                            dx_ac_a = dx_t_ac
+                                            break
+                                    except Exception:
+                                        continue
+                                if dx_ac_a is None or float(np.max(np.abs(dx_ac_a))) < 1.0e-12:
+                                    break
+                                s_ac_a = 1.0
+                                ok_ac_a = False
+                                for _ls_ac_a in range(10):
+                                    cand_ac_a = x_aa_z + s_ac_a * dx_ac_a
+                                    if _state_out_of_bounds(cand_ac_a):
+                                        s_ac_a *= 0.5
+                                        continue
+                                    self.evaluate(cand_ac_a, measurement_plan_tables, out=cand_z_est)
+                                    self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                                    cr_ac_s = cand_residual.copy()
+                                    cr_ac_s[ac_zi_rows] += lam_ac_z
+                                    co_ac_s = self._weighted_objective(weight, cr_ac_s)
+                                    if np.isfinite(co_ac_s) and co_ac_s <= obj_ac_s * (1.0 + 1e-11) + 1e-12:
+                                        x_aa_z = cand_ac_a
+                                        ze_aa_z = cand_z_est.copy()
+                                        res_aa_true = cand_residual.copy()
+                                        ok_ac_a = True
+                                        break
+                                    s_ac_a *= 0.5
+                                if not ok_ac_a:
+                                    break
+                            new_ac_zi = float(np.max(np.abs(res_aa_true[ac_zi_rows])))
+                            if np.isfinite(new_ac_zi) and new_ac_zi < best_ac_zi:
+                                best_ac_zi = new_ac_zi
+                                x = x_aa_z.copy()
+                                z_est[:] = ze_aa_z
+                                residual[:] = res_aa_true
+                                objective = self._weighted_objective(weight, residual)
+                                residual_inf = (
+                                    float(np.linalg.norm(residual[active_weight_mask], np.inf))
+                                    if active_weight_mask is not None
+                                    else (float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0)
+                                )
+                                final_quantities_current = False
+                                wb_solver = None
+                            else:
+                                break
         if box_pin_cache.get("solver") is not None:
             try:
                 box_pin_cache["solver"]._reset_pardiso()

@@ -4620,11 +4620,12 @@ class DCStateEstimator:
 
         # 精确区分电压测点 (||H||^2=1) 与支路潮流/电流测点 (||H||^2~0.5*jac_sq) 的真实行刚度，
         # 既消除低阻直流支路高电导压扁紧权重的缺陷，又严格控制正规方程相对条件数以保持机器精度选择逆
-        ref_stiff = max(p90_stiff, 0.25 * max_stiff)
-        cond_stiff_cap = min(max(2.5e7 * min_stiff, 1.5e3 * ref_stiff), 5.0e11)
+        ref_stiff = max(p90_stiff, 0.5 * max_stiff)
+        cond_stiff_cap = min(max(5.0e7 * min_stiff, 5.0e3 * max_stiff), 5.0e11)
         target_stiff = min(max(1.0e4 * ref_stiff, 1.0e6), cond_stiff_cap)
         max_zi_w = min(max(1.5e7, 200.0 * max_w), 2.5e8)
-        node_zi_w = np.clip(target_stiff / jac_sq, 100.0, max_zi_w)
+        min_zi_w = min(max(1.0e4, 10.0 * max_w), max_zi_w)
+        node_zi_w = np.clip(target_stiff / jac_sq, min_zi_w, max_zi_w)
 
         if base_count > 0:
             bdt = np.asarray(base_table.device_type_code, dtype=np.int16)
@@ -6588,6 +6589,41 @@ class DCStateEstimator:
                     return True
             return False
 
+        if (not self.flat_start) and (x0 is None) and self.n_voltage > 0:
+            vp_dc = x[: self.n_voltage]
+            if vp_dc.size and (float(vp_dc.min()) < 0.82 or float(vp_dc.max()) > 1.18):
+                x_flat_dc = self.initial_state(flat=True)
+                if not _dc_state_out_of_bounds(x_flat_dc):
+                    self.evaluate(x, measurement_plan_tables, out=z_est)
+                    self._measurement_residual(z, z_est, measurement_plan_tables, out=residual)
+                    self.evaluate(x_flat_dc, measurement_plan_tables, out=cand_z_est)
+                    self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                    real_dcm = (weight > 0.0) & (weight < 5000.0)
+                    if not np.any(real_dcm):
+                        real_dcm = (weight > 0.0) & (weight <= 1.0e6)
+                    if np.any(real_dcm):
+                        w_dcm = weight[real_dcm]
+                        obj_dw = float(np.dot(w_dcm, residual[real_dcm] * residual[real_dcm]))
+                        obj_df = float(np.dot(w_dcm, cand_residual[real_dcm] * cand_residual[real_dcm]))
+                        wr_dw = np.sqrt(w_dcm) * np.abs(residual[real_dcm])
+                        wr_df = np.sqrt(w_dcm) * np.abs(cand_residual[real_dcm])
+                        q75_dw = float(np.percentile(wr_dw, 75))
+                        q75_df = float(np.percentile(wr_df, 75))
+                        med_dw = float(np.median(wr_dw))
+                        med_df = float(np.median(wr_df))
+                        k85_dc = max(1, int(0.85 * wr_dw.size))
+                        trim_dw = float(np.mean(np.partition(wr_dw, k85_dc - 1)[:k85_dc] ** 2))
+                        trim_df = float(np.mean(np.partition(wr_df, k85_dc - 1)[:k85_dc] ** 2))
+                        if np.isfinite(obj_df) and (
+                            (obj_dw > 10.0 * max(obj_df, 1.0) and obj_dw > 1.0e3)
+                            or (q75_dw > 2.5 * max(q75_df, 1.0) and q75_dw > 8.0)
+                            or (trim_dw > 4.0 * max(trim_df, 1.0) and trim_dw > 16.0)
+                            or (med_dw > 1.8 * max(med_df, 1.0) and med_dw > 3.5)
+                        ):
+                            x = x_flat_dc
+                            cached_initial_H = None
+                            z_est_dirty = True
+
         v_cols_box = (
             np.arange(0, self.n_voltage, dtype=np.intp)
             if self.n_voltage > 0
@@ -7429,6 +7465,80 @@ class DCStateEstimator:
             objective = self._weighted_objective(weight, residual)
             if start is not None:
                 self._record_profile_time("solve.final_residual_objective", time.perf_counter() - start)
+        # 直流纯零注入母线终末增广拉格朗日（ALM）精修：不放大条件数即可消除混联低阻高权重粗差牵拉
+        if converged:
+            dc_tbl_alm = self._common_measurement_plan_table(measurement_plan_tables).table
+            if dc_tbl_alm is not None and int(dc_tbl_alm.idx.size) == n_meas:
+                dc_zi_rows = np.flatnonzero(
+                    (np.asarray(dc_tbl_alm.device_type_code, dtype=np.int16) == DEVICE_TYPE_DCPowerBalance)
+                    & (weight > 0.0)
+                )
+                if dc_zi_rows.size > 0:
+                    best_dc_zi = float(np.max(np.abs(residual[dc_zi_rows])))
+                    if np.isfinite(best_dc_zi) and best_dc_zi > 5.0e-5:
+                        x_da_z = x.copy()
+                        ze_da_z = z_est.copy()
+                        res_da_true = residual.copy()
+                        lam_dc_z = np.zeros(dc_zi_rows.size, dtype=np.float64)
+                        alm_dc_solver = NormalEquationSolver(assume_fixed_pattern=False)
+                        for _dc_o in range(3):
+                            if float(np.max(np.abs(res_da_true[dc_zi_rows]))) <= 1.0e-5:
+                                break
+                            lam_dc_z = lam_dc_z + res_da_true[dc_zi_rows]
+                            for _dc_i in range(2):
+                                res_dc_s = res_da_true.copy()
+                                res_dc_s[dc_zi_rows] += lam_dc_z
+                                obj_dc_s = self._weighted_objective(weight, res_dc_s)
+                                H_dc_a = self.jacobian_sparse(x_da_z, measurement_plan_tables)
+                                g_dc_a, rhs_dc_a = build_normal_equations(H_dc_a, res_dc_s, weight)
+                                dx_dc_a = None
+                                for b_dc_a in (0.0, 1e-6, 1e-4):
+                                    try:
+                                        dx_t_dc, _ = alm_dc_solver.solve(g_dc_a, rhs_dc_a, return_factor_diag=False, damping=b_dc_a)
+                                        if dx_t_dc is not None and dx_t_dc.size == x_da_z.size and np.all(np.isfinite(dx_t_dc)):
+                                            dx_dc_a = dx_t_dc
+                                            break
+                                    except Exception:
+                                        continue
+                                if dx_dc_a is None or float(np.max(np.abs(dx_dc_a))) < 1.0e-12:
+                                    break
+                                s_dc_a = 1.0
+                                ok_dc_a = False
+                                for _ls_dc_a in range(10):
+                                    cand_dc_a = x_da_z + s_dc_a * dx_dc_a
+                                    if _dc_state_out_of_bounds(cand_dc_a):
+                                        s_dc_a *= 0.5
+                                        continue
+                                    self.evaluate(cand_dc_a, measurement_plan_tables, out=cand_z_est)
+                                    self._measurement_residual(z, cand_z_est, measurement_plan_tables, out=cand_residual)
+                                    cr_dc_s = cand_residual.copy()
+                                    cr_dc_s[dc_zi_rows] += lam_dc_z
+                                    co_dc_s = self._weighted_objective(weight, cr_dc_s)
+                                    if np.isfinite(co_dc_s) and co_dc_s <= obj_dc_s * (1.0 + 1e-11) + 1e-12:
+                                        x_da_z = cand_dc_a
+                                        ze_da_z = cand_z_est.copy()
+                                        res_da_true = cand_residual.copy()
+                                        ok_dc_a = True
+                                        break
+                                    s_dc_a *= 0.5
+                                if not ok_dc_a:
+                                    break
+                            new_dc_zi = float(np.max(np.abs(res_da_true[dc_zi_rows])))
+                            if np.isfinite(new_dc_zi) and new_dc_zi < best_dc_zi:
+                                best_dc_zi = new_dc_zi
+                                x = x_da_z.copy()
+                                z_est[:] = ze_da_z
+                                residual[:] = res_da_true
+                                objective = self._weighted_objective(weight, residual)
+                                residual_inf = (
+                                    float(np.linalg.norm(residual[active_weight_mask], np.inf))
+                                    if active_weight_mask is not None
+                                    else (float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0)
+                                )
+                                final_quantities_current = False
+                                wb_solver = None
+                            else:
+                                break
         if box_pin_cache.get("solver") is not None:
             try:
                 box_pin_cache["solver"]._reset_pardiso()
