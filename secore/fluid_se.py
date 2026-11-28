@@ -193,6 +193,8 @@ class FluidStateEstimator:
 
     def _load_measurements(self) -> MeasurementList:
         if self._provided_measurements is not None:
+            if isinstance(self._provided_measurements, TableBackedMeasurementList) and getattr(self._provided_measurements, "table", None) is not None:
+                return self._provided_measurements
             return MeasurementList(list(self._provided_measurements))
         if self.measurement_file is None:
             raise ValueError("measurement_file or measurements is required")
@@ -392,6 +394,7 @@ class FluidStateEstimator:
             self.active_measurements = TableBackedMeasurementList(active_table, normalized=True)
 
             bad_rows = np.flatnonzero(~active_mask)
+            self._prefiltered_count_fast = int(bad_rows.size)
             if bad_rows.size == 0:
                 self.prefiltered_measurements = []
             elif bad_rows.size <= 2048:
@@ -2584,8 +2587,10 @@ class FluidStateEstimator:
             if valid_e.size
             else 100.0
         )
-        cap_e = max(6.0e6 * max(med_e, 1.0), 8.0e4 * ref_e)
-        target_e = min(max(5.0e4 * ref_e, 5.0e5), cap_e)
+        # 两阶段零注入定权：主迭代与坏数据辨识阶段采用良态中等刚度防止高粗差全网涂抹与条件数恶化，
+        # 终末增广拉格朗日（ALM）阶段再局部升权耦合乘子偏置实现微米级流量闭合
+        cap_e = max(6.0e4 * max(med_e, 1.0), 1.5e3 * ref_e)
+        target_e = min(max(150.0 * ref_e, 2.5e3), cap_e)
 
         flow_deriv = self._build_flow_derivative_csr(typ_passive_deriv)
         zi_jac = (net.incidence[zi_nodes] @ flow_deriv).tocsr()
@@ -2597,11 +2602,10 @@ class FluidStateEstimator:
         fin_pos_w = base_w[np.isfinite(base_w) & (base_w > 0.0)]
         max_real_w = float(np.max(fin_pos_w)) if fin_pos_w.size else 100.0
         med_real_w = float(np.median(fin_pos_w)) if fin_pos_w.size else 100.0
-        max_zi_w = min(max(2.5e8, 5.0e4 * max_real_w), 2.5e9)
+        max_zi_w = min(max(5.0e4, 500.0 * max_real_w), 2.5e5)
         row_eq_w = target_e / np.maximum(zi_row_sq, min_row_sq)
-        # 物理流量空间紧守恒保底权重：防止高管导节点因 zi_row_sq 偏大反被除成低权重而产生质量泄漏
-        flow_tight_w = 2.5e5 * max(med_real_w, 25.0) / max(f_base * f_base, 1.0e-2)
-        zi_weights = np.clip(np.maximum(row_eq_w, flow_tight_w), 100.0, max_zi_w)
+        flow_tight_w = 50.0 * max(med_real_w, 25.0) / max(f_base * f_base, 1.0e-2)
+        zi_weights = np.clip(np.maximum(row_eq_w, flow_tight_w), 200.0, max_zi_w)
 
         all_tbl = getattr(self.measurements, "table", None)
         if all_tbl is not None and int(all_tbl.idx.size) > 0:
@@ -3137,6 +3141,31 @@ class FluidStateEstimator:
         if x.size == self.state_count:
             x = np.clip(x, state_lo, state_hi)
         zi_plan_rows = np.asarray(self._get_compiled_meas_plan(self.active_measurements).get("zi_rows", ()), dtype=np.int64)
+        if (not self.params.flat_start) and (x0 is None) and x.size == self.state_count:
+            x_flat_f = np.clip(self.initial_state(flat_start=True), state_lo, state_hi)
+            fl_warm_diff = float(np.max(np.abs(x - x_flat_f) / np.maximum(state_scales, 1.0))) if x.size else 0.0
+            if fl_warm_diff > 0.25:
+                real_fm = (target_weight > 0.0) & (target_weight <= 1.0e5)
+                if zi_plan_rows.size > 0:
+                    v_zi_f = zi_plan_rows[(zi_plan_rows >= 0) & (zi_plan_rows < real_fm.size)]
+                    real_fm[v_zi_f] = False
+                if np.any(real_fm):
+                    rw_f = z - self.evaluate(x)
+                    rf_f = z - self.evaluate(x_flat_f)
+                    if np.all(np.isfinite(rf_f[real_fm])):
+                        w_rfm = target_weight[real_fm]
+                        wr_wf = np.sqrt(w_rfm) * np.abs(rw_f[real_fm])
+                        wr_ff = np.sqrt(w_rfm) * np.abs(rf_f[real_fm])
+                        med_wf = float(np.median(wr_wf))
+                        med_ff = float(np.median(wr_ff))
+                        q75_wf = float(np.percentile(wr_wf, 75))
+                        q75_ff = float(np.percentile(wr_ff, 75))
+                        if (
+                            not np.all(np.isfinite(rw_f[real_fm]))
+                            or (med_wf > 1.5 * max(med_ff, 1.0) and med_wf > 3.5)
+                            or (q75_wf > 2.0 * max(q75_ff, 1.5) and q75_wf > 7.0)
+                        ):
+                            x = x_flat_f
         zi_active_rows = zi_plan_rows[(zi_plan_rows >= 0) & (zi_plan_rows < weight.size) & (target_weight[zi_plan_rows] > 100.0)]
         zi_softened = bool(zi_active_rows.size > 0)
         if zi_softened:
@@ -3157,12 +3186,18 @@ class FluidStateEstimator:
                 else 100.0
             )
             zi_init_sq = np.maximum(init_row_sq[zi_active_rows], 1e-12)
-            soft_scale = 0.05 if lm_damping > 0.0 else 0.15
-            weight = target_weight.copy()
-            weight[zi_active_rows] = np.minimum(
-                target_weight[zi_active_rows],
-                np.maximum(1e-12, (soft_scale * soft_ref_e) / zi_init_sq),
-            )
+            zi_max_e = float(np.max(target_weight[zi_active_rows] * zi_init_sq))
+            if (x0 is not None) and np.isfinite(zi_max_e) and zi_max_e <= 5000.0 * max(soft_ref_e, 100.0):
+                # 外部热启动状态已拉开节点压差、不存在平启动零压差奇异导数，直接沿用目标权重避免限步重估放飞流量
+                weight = target_weight
+                zi_softened = False
+            else:
+                soft_scale = 0.05 if lm_damping > 0.0 else 0.15
+                weight = target_weight.copy()
+                weight[zi_active_rows] = np.minimum(
+                    target_weight[zi_active_rows],
+                    np.maximum(1e-12, (soft_scale * soft_ref_e) / zi_init_sq),
+                )
 
         micro_damp_full_streak = 0
         micro_damp_resets = 0
@@ -3179,6 +3214,7 @@ class FluidStateEstimator:
             nonlocal micro_damp_full_streak, micro_damp_resets
             if (
                 not zi_mid_bridged
+                and (_max_iter_cap is None or int(_max_iter_cap) > 24)
                 and zi_active_rows.size > 0
                 and float(np.min(weight[zi_active_rows])) < 1e-2
             ):
@@ -3222,9 +3258,10 @@ class FluidStateEstimator:
             micro_damp_resets = 0
             cached_z_est = cached_residual = cached_objective = None
 
-        def _solve_step(H_cur: csr_matrix, res_cur: np.ndarray, damping_val: float):
+        def _solve_step(H_cur: csr_matrix, res_cur: np.ndarray, damping_val: float, x_cur: Optional[np.ndarray] = None):
             """在无量纲标幺状态空间 x_pu = x / D_x 下组装并求解正规方程，再还原物理增量 dx = D_x * dx_pu。"""
             nonlocal aat_plan, gain
+            x_ref = x if x_cur is None else x_cur
             if use_aat and aat_solver is not None and H_cur.nnz > 0:
                 if not H_cur.has_sorted_indices:
                     H_cur.sort_indices()
@@ -3249,7 +3286,7 @@ class FluidStateEstimator:
                 )
                 diag_g = diag_pu / np.maximum(state_scales * state_scales, 1e-24)
                 pinned_pot = (
-                    np.flatnonzero((x[: self.n_potential] <= minimum + 1e-9) & (rhs_vec[: self.n_potential] < 0.0))
+                    np.flatnonzero((x_ref[: self.n_potential] <= minimum + 1e-9) & (rhs_vec[: self.n_potential] < 0.0))
                     if self.n_potential > 0
                     else np.empty(0, dtype=np.intp)
                 )
@@ -3293,7 +3330,7 @@ class FluidStateEstimator:
                         )
                     dx_pu = np.asarray(dx_raw, dtype=np.float64)
                     if dx_pu.size:
-                        dyn_jump_ref = np.maximum(1.0, np.abs(x) / np.maximum(1.0, state_scales))
+                        dyn_jump_ref = np.maximum(1.0, np.abs(x_ref) / np.maximum(1.0, state_scales))
                         if self.n_regulated > 0:
                             reg_sl = slice(self.base_regulated_flow, self.base_supply_temperature)
                             dyn_jump_ref[reg_sl] = np.maximum(dyn_jump_ref[reg_sl], 20.0)
@@ -3334,7 +3371,7 @@ class FluidStateEstimator:
             diag_pu = np.asarray(gain_pu.diagonal(), dtype=np.float64)
             diag_g = diag_pu / np.maximum(state_scales * state_scales, 1e-24)
             pinned_pot = (
-                np.flatnonzero((x[: self.n_potential] <= minimum + 1e-9) & (rhs_vec[: self.n_potential] < 0.0))
+                np.flatnonzero((x_ref[: self.n_potential] <= minimum + 1e-9) & (rhs_vec[: self.n_potential] < 0.0))
                 if self.n_potential > 0
                 else np.empty(0, dtype=np.intp)
             )
@@ -3466,10 +3503,13 @@ class FluidStateEstimator:
             )
             conv_obj_tol = max(1e-12, 1e-9 * (abs(objective) + 1.0))
             soft_rel_gate = max(5e-4, 50.0 * self.tol) if zi_mid_bridged else max(1.0e-5, 10.0 * self.tol)
-            bridge_budget_done = bool(
-                zi_mid_bridged and zi_softened and (iteration - zi_bridge_start_iter) >= max(30, int(0.65 * self.max_iter))
+            soft_init_done = bool(
+                zi_softened and (not zi_mid_bridged) and iteration >= max(6, min(12, int(0.22 * eff_fluid_max_iter)))
             )
-            if bridge_budget_done or (
+            bridge_budget_done = bool(
+                zi_mid_bridged and zi_softened and (iteration - zi_bridge_start_iter) >= max(8, min(14, int(0.25 * eff_fluid_max_iter)))
+            )
+            if soft_init_done or bridge_budget_done or (
                 zi_softened
                 and iteration >= 2
                 and pred_drop <= max(1e-6, (1e-3 if zi_mid_bridged else 1e-4) * (abs(objective) + 1.0))
@@ -3947,10 +3987,24 @@ class FluidStateEstimator:
             cached_z_est = cached_residual = cached_objective = None
             last_used_damping = max(last_used_damping, 1e-6)
 
-        # 增广拉格朗日乘子（ALM）零注入流量守恒精修：在不继续放大惩罚权重、保持正规方程良态的前提下，
-        # 通过 1~3 轮乘子偏置更新消除高管导/强压力噪声对纯零注入节点的残余质量牵拉
+        # 增广拉格朗日乘子（ALM）零注入流量守恒精修：在终末阶段局部提升零注入紧罚刚度并叠加 1~4 轮乘子偏置更新，
+        # 既保持主迭代与 BDR 正规方程良态，又彻底消除高管导/强压力噪声对纯零注入节点的残余质量牵拉
         fluid_alm_skipped = False
-        if converged and zi_active_rows.size > 0:
+        rel_corr_alm_f = (
+            float(np.max(np.abs(dx) / np.maximum(state_scales, 1.0)))
+            if ("dx" in locals() and dx is not None and dx.size == self.state_count and np.all(np.isfinite(dx)))
+            else np.inf
+        )
+        fluid_alm_ready = (
+            converged
+            or (
+                _huber_irls_k is None
+                and iteration >= 8
+                and np.all(np.isfinite(x))
+                and rel_corr_alm_f <= 0.25
+            )
+        )
+        if fluid_alm_ready and zi_active_rows.size > 0:
             z_est_chk = cached_z_est if cached_z_est is not None else self.evaluate(x)
             res_chk = z - z_est_chk
             _, flow_chk, _ = self._flow_state_arrays(x, need_derivative=False)
@@ -3959,69 +4013,118 @@ class FluidStateEstimator:
             if np.isfinite(best_zi_err) and best_zi_err > 1.0e-5 * f_ref_alm and _skip_terminal_alm:
                 fluid_alm_skipped = True
             elif np.isfinite(best_zi_err) and best_zi_err > 1.0e-5 * f_ref_alm:
+                saved_f_w = weight
+                real_alm_mask = np.ones(weight.size, dtype=bool)
+                real_alm_mask[zi_active_rows] = False
+                pos_real_alm = weight[real_alm_mask & (weight > 0.0) & np.isfinite(weight)]
+                med_real_alm = float(np.median(pos_real_alm)) if pos_real_alm.size else 100.0
+                max_real_alm = float(np.max(pos_real_alm)) if pos_real_alm.size else 100.0
+                H_alm0 = self.jacobian_sparse(x)
+                H_alm0_pu = H_alm0.copy()
+                if H_alm0_pu.nnz > 0:
+                    H_alm0_pu.data = H_alm0.data * state_scales[H_alm0.indices]
+                alm_row_sq = np.asarray(H_alm0_pu.power(2).sum(axis=1)).reshape(-1)
+                real_alm_e = weight[real_alm_mask] * alm_row_sq[real_alm_mask]
+                valid_alm_e = real_alm_e[np.isfinite(real_alm_e) & (real_alm_e > 1e-12) & (real_alm_e < 1e14)]
+                ref_alm_e = (
+                    max(float(np.percentile(valid_alm_e, 85)), 0.25 * float(np.max(valid_alm_e)))
+                    if valid_alm_e.size
+                    else 100.0
+                )
+                alm_eq_w = max(5.0e4 * ref_alm_e, 1.0e6) / np.maximum(alm_row_sq[zi_active_rows], 1.0e-8)
+                alm_flow_w = 2.5e5 * max(med_real_alm, 25.0) / max((0.1 * f_ref_alm) ** 2, 1.0e-2)
+                alm_max_w = min(max(2.5e8, 5.0e4 * max_real_alm), 2.5e9)
+                w_f_alm = weight.copy()
+                w_f_alm[zi_active_rows] = np.clip(
+                    np.maximum(weight[zi_active_rows] * 50.0, np.maximum(alm_eq_w, alm_flow_w)),
+                    1.0e5,
+                    alm_max_w,
+                )
+                real_obj_base = float(np.dot(saved_f_w[real_alm_mask], res_chk[real_alm_mask] * res_chk[real_alm_mask]))
                 x_alm = x.copy()
                 z_est_alm = z_est_chk.copy()
                 alm_shift = np.zeros(zi_active_rows.size, dtype=np.float64)
-                for _alm_outer in range(3):
-                    true_zi_res = z[zi_active_rows] - z_est_alm[zi_active_rows]
-                    cur_zi_err = float(np.max(np.abs(true_zi_res)))
-                    if cur_zi_err <= 5.0e-6 * f_ref_alm:
-                        break
-                    alm_shift = alm_shift + true_zi_res
-                    z_target_alm = z.copy()
-                    z_target_alm[zi_active_rows] = z[zi_active_rows] + alm_shift
-                    for _alm_inner in range(3):
-                        res_alm = z_target_alm - z_est_alm
-                        obj_alm = float(np.dot(weight, res_alm * res_alm))
-                        H_alm = self.jacobian_sparse(x_alm)
-                        dx_alm = None
-                        for beta_alm in (0.0, 1e-5, 1e-3):
-                            try:
-                                dx_try, _, _, _ = _solve_step(H_alm, res_alm, beta_alm)
-                                if dx_try is not None and dx_try.size == self.state_count and np.all(np.isfinite(dx_try)):
-                                    dx_alm = dx_try
-                                    break
-                            except Exception:
-                                continue
-                        if dx_alm is None:
+                last_alm_rel_dx = np.inf
+                weight = w_f_alm
+                try:
+                    for _alm_outer in range(4):
+                        true_zi_res = z[zi_active_rows] - z_est_alm[zi_active_rows]
+                        cur_zi_err = float(np.max(np.abs(true_zi_res)))
+                        if cur_zi_err <= 5.0e-6 * f_ref_alm:
                             break
-                        if float(np.max(np.abs(dx_alm) / np.maximum(state_scales, 1.0))) < 1.0e-12:
-                            break
-                        step_alm = 1.0
-                        pot_min_alm = (
-                            np.maximum(minimum, 0.25 * x_alm[: self.n_potential])
-                            if self.n_potential > 0
-                            else np.empty(0, dtype=np.float64)
-                        )
-                        step_ok = False
-                        for _ls_a in range(10):
-                            cand_alm = x_alm + step_alm * dx_alm
-                            if self.n_potential > 0 and np.any(cand_alm[: self.n_potential] < pot_min_alm):
-                                step_alm *= 0.5
-                                continue
-                            cand_ze = self.evaluate(cand_alm)
-                            if not np.all(np.isfinite(cand_ze)):
-                                step_alm *= 0.5
-                                continue
-                            cand_ra = z_target_alm - cand_ze
-                            cand_oa = float(np.dot(weight, cand_ra * cand_ra))
-                            if np.isfinite(cand_oa) and cand_oa <= obj_alm * (1.0 + 1e-11) + 1e-12:
-                                x_alm = cand_alm
-                                z_est_alm = cand_ze
-                                step_ok = True
+                        if _alm_outer == 0:
+                            # 首轮刚将罚权重从温和主权重放大至紧刚度 w_f_alm，按 Hestenes-Powell 同乘子尺度换算偏置 lambda / rho_new
+                            alm_shift = (saved_f_w[zi_active_rows] / np.maximum(w_f_alm[zi_active_rows], 1.0)) * true_zi_res
+                        else:
+                            alm_shift = alm_shift + true_zi_res
+                        z_target_alm = z.copy()
+                        z_target_alm[zi_active_rows] = z[zi_active_rows] + alm_shift
+                        for _alm_inner in range(3):
+                            res_alm = z_target_alm - z_est_alm
+                            obj_alm = float(np.dot(weight, res_alm * res_alm))
+                            H_alm = self.jacobian_sparse(x_alm)
+                            dx_alm = None
+                            for beta_alm in (0.0, 1e-6, 1e-4, 1e-2):
+                                try:
+                                    dx_try, _, _, _ = _solve_step(H_alm, res_alm, beta_alm, x_alm)
+                                    if dx_try is not None and dx_try.size == self.state_count and np.all(np.isfinite(dx_try)):
+                                        dx_alm = dx_try
+                                        break
+                                except Exception:
+                                    continue
+                            if dx_alm is None:
                                 break
-                            step_alm *= 0.5
-                        if not step_ok:
+                            cur_alm_rel_dx = float(np.max(np.abs(dx_alm) / np.maximum(state_scales, 1.0)))
+                            last_alm_rel_dx = cur_alm_rel_dx
+                            if cur_alm_rel_dx < 1.0e-12:
+                                break
+                            step_alm = 1.0
+                            pot_min_alm = (
+                                np.maximum(minimum, 0.25 * x_alm[: self.n_potential])
+                                if self.n_potential > 0
+                                else np.empty(0, dtype=np.float64)
+                            )
+                            step_ok = False
+                            for _ls_a in range(16):
+                                cand_alm = np.clip(x_alm + step_alm * dx_alm, state_lo, state_hi)
+                                if self.n_potential > 0:
+                                    cand_alm[: self.n_potential] = np.maximum(cand_alm[: self.n_potential], pot_min_alm)
+                                cand_ze = self.evaluate(cand_alm)
+                                if not np.all(np.isfinite(cand_ze)):
+                                    step_alm *= 0.5
+                                    continue
+                                cand_ra = z_target_alm - cand_ze
+                                cand_oa = float(np.dot(weight, cand_ra * cand_ra))
+                                if np.isfinite(cand_oa) and cand_oa <= obj_alm * (1.0 + 1e-11) + 1e-12:
+                                    x_alm = cand_alm
+                                    z_est_alm = cand_ze
+                                    step_ok = True
+                                    break
+                                step_alm *= 0.5
+                            if not step_ok:
+                                break
+                        cand_true_r = z - z_est_alm
+                        new_zi_err = float(np.max(np.abs(cand_true_r[zi_active_rows])))
+                        real_obj_cand = float(
+                            np.dot(saved_f_w[real_alm_mask], cand_true_r[real_alm_mask] * cand_true_r[real_alm_mask])
+                        )
+                        if (
+                            np.isfinite(new_zi_err)
+                            and new_zi_err < best_zi_err
+                            and np.isfinite(real_obj_cand)
+                            and real_obj_cand <= max(real_obj_base * 2.5 + 10.0, real_obj_base + 5.0e4)
+                        ):
+                            best_zi_err = new_zi_err
+                            x = x_alm.copy()
+                            cached_z_est = cached_residual = cached_objective = None
+                            evaluated_at_final_x = False
+                            last_used_damping = max(last_used_damping, 1e-6)
+                            if (not converged) and last_alm_rel_dx < self.tol and best_zi_err <= 1.0e-4 * f_ref_alm:
+                                converged = True
+                        else:
                             break
-                    new_zi_err = float(np.max(np.abs(z[zi_active_rows] - z_est_alm[zi_active_rows])))
-                    if np.isfinite(new_zi_err) and new_zi_err < best_zi_err:
-                        best_zi_err = new_zi_err
-                        x = x_alm.copy()
-                        cached_z_est = cached_residual = cached_objective = None
-                        evaluated_at_final_x = False
-                        last_used_damping = max(last_used_damping, 1e-6)
-                    else:
-                        break
+                finally:
+                    weight = saved_f_w
 
         # 仅当终轮无阻尼且未开启 Huber 重加权时，缓存求解器与标幺线性因子句柄供坏数据杠杆复用
         if _huber_irls_k is None and last_used_damping == 0.0 and evaluated_at_final_x:
@@ -4340,7 +4443,10 @@ class FluidStateEstimator:
                 )
                 if np.all(np.isfinite(hub_res.x)) and np.all(np.isfinite(hub_res.residual)):
                     # 在 Huber 稳健状态点按原始 cur_weight 重新评估真实目标与雅可比，精准浮出全部强粗差
+                    wls_init_f_obj = float(res.objective) if np.isfinite(res.objective) else np.inf
                     hub_res.objective = float(np.dot(cur_weight, hub_res.residual * hub_res.residual))
+                    hub_res._from_huber_warmup = True
+                    hub_res._wls_init_obj = wls_init_f_obj
                     res = hub_res
             if total_cap <= 0 or (not res.converged and not (obs.observable and np.isfinite(res.objective))):
                 self.identify_bad_data(res, threshold=threshold_value, weight_override=cur_weight)
@@ -4462,17 +4568,19 @@ class FluidStateEstimator:
                     prev_min_p = float(np.min(prev_p))
                     prev_max_p = float(np.max(prev_p))
                     prev_med_p = float(np.median(prev_p))
+                    prev_p05 = float(np.percentile(prev_p, 5))
                 else:
                     prev_min_p = 1.0
                     prev_max_p = 1.0
                     prev_med_p = 1.0
+                    prev_p05 = 1.0
                 accepted_trial = False
                 while trial_rows:
                     t_weight = cur_weight.copy()
                     t_weight[trial_rows] = 0.0
                     hint_damp = float(getattr(res, "_final_lm_damping", 0.0))
                     mid_batch_cap = (
-                        min(int(self.max_iter), 12)
+                        min(int(self.max_iter), 16)
                         if (fluid_round_idx <= 8 and self.state_count >= 5000 and (len(cand_rows) - len(trial_rows)) >= 32)
                         else None
                     )
@@ -4507,13 +4615,23 @@ class FluidStateEstimator:
                             trial_res = flat_res
                     if self.n_potential > 0:
                         trial_pot = np.maximum(trial_res.x[: self.n_potential], 1e-12)
-                        trial_min_p = float(np.min(trial_pot)) ** (1.0 / pw)
-                        trial_max_p = float(np.max(trial_pot)) ** (1.0 / pw)
+                        trial_p = trial_pot ** (1.0 / pw)
+                        trial_min_p = float(np.min(trial_p))
+                        trial_max_p = float(np.max(trial_p))
+                        trial_p05 = float(np.percentile(trial_p, 5))
                     else:
                         trial_min_p = 1.0
                         trial_max_p = 1.0
+                        trial_p05 = 1.0
+                    low_p_collapse = (
+                        prev_min_p > 1e-3
+                        and (
+                            trial_min_p < min(0.15 * prev_min_p, 0.08 * max(prev_med_p, 1e-3))
+                            or (prev_p05 > 1e-3 and trial_p05 < 0.25 * prev_p05)
+                        )
+                    )
                     pressure_abnormal = (
-                        (prev_min_p > 1e-3 and trial_min_p < 0.25 * prev_min_p)
+                        low_p_collapse
                         or (prev_max_p > 1e-3 and trial_max_p > 3.0 * prev_max_p)
                         or (
                             prev_med_p > 1e-3
@@ -4523,17 +4641,22 @@ class FluidStateEstimator:
                     )
                     # 允许首轮未收敛后通过删坏恢复收敛；中间限步轮次只要目标下降且无压力坍塌则放行延续；终轮统一精算
                     trial_iter_capped = bool(getattr(trial_res, "_iter_capped", False))
+                    ref_f_obj = (
+                        max(float(res.objective), float(getattr(res, "_wls_init_obj", res.objective)))
+                        if bool(getattr(res, "_from_huber_warmup", False))
+                        else float(res.objective)
+                    )
                     trial_ok = (
                         np.isfinite(trial_res.objective)
                         and not pressure_abnormal
                         and (
                             trial_res.converged
-                            or (trial_iter_capped and trial_res.objective <= res.objective * 1.02 + 1e-6)
-                            or (not res.converged and trial_res.objective < res.objective)
+                            or (trial_iter_capped and trial_res.objective <= ref_f_obj * 1.02 + 1e-6)
+                            or (not res.converged and trial_res.objective < ref_f_obj)
                         )
                         and (
                             not res.converged
-                            or trial_res.objective <= res.objective * 1.05 + 1e-6
+                            or trial_res.objective <= ref_f_obj * 1.05 + 1e-6
                         )
                     )
                     if trial_ok:
@@ -4579,8 +4702,9 @@ class FluidStateEstimator:
                 if unconverged_streak >= 3 or unconverged_total_rounds >= 10:
                     break
 
-            if getattr(res, "_iter_capped", False) or (res.converged and getattr(res, "_alm_skipped", False)):
-                final_f_cap = 3 if (res.converged and getattr(res, "_alm_skipped", False)) else None
+            if getattr(res, "_iter_capped", False) or getattr(res, "_alm_skipped", False):
+                was_f_capped = bool(getattr(res, "_iter_capped", False))
+                final_f_cap = 3 if (res.converged and (not was_f_capped) and getattr(res, "_alm_skipped", False)) else None
                 final_f_res = self.estimate(
                     x0=res.x,
                     observability=obs,
@@ -4589,7 +4713,13 @@ class FluidStateEstimator:
                     _max_iter_cap=final_f_cap,
                     _skip_terminal_alm=False,
                 )
-                if final_f_res.converged or (not res.converged and np.isfinite(final_f_res.objective) and final_f_res.objective <= res.objective):
+                if final_f_res.converged or (
+                    (not res.converged)
+                    and np.isfinite(final_f_res.objective)
+                    and final_f_res.objective <= res.objective * 1.05 + 1e-6
+                ):
+                    if res.converged and not was_f_capped:
+                        final_f_res.iterations += int(res.iterations)
                     res = final_f_res
                     need_identify = True
             self.bad_data = removed_items
@@ -4613,6 +4743,9 @@ class FluidStateEstimator:
             prefiltered_measurements=self.prefiltered_measurements,
             all_measurements=self.measurements,
         )
+        fast_pf_cnt = int(getattr(self, "_prefiltered_count_fast", 0))
+        if fast_pf_cnt > int(self.se_result.statistics.prefiltered_measurement_count):
+            self.se_result.statistics.prefiltered_measurement_count = fast_pf_cnt
         return self.se_result
 
     def run(

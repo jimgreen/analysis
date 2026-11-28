@@ -9331,6 +9331,222 @@ def test_large_scale_no_cholmod_superlu_leverage_pseudo_masking_and_dc_alm_regre
             assert corrupted_idx in rem_ids
 
 
+def test_steam_lf_decoupled_warmup_and_multi_energy_prefilter_idx_isolation(tmp_path: Path) -> None:
+    """验证蒸汽网潮流水热解耦热启动收敛及多能耦合预过滤 idx 隔离与统计计数准确性。"""
+    from lfcore.steam_lf import SteamPowerFlowCalc
+    from model.steam_model import load_steam_network_from_e_file
+
+    # 1. 构造多级分支蒸汽管网（节点初始比焓偏离源点且下游初值压降平坦），验证水热解耦热启动一次精确收敛
+    n_steam = 300
+    s_lines = [
+        "<Model>",
+        "@ p_base u_unit p_unit i_unit",
+        "# 100.0 kV MW kA",
+        "</Model>",
+        "<SteamMedium>",
+        "@ idx name rho cp t_ref h_ref t_amb h_amb h_fw",
+        "# 1 steam_med 4.5 2.1 220.0 2800.0 20.0 100.0 420.0",
+        "</SteamMedium>",
+        "<SteamNode>",
+        "@ idx name p_init h_init isl run_stat",
+    ]
+    for i in range(1, n_steam + 1):
+        s_lines.append(f"# {i} snode_{i} 12.0 2650.0 1 1")
+    s_lines += [
+        "</SteamNode>",
+        "<SteamSource>",
+        "@ idx name node ctrl p_set q_set h_set q_min q_max alpha run_stat",
+        "# 1 ssrc_1 1 PRESSURE 16.0 0.0 3050.0 -5000.0 5000.0 1.0 1",
+        "</SteamSource>",
+        "<SteamLoad>",
+        "@ idx name node q_set h_cond run_stat",
+    ]
+    for k in range(2, n_steam + 1, 3):
+        s_lines.append(f"# {k} sload_{k} {k} 0.45 420.0 1")
+    s_lines += [
+        "</SteamLoad>",
+        "<SteamPipe>",
+        "@ idx name i_node j_node r heat_loss q_min q_max run_stat",
+    ]
+    for i in range(2, n_steam + 1):
+        par = (i - 2) // 4 + 1
+        s_lines.append(f"# {i - 1} spipe_{i - 1} {par} {i} 0.015 0.002 -2000.0 2000.0 1")
+    s_lines.append("</SteamPipe>")
+    steam_e = tmp_path / "steam_300.e"
+    steam_e.write_text("\n".join(s_lines) + "\n", encoding="utf-8")
+    s_net = load_steam_network_from_e_file(str(steam_e))
+    s_lf = SteamPowerFlowCalc(s_net, parameters=LF_PARAMS, result_mode="array")
+    rc_s = s_lf.run()
+    assert rc_s == 0 and s_lf.converged
+    assert float(s_lf.normF) < 1.0e-6
+
+    # 2. 验证多能耦合末尾预过滤探针被剔除后，伪量测合成 idx 不复用被剔除探针 idx，且 prefiltered_measurement_count 准确
+    root_dir = Path(__file__).resolve().parents[1]
+    me_e = root_dir / "data" / "hybrid_ac_gas" / "hybrid_ac_gas.e"
+    me_m = root_dir / "data" / "hybrid_ac_gas" / "hybrid_ac_gas.meas"
+    if me_e.exists() and me_m.exists():
+        pf_dir = tmp_path / "me_pf_iso"
+        pf_dir.mkdir(parents=True, exist_ok=True)
+        dst_e = pf_dir / "case.e"
+        dst_m = pf_dir / "case.meas"
+        dst_e.write_text(me_e.read_text(encoding="utf-8"), encoding="utf-8")
+        raw_lines = me_m.read_text(encoding="utf-8").splitlines()
+        out_lines = []
+        max_orig_id = 0
+        blinded = 0
+        for ln in raw_lines:
+            if ln.startswith("#"):
+                ps = ln.split()
+                if len(ps) >= 9:
+                    max_orig_id = max(max_orig_id, int(ps[1]))
+                    if blinded < 3 and ps[7] == "1" and ps[3] in ("ACNode", "GasNode"):
+                        ps[7] = "0"
+                        blinded += 1
+                        ln = " ".join(ps)
+            if ln.strip() == "</Measurement>":
+                probe_ids = [max_orig_id + 1, max_orig_id + 2, max_orig_id + 3]
+                out_lines.append(f"# {probe_ids[0]} pf_abn ACNode NONEXIST_BUS V 100.0 1 1.0 2")
+                out_lines.append(f"# {probe_ids[1]} pf_vhi ACNode NONEXIST_BUS V 100.0 1 999999.0 0")
+                out_lines.append(f"# {probe_ids[2]} pf_gas GasNode NONEXIST_GNODE PRESSURE 100.0 1 -50.0 0")
+            out_lines.append(ln)
+        dst_m.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        est_me = HybridStateEstimator(
+            dst_e,
+            dst_m,
+            parameters=SE_PARAMS.with_overrides(max_iter=60, max_remove=10),
+            flat_start=True,
+        )
+        se_res_me = est_me.run(result_mode="summary", remove_bad_data=True, skip_bad_data=False, verbose=False)
+        assert se_res_me is not None
+        active_ids_me = set(np.asarray(est_me._multi_energy_measurement_table.idx, dtype=np.int64).tolist())
+        for pid in probe_ids:
+            assert pid not in active_ids_me, f"Prefiltered probe idx={pid} collided with synthetic pseudo idx"
+        assert int(se_res_me.statistics.prefiltered_measurement_count) >= 3 + blinded
+
+
+def test_fluid_two_stage_zi_low_pressure_bdr_and_ac_corrupted_warmstart(tmp_path):
+    """验证流体两阶段零注入紧闭合与低压粗差防误回滚，以及交流畸变热启动 BDR 前向初值净化零误删。"""
+    from lfcore.gas_lf import GasPowerFlowCalc
+    from model.gas_model import load_gas_network_from_e_file
+    from secore.gas_se import GasStateEstimator
+
+    # 1. 构造含盲零注入汇流节点与深幅低压粗差（0.22 * p_true）的气网，验证 BDR 不因 Huber 预热切换误回滚且终末 ALM 精确闭合
+    rng = np.random.default_rng(20261128)
+    n_gas = 40
+    g_lines = [
+        "<GasMedium>",
+        "@ density compressibility molar_mass temperature flow_factor",
+        "# 0.8 1.0 0.018 288.15 1.0",
+        "</GasMedium>",
+        "<GasNode>",
+        "@ idx name pressure run_stat",
+    ]
+    for i in range(1, n_gas + 1):
+        g_lines.append(f"# {i} gnode_{i} {12.0 - 0.03 * i:.4f} 1")
+    g_lines += [
+        "</GasNode>",
+        "<GasSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+        "# 1 gsrc_1 1 PRESSURE 12.0 0.0 1.0 0.0 50.0 1",
+        "</GasSource>",
+        "<GasLoad>",
+        "@ idx name node flow_set run_stat",
+    ]
+    load_nodes = [k for k in range(4, n_gas + 1) if k % 3 == 0]
+    for lid, nd in enumerate(load_nodes, start=1):
+        g_lines.append(f"# {lid} gload_{lid} {nd} 0.12 1")
+    g_lines += [
+        "</GasLoad>",
+        "<GasPipe>",
+        "@ idx name i_node j_node conductance run_stat",
+    ]
+    for pid in range(2, n_gas + 1):
+        par = (pid - 2) // 3 + 1
+        g_lines.append(f"# {pid - 1} gpipe_{pid - 1} {par} {pid} 1.5 1")
+    g_lines.append("</GasPipe>")
+    gas_e = tmp_path / "gas_round8.e"
+    gas_e.write_text("\n".join(g_lines) + "\n", encoding="utf-8")
+
+    net0 = load_gas_network_from_e_file(str(gas_e))
+    lf_g = GasPowerFlowCalc(net0, parameters=LF_PARAMS)
+    lf_g.prepare()
+    assert lf_g.run() == 0
+    p_true = np.asarray(lf_g.pressure, dtype=np.float64).copy()
+    flow_true = np.asarray(lf_g.edge_flow, dtype=np.float64).copy()
+
+    # 构造带冗余与盲零注入节点的量测，注入 2 条粗差：节点 9 深幅低压粗差与支路大流量粗差
+    m_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 1
+    bad_low_p_idx = None
+    bad_flow_idx = None
+    for i in range(1, n_gas + 1):
+        # 让部分纯零注入中间节点无直接压力测点，依赖零注入方程与邻域流量可观测
+        if i not in load_nodes and i > 1 and i % 4 == 2:
+            continue
+        val_p = float(p_true[i - 1]) * (1.0 + float(rng.normal(0.0, 0.002)))
+        if i == 9:
+            val_p = 0.42 * float(p_true[i - 1])
+            bad_low_p_idx = mid
+        m_lines.append(f"# {mid} gm_{mid} GasNode gnode_{i} PRESSURE 100.0 1 {val_p:.6f}")
+        mid += 1
+    for pid in range(2, n_gas + 1):
+        e_idx = pid - 2
+        chd = int(net0.edge_j[e_idx])
+        fl = float(flow_true[e_idx])
+        val_f = fl * (1.0 + float(rng.normal(0.0, 0.005)))
+        if pid == 3:
+            val_f = fl - 3.5
+            bad_flow_idx = mid
+        m_lines.append(f"# {mid} gm_{mid} GasPipe gpipe_{pid - 1} FLOW_FROM 100.0 1 {val_f:.6f}")
+        mid += 1
+        m_lines.append(f"# {mid} gm_{mid} GasPipe gpipe_{pid - 1} PRESSURE_TO 100.0 1 {float(p_true[chd]):.6f}")
+        mid += 1
+    m_lines.append("</Measurement>")
+    gas_m = tmp_path / "gas_round8.meas"
+    gas_m.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    est_g = GasStateEstimator(
+        load_gas_network_from_e_file(str(gas_e)),
+        str(gas_m),
+        parameters=SE_PARAMS.with_overrides(max_iter=80, bad_threshold=4.0),
+        flat_start=True,
+    )
+    res_g, rem_g = est_g.estimate_with_bad_data_removal(threshold=4.0, max_remove=10)
+    assert res_g.converged
+    rem_g_ids = {int(it.measurement.idx) for it in rem_g}
+    assert bad_low_p_idx in rem_g_ids and bad_flow_idx in rem_g_ids
+    _, flow_est_g, _ = est_g._flow_state_arrays(res_g.x, need_derivative=False)
+    f_ref_g = max(float(np.max(np.abs(flow_est_g))), 1.0)
+    node_bal_g = np.asarray(est_g.network.incidence @ flow_est_g, dtype=np.float64)
+    zi_pos_g = [k - 1 for k in range(2, n_gas + 1) if k not in load_nodes]
+    assert float(np.max(np.abs(node_bal_g[zi_pos_g]))) / f_ref_g < 1.0e-4
+
+    # 2. 验证交流电网严重畸变热启动（flat_start=False）叠加坏数据时，前向初值净化直接切换至平启动且不误删正常测点
+    ac_e, ac_m = _generate_ac_case(30, tmp_path)
+    est_ac = ACStateEstimator(
+        str(ac_e),
+        str(ac_m),
+        parameters=SE_PARAMS.with_overrides(max_iter=60, bad_threshold=4.0),
+        flat_start=False,
+        auto_prepare=False,
+    )
+    est_ac.prepare()
+    # 向初值电压与相角注入严重随机畸变，并向第 1 条支路功率量测注入单条坏数据
+    est_ac.file_voltage = np.clip(est_ac.file_voltage * rng.uniform(0.76, 1.26, size=est_ac.file_voltage.size), 0.72, 1.30)
+    est_ac.file_theta = est_ac.file_theta + rng.uniform(-22.0, 22.0, size=est_ac.file_theta.size)
+    tbl_ac = est_ac.active_measurements.table
+    br_p_pos = int(np.flatnonzero(np.asarray(tbl_ac.weight) > 1.0)[0])
+    bad_ac_idx = int(tbl_ac.idx[br_p_pos])
+    tbl_ac.value[br_p_pos] += 50.0 * max(abs(float(tbl_ac.value[br_p_pos])), 10.0)
+
+    res_ac, rem_ac = est_ac.estimate_with_bad_data_removal(threshold=4.0, max_remove=15)
+    assert res_ac.converged
+    rem_ac_ids = {int(it.measurement.idx) for it in rem_ac}
+    assert bad_ac_idx in rem_ac_ids
+    assert len(rem_ac_ids - {bad_ac_idx}) == 0
+
+
+
 
 
 

@@ -8701,7 +8701,12 @@ class DCStateEstimator:
                 return True
             prev_spd_bad = bool(getattr(prev_res, "_undamped_spd_failed", False))
             trial_spd_bad = bool(getattr(trial_res, "_undamped_spd_failed", False))
-            if trial_spd_bad or (not trial_res.converged):
+            skip_large_rank_chk = (
+                self.n_state >= 5000
+                and not trial_spd_bad
+                and bool(getattr(trial_res, "_iter_capped", False))
+            )
+            if (trial_spd_bad or (not trial_res.converged)) and not skip_large_rank_chk:
                 H_chk = trial_res.H if trial_res.H is not None else prev_res.H
                 if H_chk is not None and int(H_chk.shape[0]) == n_base:
                     if not check_active_structural_full_rank(H_chk, active_mask, masked_weights):

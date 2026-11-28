@@ -1715,6 +1715,44 @@ class FluidPowerFlowCalc:
         x = self.x.copy()
         minimum = self._minimum_potential()
         cached_residual = None
+        presolve_hyd_iters = 0
+        # 热网与蒸汽网水力-热力单向顺序解耦热启动：先在窄带宽水力子系统快速收敛流量场，
+        # 再用线性迎风方程一次性解析求解初始温度/比焓，避免在全耦合非对称矩阵上跨流向切换点盲搜
+        if (self.network.steam or self.network.thermal) and self.hydraulic_state_count > 0:
+            init_res, _, _, _ = self._residual_and_jacobian(x, return_jacobian=False)
+            init_norm = float(np.linalg.norm(init_res, np.inf)) if init_res.size else 0.0
+            cached_residual = init_res
+            if init_norm >= self.tol:
+                try:
+                    hyd_x, hyd_info = self._solve_hydraulic_initial_state()
+                    if bool(hyd_info.get("converged", False)):
+                        saved_pot = self.potential
+                        saved_ef = self.edge_flow
+                        saved_sf = self.source_flow
+                        try:
+                            x_warm = x.copy()
+                            x_warm[: self.hydraulic_state_count] = hyd_x
+                            self.potential = hyd_info["potential"]
+                            self.edge_flow = hyd_info["edge_flow"]
+                            self.source_flow = hyd_info["source_flow"]
+                            if self.network.steam:
+                                self._solve_steam_enthalpy()
+                                x_warm[self.base_enthalpy :] = self.enthalpy
+                            elif self.network.thermal and self.base_enthalpy > self.base_temperature:
+                                self._solve_heat_temperatures()
+                                x_warm[self.base_temperature : self.base_enthalpy] = self.heat_temperature_state
+                            warm_res, _, _, _ = self._residual_and_jacobian(x_warm, return_jacobian=False)
+                            warm_norm = float(np.linalg.norm(warm_res, np.inf)) if warm_res.size else np.inf
+                            if np.isfinite(warm_norm) and warm_norm < init_norm:
+                                x = x_warm
+                                cached_residual = warm_res
+                                presolve_hyd_iters = int(hyd_info.get("iterations", 0))
+                        finally:
+                            self.potential = saved_pot
+                            self.edge_flow = saved_ef
+                            self.source_flow = saved_sf
+                except Exception:
+                    pass
         for iteration in range(1, self.max_iter + 1):
             if cached_residual is not None:
                 residual = cached_residual
@@ -1726,6 +1764,8 @@ class FluidPowerFlowCalc:
             if self.verbose:
                 print(f"Iter {iteration}: |F| = {self.normF:.6e}")
             if self.normF < self.tol:
+                if iteration == 1 and presolve_hyd_iters > 0:
+                    self.iterations = int(presolve_hyd_iters)
                 self.converged = True
                 break
             residual, jacobian, _potential, _edge_flow = self._residual_and_jacobian(x, return_jacobian=True)
@@ -1852,29 +1892,25 @@ class FluidPowerFlowCalc:
                 self.base_pressure_source_group_flow : self.hydraulic_state_count
             ].copy()
         node_edge_balance = np.asarray(net.incidence @ self.edge_flow, dtype=np.float64)
-        for node_pos in range(len(net.nodes)):
-            source_positions = np.flatnonzero(net.source_node_pos == node_pos)
-            if source_positions.size == 0:
-                continue
-            pressure_positions = source_positions[
-                net.source_is_pressure_controlled[source_positions]
-            ]
-            if net.thermal and pressure_positions.size:
-                pressure_positions = pressure_positions[
-                    ~net.source_explicit_return[pressure_positions]
-                ]
-            if pressure_positions.size == 0:
-                continue
-            pressure_target = float(
-                net.demand[node_pos] - node_edge_balance[node_pos] - net.fixed_injection[node_pos]
-            )
-            source_flow[pressure_positions] = allocate_limited_residual(
-                net.source_flow_set[pressure_positions],
-                pressure_target,
-                lower=net.source_flow_min[pressure_positions],
-                upper=net.source_flow_max[pressure_positions],
-                alpha=net.source_alpha[pressure_positions],
-            )
+        p_src_mask = np.asarray(net.source_is_pressure_controlled, dtype=bool)
+        if net.thermal and p_src_mask.size:
+            p_src_mask = p_src_mask & (~np.asarray(net.source_explicit_return, dtype=bool))
+        p_src_all = np.flatnonzero(p_src_mask).astype(np.int64)
+        if p_src_all.size:
+            p_src_nodes = net.source_node_pos[p_src_all]
+            for node_pos in np.unique(p_src_nodes).tolist():
+                n_i = int(node_pos)
+                pressure_positions = p_src_all[p_src_nodes == n_i]
+                pressure_target = float(
+                    net.demand[n_i] - node_edge_balance[n_i] - net.fixed_injection[n_i]
+                )
+                source_flow[pressure_positions] = allocate_limited_residual(
+                    net.source_flow_set[pressure_positions],
+                    pressure_target,
+                    lower=net.source_flow_min[pressure_positions],
+                    upper=net.source_flow_max[pressure_positions],
+                    alpha=net.source_alpha[pressure_positions],
+                )
         self.source_flow = source_flow
 
     def _edge_attenuation(self) -> np.ndarray:
@@ -1914,58 +1950,59 @@ class FluidPowerFlowCalc:
         }
         cp = float(net.medium.heat_capacity)
         ambient = float(net.medium.ambient_temperature)
-        for edge_pos in range(count):
-            i = int(net.edge_i[edge_pos])
-            j = int(net.edge_j[edge_pos])
-            edge_flow = float(flow[edge_pos])
-            factor = float(attenuation[edge_pos])
-            if net.node_explicit_return[i]:
-                if not active[edge_pos]:
-                    i_temperature = float(self.temperature[i])
-                    j_temperature = float(self.temperature[j])
-                elif edge_flow > 0.0:
-                    i_temperature = float(self.temperature[i])
-                    j_temperature = ambient + (i_temperature - ambient) * factor
-                else:
-                    j_temperature = float(self.temperature[j])
-                    i_temperature = ambient + (j_temperature - ambient) * factor
-                i_heat_power = edge_flow * cp * (i_temperature - ambient)
-                j_heat_power = -edge_flow * cp * (j_temperature - ambient)
-                values["edge_i_temperature"][edge_pos] = i_temperature
-                values["edge_j_temperature"][edge_pos] = j_temperature
-            else:
-                if not active[edge_pos]:
-                    i_supply = float(self.supply_temperature[i])
-                    j_supply = float(self.supply_temperature[j])
-                    i_return = float(self.return_temperature[i])
-                    j_return = float(self.return_temperature[j])
-                elif edge_flow > 0.0:
-                    i_supply = float(self.supply_temperature[i])
-                    j_supply = ambient + (i_supply - ambient) * factor
-                    j_return = float(self.return_temperature[j])
-                    i_return = ambient + (j_return - ambient) * factor
-                else:
-                    j_supply = float(self.supply_temperature[j])
-                    i_supply = ambient + (j_supply - ambient) * factor
-                    i_return = float(self.return_temperature[i])
-                    j_return = ambient + (i_return - ambient) * factor
-                i_supply_heat_power = edge_flow * cp * (i_supply - ambient)
-                j_supply_heat_power = -edge_flow * cp * (j_supply - ambient)
-                i_return_heat_power = -edge_flow * cp * (i_return - ambient)
-                j_return_heat_power = edge_flow * cp * (j_return - ambient)
-                i_heat_power = i_supply_heat_power + i_return_heat_power
-                j_heat_power = j_supply_heat_power + j_return_heat_power
-                values["edge_i_supply_temperature"][edge_pos] = i_supply
-                values["edge_j_supply_temperature"][edge_pos] = j_supply
-                values["edge_i_return_temperature"][edge_pos] = i_return
-                values["edge_j_return_temperature"][edge_pos] = j_return
-                values["edge_i_supply_heat_power"][edge_pos] = i_supply_heat_power
-                values["edge_j_supply_heat_power"][edge_pos] = j_supply_heat_power
-                values["edge_i_return_heat_power"][edge_pos] = i_return_heat_power
-                values["edge_j_return_heat_power"][edge_pos] = j_return_heat_power
-            values["edge_i_heat_power"][edge_pos] = i_heat_power
-            values["edge_j_heat_power"][edge_pos] = j_heat_power
-            values["edge_heat_loss"][edge_pos] = i_heat_power + j_heat_power
+        if count > 0:
+            ei = net.edge_i
+            ej = net.edge_j
+            exp_m = np.asarray(net.node_explicit_return[ei], dtype=bool)
+            if np.any(exp_m):
+                idx_e = np.flatnonzero(exp_m)
+                fe = flow[idx_e]
+                ae = active[idx_e]
+                fac_e = attenuation[idx_e]
+                ti_raw = self.temperature[ei[idx_e]]
+                tj_raw = self.temperature[ej[idx_e]]
+                pos_f = fe > 0.0
+                ti = np.where(~ae, ti_raw, np.where(pos_f, ti_raw, ambient + (tj_raw - ambient) * fac_e))
+                tj = np.where(~ae, tj_raw, np.where(pos_f, ambient + (ti_raw - ambient) * fac_e, tj_raw))
+                ih = fe * cp * (ti - ambient)
+                jh = -fe * cp * (tj - ambient)
+                values["edge_i_temperature"][idx_e] = ti
+                values["edge_j_temperature"][idx_e] = tj
+                values["edge_i_heat_power"][idx_e] = ih
+                values["edge_j_heat_power"][idx_e] = jh
+                values["edge_heat_loss"][idx_e] = ih + jh
+            imp_m = ~exp_m
+            if np.any(imp_m):
+                idx_i = np.flatnonzero(imp_m)
+                fi = flow[idx_i]
+                ai = active[idx_i]
+                fac_i = attenuation[idx_i]
+                si_raw = self.supply_temperature[ei[idx_i]]
+                sj_raw = self.supply_temperature[ej[idx_i]]
+                ri_raw = self.return_temperature[ei[idx_i]]
+                rj_raw = self.return_temperature[ej[idx_i]]
+                pos_f = fi > 0.0
+                isup = np.where(~ai, si_raw, np.where(pos_f, si_raw, ambient + (sj_raw - ambient) * fac_i))
+                jsup = np.where(~ai, sj_raw, np.where(pos_f, ambient + (si_raw - ambient) * fac_i, sj_raw))
+                iret = np.where(~ai, ri_raw, np.where(pos_f, ambient + (rj_raw - ambient) * fac_i, ri_raw))
+                jret = np.where(~ai, rj_raw, np.where(pos_f, rj_raw, ambient + (ri_raw - ambient) * fac_i))
+                is_hp = fi * cp * (isup - ambient)
+                js_hp = -fi * cp * (jsup - ambient)
+                ir_hp = -fi * cp * (iret - ambient)
+                jr_hp = fi * cp * (jret - ambient)
+                ih = is_hp + ir_hp
+                jh = js_hp + jr_hp
+                values["edge_i_supply_temperature"][idx_i] = isup
+                values["edge_j_supply_temperature"][idx_i] = jsup
+                values["edge_i_return_temperature"][idx_i] = iret
+                values["edge_j_return_temperature"][idx_i] = jret
+                values["edge_i_supply_heat_power"][idx_i] = is_hp
+                values["edge_j_supply_heat_power"][idx_i] = js_hp
+                values["edge_i_return_heat_power"][idx_i] = ir_hp
+                values["edge_j_return_heat_power"][idx_i] = jr_hp
+                values["edge_i_heat_power"][idx_i] = ih
+                values["edge_j_heat_power"][idx_i] = jh
+                values["edge_heat_loss"][idx_i] = ih + jh
         return values
 
     def _solve_heat_temperatures(self) -> None:
@@ -2187,40 +2224,45 @@ class FluidPowerFlowCalc:
         n = len(net.nodes)
         attenuation = self._edge_attenuation()
         ambient_enthalpy = float(net.medium.ambient_enthalpy)
-        rows = []
-        cols = []
-        data = []
         rhs = np.zeros(n, dtype=np.float64)
         incoming_mass = np.zeros(n, dtype=np.float64)
-        for edge_pos, flow in enumerate(self.edge_flow.tolist()):
-            if abs(flow) <= 1e-12:
-                continue
-            if flow > 0.0:
-                upstream, downstream = int(net.edge_i[edge_pos]), int(net.edge_j[edge_pos])
-            else:
-                upstream, downstream = int(net.edge_j[edge_pos]), int(net.edge_i[edge_pos])
-            mass = abs(float(flow))
-            factor = float(attenuation[edge_pos])
-            incoming_mass[downstream] += mass
-            rows.append(downstream)
-            cols.append(upstream)
-            data.append(-mass * factor)
-            rhs[downstream] += mass * (1.0 - factor) * ambient_enthalpy
-        for source_pos, flow in enumerate(self.source_flow.tolist()):
-            if flow <= 1e-12:
-                continue
-            node_pos = int(net.source_node_pos[source_pos])
-            incoming_mass[node_pos] += flow
-            rhs[node_pos] += flow * net.source_enthalpy_set[source_pos]
-        for node_pos in range(n):
-            rows.append(node_pos)
-            cols.append(node_pos)
-            if incoming_mass[node_pos] <= 1e-12:
-                data.append(1.0)
-                rhs[node_pos] = net.node_enthalpy[node_pos]
-            else:
-                data.append(incoming_mass[node_pos])
-        matrix = coo_matrix((data, (rows, cols)), shape=(n, n)).tocsc()
+        row_parts = []
+        col_parts = []
+        data_parts = []
+        ef = np.asarray(self.edge_flow, dtype=np.float64)
+        act_e = np.flatnonzero(np.abs(ef) > 1e-12)
+        if act_e.size:
+            f_act = ef[act_e]
+            pos_m = f_act > 0.0
+            ei_a = net.edge_i[act_e]
+            ej_a = net.edge_j[act_e]
+            upstream = np.where(pos_m, ei_a, ej_a).astype(np.int64, copy=False)
+            downstream = np.where(pos_m, ej_a, ei_a).astype(np.int64, copy=False)
+            mass = np.abs(f_act)
+            factor = attenuation[act_e]
+            np.add.at(incoming_mass, downstream, mass)
+            np.add.at(rhs, downstream, mass * (1.0 - factor) * ambient_enthalpy)
+            row_parts.append(downstream)
+            col_parts.append(upstream)
+            data_parts.append(-mass * factor)
+        sf = np.asarray(self.source_flow, dtype=np.float64)
+        act_s = np.flatnonzero(sf > 1e-12)
+        if act_s.size:
+            s_nodes = net.source_node_pos[act_s]
+            s_flow = sf[act_s]
+            np.add.at(incoming_mass, s_nodes, s_flow)
+            np.add.at(rhs, s_nodes, s_flow * net.source_enthalpy_set[act_s])
+        diag_idx = np.arange(n, dtype=np.int64)
+        zero_in = incoming_mass <= 1e-12
+        if np.any(zero_in):
+            rhs[zero_in] = net.node_enthalpy[zero_in]
+        row_parts.append(diag_idx)
+        col_parts.append(diag_idx)
+        data_parts.append(np.where(zero_in, 1.0, incoming_mass))
+        matrix = coo_matrix(
+            (np.concatenate(data_parts), (np.concatenate(row_parts), np.concatenate(col_parts))),
+            shape=(n, n),
+        ).tocsc()
         with warnings.catch_warnings():
             warnings.simplefilter("error", MatrixRankWarning)
             try:

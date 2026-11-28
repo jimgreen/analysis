@@ -1621,23 +1621,60 @@ class HybridStateEstimator:
         if source_table is None:
             _, source = self._prepare_measurement_source()
             source_table = source.table
-        all_measurements = [
-            measurement_from_table_row(source_table, row)
-            for row in range(int(source_table.idx.size))
-        ]
         estimator_types = {
             "heat": HeatStateEstimator,
             "gas": GasStateEstimator,
             "hydro": HydroStateEstimator,
             "steam": SteamStateEstimator,
         }
+        can_slice_table_fast = (
+            source_table is not None
+            and getattr(source_table, "device_type_code", None) is not None
+            and getattr(source_table, "meas_type_code", None) is not None
+            and getattr(source_table, "device_name_id", None) is not None
+            and getattr(source_table, "device_names", None) is not None
+            and int(np.asarray(source_table.device_type_code).size) == int(source_table.idx.size)
+        )
+        all_measurements = None
+        if not can_slice_table_fast:
+            all_measurements = [
+                measurement_from_table_row(source_table, row)
+                for row in range(int(source_table.idx.size))
+            ]
+        else:
+            from model.meas_array_model import TableBackedMeasurementList
+            src_dt_arr = np.asarray(source_table.device_type_code, dtype=np.int16)
         for name, network in self.multi_energy.fluid_networks.items():
             prefix = network.prefix
-            measurements = [
-                measurement
-                for measurement in all_measurements
-                if str(measurement.device_type).startswith(prefix)
-            ]
+            if can_slice_table_fast:
+                dom_dt_codes = [
+                    int(code)
+                    for dt_name, code in DEVICE_TYPE_CODES.items()
+                    if dt_name.startswith(prefix) or (network.thermal and dt_name == "HeatExchanger")
+                ]
+                sub_rows = np.flatnonzero(np.isin(src_dt_arr, np.asarray(dom_dt_codes, dtype=np.int16)))
+                if np.any(src_dt_arr == 0) and int(np.asarray(source_table.device_type).size) == int(source_table.idx.size):
+                    dt_str_arr = np.asarray(source_table.device_type, dtype=object)
+                    extra_zero = np.flatnonzero(
+                        (src_dt_arr == 0)
+                        & np.fromiter(
+                            (str(s).startswith(prefix) or (network.thermal and str(s) == "HeatExchanger") for s in dt_str_arr.tolist()),
+                            dtype=bool,
+                            count=int(dt_str_arr.size),
+                        )
+                    )
+                    if extra_zero.size:
+                        sub_rows = np.union1d(sub_rows, extra_zero)
+                sub_table = measurement_table_take(source_table, sub_rows)
+                sub_table.device_names = source_table.device_names
+                measurements = TableBackedMeasurementList(sub_table, normalized=False)
+            else:
+                measurements = [
+                    measurement
+                    for measurement in all_measurements
+                    if str(measurement.device_type).startswith(prefix)
+                    or (network.thermal and str(measurement.device_type) == "HeatExchanger")
+                ]
             estimator = estimator_types[name](
                 network,
                 measurements=measurements,
@@ -2963,6 +3000,46 @@ class HybridStateEstimator:
         ]
         self._multi_energy_observability_cache = None
 
+    @staticmethod
+    def _fluid_table_with_string_columns(table: MeasurementTable) -> MeasurementTable:
+        n_rows = int(table.idx.size)
+        if (
+            n_rows == 0
+            or (
+                int(np.asarray(table.device_name).size) == n_rows
+                and int(np.asarray(table.device_type).size) == n_rows
+                and int(np.asarray(table.meas_type).size) == n_rows
+                and int(np.asarray(table.name).size) == n_rows
+            )
+        ):
+            return table
+        out = copy(table)
+        if int(np.asarray(out.name).size) != n_rows:
+            out.name = np.asarray([f"m{int(v)}" for v in np.asarray(out.idx, dtype=np.int64).tolist()], dtype=object)
+        if int(np.asarray(out.device_type).size) != n_rows:
+            dtc = np.asarray(out.device_type_code, dtype=np.int16)
+            out.device_type = np.asarray([DEVICE_TYPE_NAMES.get(int(c), "") for c in dtc.tolist()], dtype=object)
+        if int(np.asarray(out.meas_type).size) != n_rows:
+            mtc = np.asarray(getattr(out, "meas_type_code", ()), dtype=np.int16)
+            if mtc.size == n_rows:
+                out.meas_type = np.asarray([MEAS_TYPE_NAMES.get(int(c), "") for c in mtc.tolist()], dtype=object)
+            else:
+                out.meas_type = np.full(n_rows, "", dtype=object)
+        if int(np.asarray(out.device_name).size) != n_rows:
+            dn_id = getattr(out, "device_name_id", None)
+            dn_dict = getattr(out, "device_names", None)
+            if dn_id is not None and dn_dict is not None and int(np.asarray(dn_id).size) == n_rows:
+                dn_arr = np.asarray(dn_dict, dtype=object)
+                n_dn = int(dn_arr.size)
+                ids = np.asarray(dn_id, dtype=np.int64)
+                out.device_name = np.asarray(
+                    [str(dn_arr[i]) if 0 <= i < n_dn else "" for i in ids.tolist()],
+                    dtype=object,
+                )
+            else:
+                out.device_name = np.full(n_rows, "", dtype=object)
+        return out
+
     def _multi_energy_local_measurement_tables(self) -> List[MeasurementTable]:
         tables = []
         if not self._fluid_only:
@@ -2972,7 +3049,9 @@ class HybridStateEstimator:
                 )
             )
         tables.extend(
-            estimator.active_measurements.table
+            self._fluid_table_with_string_columns(
+                measurement_table_from_measurements(estimator.active_measurements)
+            )
             for estimator in self.fluid_estimators.values()
         )
         return tables
@@ -2983,21 +3062,29 @@ class HybridStateEstimator:
         combined = _measurement_table_from_measurements(MeasurementList())
         for table in tables:
             combined = concat_measurement_tables(combined, table)
-        # 严格保留真实非伪量测行的原始文件 idx，仅对跨子网伪量测/耦合附加行顺延分配全局唯一 idx
+        # 严格保留真实非伪量测行的原始文件 idx，仅对跨子网伪量测/内部守恒约束/耦合附加行顺延分配全局唯一 idx
         raw_idx = np.asarray(combined.idx, dtype=np.int64).copy()
         st_arr = measurement_table_status_code(combined)
+        syn_constraint_mask = measurement_table_bad_data_protected_mask(combined)
         ctrl_n = int(self._multi_energy_coupling_measurements.table.idx.size)
         real_lim = max(0, raw_idx.size - ctrl_n)
         seen_real: set = set()
         keep_real = np.zeros(raw_idx.size, dtype=bool)
         for pos_i in range(real_lim):
-            if int(st_arr[pos_i]) == MEAS_STATUS_PSEUDO:
+            if int(st_arr[pos_i]) == MEAS_STATUS_PSEUDO or bool(syn_constraint_mask[pos_i]):
                 continue
             id_v = int(raw_idx[pos_i])
             if id_v > 0 and id_v not in seen_real:
                 seen_real.add(id_v)
                 keep_real[pos_i] = True
-        next_syn_id = (max(seen_real) + 1) if seen_real else 1
+        max_src_idx = 0
+        for cand_tbl in (
+            getattr(self, "_source_measurement_table", None),
+            getattr(getattr(self, "measurements", None), "table", None),
+        ):
+            if cand_tbl is not None and getattr(cand_tbl, "idx", None) is not None and int(cand_tbl.idx.size) > 0:
+                max_src_idx = max(max_src_idx, int(np.max(cand_tbl.idx)))
+        next_syn_id = max((max(seen_real) if seen_real else 0), max_src_idx) + 1
         need_syn = ~keep_real
         n_syn = int(np.count_nonzero(need_syn))
         if n_syn > 0:
@@ -3814,11 +3901,11 @@ class HybridStateEstimator:
             severe_warm = False
             if me_v_cols.size:
                 vp_w = x[me_v_cols]
-                if float(vp_w.min()) < 0.82 or float(vp_w.max()) > 1.18:
+                if float(vp_w.min()) < 0.88 or float(vp_w.max()) > 1.12:
                     severe_warm = True
             if (not severe_warm) and me_a_cols.size:
                 ap_w = x[me_a_cols]
-                if float(np.max(np.abs(ap_w))) > 0.35:
+                if float(np.max(np.abs(ap_w))) > 0.20:
                     severe_warm = True
             x_flat_me = x.copy()
             el_sl = getattr(self, "electric_state_slice", slice(0, 0))
@@ -3835,7 +3922,7 @@ class HybridStateEstimator:
                     x_flat_me[f_sl] = f_est.initial_state(flat_start=True)
                     if not severe_warm:
                         fl_diff = np.max(np.abs(x[f_sl] - x_flat_me[f_sl]) / np.maximum(me_state_scales[f_sl], 1.0))
-                        if float(fl_diff) > 0.45:
+                        if float(fl_diff) > 0.25:
                             severe_warm = True
             if severe_warm:
                 x_flat_me = self._apply_multi_energy_state_bounds(x_flat_me)
@@ -3861,10 +3948,10 @@ class HybridStateEstimator:
                     trim_w = float(np.mean(np.partition(wr_w, k85_me - 1)[:k85_me] ** 2))
                     trim_f = float(np.mean(np.partition(wr_f, k85_me - 1)[:k85_me] ** 2))
                     if np.isfinite(obj_f_r) and (
-                        (obj_w_r > 10.0 * max(obj_f_r, 1.0) and obj_w_r > 1.0e3)
-                        or (q75_w > 2.5 * max(q75_f, 1.0) and q75_w > 8.0)
-                        or (trim_w > 4.0 * max(trim_f, 1.0) and trim_w > 16.0)
-                        or (med_w > 1.8 * max(med_f, 1.0) and med_w > 3.5)
+                        (obj_w_r > 8.0 * max(obj_f_r, 1.0) and obj_w_r > 1.0e3)
+                        or (q75_w > 1.8 * max(q75_f, 1.5) and q75_w > 6.0)
+                        or (trim_w > 3.0 * max(trim_f, 1.5) and trim_w > 12.0)
+                        or (med_w > 1.45 * max(med_f, 1.0) and med_w > 3.0)
                     ):
                         x = x_flat_me
                         me_state_scales = self._multi_energy_state_base_scales(x)
@@ -3930,11 +4017,16 @@ class HybridStateEstimator:
                 if me_valid_e.size
                 else 100.0
             )
-            weight = target_me_weight.copy()
-            weight[me_zi_local] = np.minimum(
-                target_me_weight[me_zi_local],
-                np.maximum(1e-12, (0.15 * me_soft_ref_e) / np.maximum(me_init_sq[me_zi_local], 1e-12)),
-            )
+            me_zi_max_e = float(np.max(target_me_weight[me_zi_local] * me_init_sq[me_zi_local]))
+            if (x0 is not None) and np.isfinite(me_zi_max_e) and me_zi_max_e <= 5000.0 * max(me_soft_ref_e, 100.0):
+                weight = target_me_weight
+                me_zi_softened = False
+            else:
+                weight = target_me_weight.copy()
+                weight[me_zi_local] = np.minimum(
+                    target_me_weight[me_zi_local],
+                    np.maximum(1e-12, (0.15 * me_soft_ref_e) / np.maximum(me_init_sq[me_zi_local], 1e-12)),
+                )
             uniform_weight = self._uniform_weight(weight)
             weights_are_uniform = uniform_weight is not None
             weighted_residual = None if weights_are_uniform else np.empty_like(weight)
@@ -4096,6 +4188,7 @@ class HybridStateEstimator:
             nonlocal z_est_valid, prev_accepted_step_pu, healthy_fullstep_streak, min_cycle_damping
             if (
                 not me_zi_mid_bridged
+                and (_max_iter_cap is None or int(_max_iter_cap) > 24)
                 and me_zi_local.size > 0
                 and float(np.min(weight[me_zi_local])) < 1e-2
             ):
@@ -4250,10 +4343,13 @@ class HybridStateEstimator:
             )
             conv_obj_tol_me = max(1e-12, 1e-9 * (abs(objective) + 1.0))
             me_soft_gate = max(5e-4, 50.0 * self.tol) if me_zi_mid_bridged else max(1.0e-5, 10.0 * self.tol)
-            me_bridge_done = bool(
-                me_zi_mid_bridged and me_zi_softened and (iteration - me_zi_bridge_start_iter) >= max(25, int(0.45 * self.max_iter))
+            me_soft_init_done = bool(
+                me_zi_softened and (not me_zi_mid_bridged) and iteration >= max(6, min(12, int(0.22 * eff_hyb_max_iter)))
             )
-            if me_bridge_done or (
+            me_bridge_done = bool(
+                me_zi_mid_bridged and me_zi_softened and (iteration - me_zi_bridge_start_iter) >= max(8, min(14, int(0.25 * eff_hyb_max_iter)))
+            )
+            if me_soft_init_done or me_bridge_done or (
                 me_zi_softened
                 and iteration >= 2
                 and pred_drop_me <= max(1e-6, (1e-3 if me_zi_mid_bridged else 1e-4) * (abs(objective) + 1.0))
@@ -4660,8 +4756,18 @@ class HybridStateEstimator:
         if scaled_correction < self.tol:
             converged = True
 
-        # 多能子系统（流体流量平衡 + 电侧纯联络零注入）增广拉格朗日（ALM）精修：消除高权重测点噪声/粗差对零注入节点的牵拉
-        if converged and (me_zi_local.size > 0 or me_elec_zi_local.size > 0):
+        # 多能子系统（流体流量平衡 + 电侧纯联络零注入）增广拉格朗日（ALM）精修：终末局部升权并叠加乘子偏置消除噪声/粗差牵拉
+        me_alm_ready = (
+            converged
+            or (
+                _huber_irls_k is None
+                and iteration >= 8
+                and np.isfinite(objective)
+                and scaled_correction <= 0.25
+                and np.all(np.isfinite(x))
+            )
+        )
+        if me_alm_ready and (me_zi_local.size > 0 or me_elec_zi_local.size > 0):
             f_ref_me = 1.0
             for fk_a, fest_a in self.fluid_estimators.items():
                 sl_a = self.fluid_state_slices.get(fk_a)
@@ -4717,11 +4823,42 @@ class HybridStateEstimator:
                 # 采用 Hestenes-Powell 乘子偏置向量 lambda_shift（满足 z_shifted = z + lambda_shift）
                 saved_me_w = weight
                 w_me_alm = weight.copy()
+                real_me_w_mask = (
+                    (weight > 0.0)
+                    & (weight <= 1.0e6)
+                    & (me_mt_slice != MEAS_TYPE_FLOW_BALANCE)
+                    & (~np.isin(me_dt_slice, (DEVICE_TYPE_ACPowerBalance, DEVICE_TYPE_DCPowerBalance)))
+                )
+                max_real_me_w = float(np.max(weight[real_me_w_mask])) if np.any(real_me_w_mask) else 100.0
+                med_real_me_w = float(np.median(weight[real_me_w_mask])) if np.any(real_me_w_mask) else 100.0
                 if me_elec_zi_local.size > 0:
-                    real_me_w_mask = (weight > 0.0) & (weight <= 1.0e6)
-                    max_real_me_w = float(np.max(weight[real_me_w_mask])) if np.any(real_me_w_mask) else 100.0
                     me_el_rho = min(max(1.0e6, 500.0 * max_real_me_w), 5.0e8)
                     w_me_alm[me_elec_zi_local] = np.maximum(w_me_alm[me_elec_zi_local], me_el_rho)
+                if me_zi_local.size > 0:
+                    H_me_alm0 = self._multi_energy_jacobian_sparse(x)[rows]
+                    H_me_alm0_csr = H_me_alm0 if getattr(H_me_alm0, "format", None) == "csr" else H_me_alm0.tocsr()
+                    H_me_alm0_pu = H_me_alm0_csr.copy()
+                    if H_me_alm0_pu.nnz > 0:
+                        H_me_alm0_pu.data = H_me_alm0_csr.data * me_state_scales[H_me_alm0_csr.indices]
+                    me_alm_sq = np.asarray(H_me_alm0_pu.power(2).sum(axis=1)).reshape(-1)
+                    me_real_alm_e = weight[real_me_w_mask] * me_alm_sq[real_me_w_mask]
+                    me_valid_alm_e = me_real_alm_e[np.isfinite(me_real_alm_e) & (me_real_alm_e > 1e-12) & (me_real_alm_e < 1e14)]
+                    me_ref_alm_e = (
+                        max(float(np.percentile(me_valid_alm_e, 85)), 0.25 * float(np.max(me_valid_alm_e)))
+                        if me_valid_alm_e.size
+                        else 100.0
+                    )
+                    me_fl_eq = max(5.0e4 * me_ref_alm_e, 1.0e6) / np.maximum(me_alm_sq[me_zi_local], 1.0e-8)
+                    me_fl_tight = 2.5e5 * max(med_real_me_w, 25.0) / max((0.1 * f_ref_me) ** 2, 1.0e-2)
+                    me_fl_max_w = min(max(2.5e8, 5.0e4 * max_real_me_w), 2.5e9)
+                    w_me_alm[me_zi_local] = np.clip(
+                        np.maximum(weight[me_zi_local] * 50.0, np.maximum(me_fl_eq, me_fl_tight)),
+                        1.0e5,
+                        me_fl_max_w,
+                    )
+                me_non_zi_mask = np.ones(weight.size, dtype=bool)
+                me_non_zi_mask[alm_zi_rows] = False
+                me_real_obj_base = float(np.dot(saved_me_w[me_non_zi_mask], residual[me_non_zi_mask] * residual[me_non_zi_mask]))
                 weight = w_me_alm
                 uniform_weight = self._uniform_weight(weight)
                 weights_are_uniform = uniform_weight is not None
@@ -4731,19 +4868,25 @@ class HybridStateEstimator:
                 res_me_true = residual.copy()
                 lambda_shift = np.zeros(alm_zi_rows.size, dtype=np.float64)
                 cand_res_buf = np.empty_like(residual)
+                last_me_alm_dx = np.inf
                 try:
-                    for _alm_o in range(3):
+                    for _alm_o in range(4):
                         cur_zi_err = float(np.max(np.abs(res_me_true[alm_zi_rows]) / alm_zi_ref))
                         if cur_zi_err <= 5.0e-6:
                             break
-                        lambda_shift = lambda_shift + res_me_true[alm_zi_rows]
+                        if _alm_o == 0:
+                            lambda_shift = (
+                                saved_me_w[alm_zi_rows] / np.maximum(w_me_alm[alm_zi_rows], 1.0)
+                            ) * res_me_true[alm_zi_rows]
+                        else:
+                            lambda_shift = lambda_shift + res_me_true[alm_zi_rows]
                         for _alm_i in range(3):
                             res_alm_me = res_me_true.copy()
                             res_alm_me[alm_zi_rows] += lambda_shift
                             obj_alm_me = self._weighted_objective(weight, res_alm_me)
                             H_alm_me = self._multi_energy_jacobian_sparse(x_me_alm)[rows]
                             dx_alm_me = None
-                            for beta_m in (0.0, 1e-5, 1e-3):
+                            for beta_m in (0.0, 1e-6, 1e-4, 1e-2):
                                 try:
                                     dx_try_m, _, _ = _solve_me_step(H_alm_me, res_alm_me, beta_m)
                                     if dx_try_m is not None and dx_try_m.size == n_me_state and np.all(np.isfinite(dx_try_m)):
@@ -4753,12 +4896,16 @@ class HybridStateEstimator:
                                     continue
                             if dx_alm_me is None:
                                 break
-                            if float(np.max(np.abs(dx_alm_me) / np.maximum(np.maximum(me_state_scales, np.abs(x_me_alm)), 1.0))) < 1.0e-12:
+                            cur_me_alm_dx = float(
+                                np.max(np.abs(dx_alm_me) / np.maximum(np.maximum(me_state_scales, np.abs(x_me_alm)), 1.0))
+                            )
+                            last_me_alm_dx = cur_me_alm_dx
+                            if cur_me_alm_dx < 1.0e-12:
                                 break
                             s_me = 1.0
                             ok_me = False
                             for _ls_m in range(10):
-                                cand_m = x_me_alm + s_me * dx_alm_me
+                                cand_m = self._apply_multi_energy_state_bounds(x_me_alm + s_me * dx_alm_me)
                                 if not _me_cand_valid(cand_m):
                                     s_me *= 0.5
                                     continue
@@ -4780,7 +4927,15 @@ class HybridStateEstimator:
                             if not ok_me:
                                 break
                         new_me_zi = float(np.max(np.abs(res_me_true[alm_zi_rows]) / alm_zi_ref))
-                        if np.isfinite(new_me_zi) and new_me_zi < best_me_zi:
+                        me_real_obj_cand = float(
+                            np.dot(saved_me_w[me_non_zi_mask], res_me_true[me_non_zi_mask] * res_me_true[me_non_zi_mask])
+                        )
+                        if (
+                            np.isfinite(new_me_zi)
+                            and new_me_zi < best_me_zi
+                            and np.isfinite(me_real_obj_cand)
+                            and me_real_obj_cand <= max(me_real_obj_base * 2.5 + 10.0, me_real_obj_base + 5.0e4)
+                        ):
                             best_me_zi = new_me_zi
                             x = x_me_alm.copy()
                             z_est[:] = ze_me_alm
@@ -4789,6 +4944,8 @@ class HybridStateEstimator:
                             residual_inf = float(np.linalg.norm(residual, np.inf)) if residual.size else 0.0
                             evaluated_at_final_x = False
                             last_used_damping = max(last_used_damping, 1e-6)
+                            if (not converged) and last_me_alm_dx < self.tol and best_me_zi <= 1.0e-4:
+                                converged = True
                         else:
                             break
                 finally:
@@ -5004,8 +5161,24 @@ class HybridStateEstimator:
             result_mode=result_mode,
             all_measurement_table=self._multi_energy_measurement_table,
         )
+        me_st_all = measurement_table_status_code(self._multi_energy_measurement_table)
+        me_ctrl_s = int(self.multi_energy_control_measurement_slice.start)
+        init_real_active = int(np.count_nonzero(me_st_all[:me_ctrl_s] != MEAS_STATUS_PSEUDO))
+        src_tbl_pf = getattr(self, "_source_measurement_table", None)
+        if src_tbl_pf is None:
+            src_tbl_pf = getattr(getattr(self, "measurements", None), "table", None)
+        total_raw_file_meas = int(src_tbl_pf.idx.size) if (src_tbl_pf is not None and getattr(src_tbl_pf, "idx", None) is not None) else 0
+        global_pf_count = max(0, total_raw_file_meas - init_real_active)
+        if self.se_result is not None and global_pf_count > int(self.se_result.statistics.prefiltered_measurement_count):
+            self.se_result.statistics.prefiltered_measurement_count = global_pf_count
 
         electric_se_result = None
+        fluid_pf_sum = 0
+        for fest_pf in self.fluid_estimators.values():
+            fluid_pf_sum += max(
+                len(getattr(fest_pf, "prefiltered_measurements", ()) or ()),
+                int(getattr(fest_pf, "_prefiltered_count_fast", 0)),
+            )
         if not self._fluid_only:
             electric_table = self._measurement_table(self.active_measurements)
             electric_estimate = self._multi_energy_local_result(
@@ -5022,6 +5195,10 @@ class HybridStateEstimator:
                 result_mode=result_mode,
                 all_measurement_table=electric_table,
             )
+            if electric_se_result is not None:
+                elec_pf_cnt = max(0, global_pf_count - fluid_pf_sum)
+                if elec_pf_cnt > int(electric_se_result.statistics.prefiltered_measurement_count):
+                    electric_se_result.statistics.prefiltered_measurement_count = elec_pf_cnt
             self.electric_se_result = electric_se_result
 
         self.fluid_se_rc = {}
@@ -5053,6 +5230,13 @@ class HybridStateEstimator:
                 result_mode=result_mode,
                 all_measurement_table=estimator.active_measurements.table,
             )
+            if estimator.se_result is not None:
+                f_pf_cnt = max(
+                    len(getattr(estimator, "prefiltered_measurements", ()) or ()),
+                    int(getattr(estimator, "_prefiltered_count_fast", 0)),
+                )
+                if f_pf_cnt > int(estimator.se_result.statistics.prefiltered_measurement_count):
+                    estimator.se_result.statistics.prefiltered_measurement_count = f_pf_cnt
             self.fluid_se_rc[name] = 0 if local_result.converged else 1
             if not local_result.converged:
                 self.fluid_se_errors[name] = (
@@ -5156,8 +5340,11 @@ class HybridStateEstimator:
                 _skip_terminal_alm=True,
             )
             if np.all(np.isfinite(hub_me_res.x)) and np.all(np.isfinite(hub_me_res.residual)):
+                wls_init_obj = float(result.objective) if np.isfinite(result.objective) else np.inf
                 cur_me_w0 = np.asarray(self._multi_energy_weight[rows], dtype=np.float64)
                 hub_me_res.objective = self._weighted_objective(cur_me_w0, hub_me_res.residual)
+                hub_me_res._from_huber_warmup = True
+                hub_me_res._wls_init_obj = wls_init_obj
                 result = hub_me_res
         removed: List[BadDataItem] = []
         if remove_limit <= 0 or (not result.converged and not (result.observability.observable and np.isfinite(result.objective))):
@@ -5420,7 +5607,7 @@ class HybridStateEstimator:
                     use_warm = _warm_start_is_healthy(result.x)
                     hint_damp = float(getattr(result, "_final_lm_damping", 0.0)) if use_warm else 0.0
                     mid_me_cap = (
-                        min(int(self.max_iter), 12)
+                        min(int(self.max_iter), 16)
                         if (me_round_idx <= 8 and int(self.multi_energy_state_count) >= 5000 and (len(cand_locals) - len(trial_locals)) >= 32)
                         else None
                     )
@@ -5459,16 +5646,21 @@ class HybridStateEstimator:
                         ):
                             trial_res = flat_res
                     trial_me_capped = bool(getattr(trial_res, "_iter_capped", False))
+                    ref_me_obj = (
+                        max(float(result.objective), float(getattr(result, "_wls_init_obj", result.objective)))
+                        if bool(getattr(result, "_from_huber_warmup", False))
+                        else float(result.objective)
+                    )
                     trial_ok = (
                         np.isfinite(trial_res.objective)
                         and (
                             trial_res.converged
-                            or (trial_me_capped and trial_res.objective <= result.objective * 1.02 + 1e-6)
-                            or (not result.converged and trial_res.objective < result.objective)
+                            or (trial_me_capped and trial_res.objective <= ref_me_obj * 1.02 + 1e-6)
+                            or (not result.converged and trial_res.objective < ref_me_obj)
                         )
                         and (
                             not result.converged
-                            or trial_res.objective <= result.objective * 1.05 + 1e-6
+                            or trial_res.objective <= ref_me_obj * 1.05 + 1e-6
                         )
                     )
                     if trial_ok:
@@ -5522,8 +5714,9 @@ class HybridStateEstimator:
             self._multi_energy_weight[:] = orig_me_weights
             self._multi_energy_z[:] = orig_me_z
 
-        if getattr(result, "_iter_capped", False) or (result.converged and getattr(result, "_alm_skipped", False)):
-            final_me_cap = 3 if (result.converged and getattr(result, "_alm_skipped", False)) else None
+        if getattr(result, "_iter_capped", False) or getattr(result, "_alm_skipped", False):
+            was_me_capped = bool(getattr(result, "_iter_capped", False))
+            final_me_cap = 3 if (result.converged and (not was_me_capped) and getattr(result, "_alm_skipped", False)) else None
             alm_me_res = self._estimate_multi_energy(
                 x0=result.x,
                 measurement_rows=rows,
@@ -5533,8 +5726,12 @@ class HybridStateEstimator:
                 _max_iter_cap=final_me_cap,
                 _skip_terminal_alm=False,
             )
-            if alm_me_res.converged or (not result.converged and np.isfinite(alm_me_res.objective) and alm_me_res.objective <= result.objective):
-                if result.converged:
+            if alm_me_res.converged or (
+                (not result.converged)
+                and np.isfinite(alm_me_res.objective)
+                and alm_me_res.objective <= result.objective * 1.05 + 1e-6
+            ):
+                if result.converged and not was_me_capped:
                     alm_me_res.iterations += int(result.iterations)
                 result = alm_me_res
 
@@ -11895,9 +12092,20 @@ class HybridStateEstimator:
                 return parts[0], True
             return hstack(parts, format="csc"), True
 
+        cur_hyb_tbl_nf = getattr(measurements, "table", None)
+        nf_hyb_zi_rows = (
+            np.flatnonzero(
+                np.isin(np.asarray(cur_hyb_tbl_nf.device_type_code, dtype=np.int16), (DEVICE_TYPE_ACPowerBalance, DEVICE_TYPE_DCPowerBalance))
+                & np.asarray(cur_hyb_tbl_nf.valid, dtype=bool)
+                & (weight > 0.0)
+            )
+            if (self.n_state >= 10000 and cur_hyb_tbl_nf is not None and int(cur_hyb_tbl_nf.idx.size) == n_meas)
+            else np.empty(0, dtype=np.int64)
+        )
         box_pin_cache: Dict = {}
         boundary_proj_streak = 0
         frozen_fail_count = 0
+        noise_floor_streak = 0
         normal_operand = None
         gain = None
 
@@ -12068,7 +12276,11 @@ class HybridStateEstimator:
                 and prev_step_accepted
                 and factor_is_current_weights
                 and (
-                    (prev_max_correction < 2e-2 and last_factor_x_disp < 0.10 and frozen_steps < 3)
+                    (
+                        prev_max_correction < (5e-2 if self.n_state >= 5000 else 2e-2)
+                        and last_factor_x_disp < (0.15 if self.n_state >= 5000 else 0.10)
+                        and frozen_steps < (4 if self.n_state >= 5000 else 3)
+                    )
                     or local_warm_frozen
                 )
             ):
@@ -12915,6 +13127,16 @@ class HybridStateEstimator:
                 ):
                     final_quantities_current = True
                 break
+            if self.n_state >= 10000 and iteration >= 18 and np.isfinite(objective):
+                rel_obj_chg = abs(float(objective_change)) / max(abs(float(objective)), 1.0)
+                zi_hyb_nf_ok = bool(nf_hyb_zi_rows.size == 0 or float(np.max(np.abs(residual[nf_hyb_zi_rows]))) <= 5.0e-3)
+                if rel_obj_chg <= 2.0e-4 and prev_rms_correction <= 2.5e-2 and zi_hyb_nf_ok:
+                    noise_floor_streak += 1
+                    if noise_floor_streak >= 5 and iteration >= 22:
+                        final_quantities_current = False
+                        break
+                else:
+                    noise_floor_streak = 0
             coarse_v_healthy = True
             if v_cols.size > 0:
                 xv_c = x[v_cols]
@@ -13000,12 +13222,21 @@ class HybridStateEstimator:
         alm_did_update_x = False
         # 交直流混合网全有效母线功率平衡与换流器损耗守恒终末增广拉格朗日（ALM）精修：不放大主迭代条件数即可精确闭合守恒约束
         hyb_tbl = getattr(measurements, "table", None)
-        if (
-            converged
+        hyb_alm_ready = (
+            (
+                converged
+                or (
+                    iteration >= 8
+                    and np.isfinite(objective)
+                    and (max_correction <= 1.0 or prev_rms_correction <= 5.0e-2)
+                    and not _hybrid_state_out_of_bounds(x)
+                )
+            )
             and (not coarse_stopped)
             and hyb_tbl is not None
             and int(hyb_tbl.idx.size) == n_meas
-        ):
+        )
+        if hyb_alm_ready:
             hyb_dt_arr = np.asarray(hyb_tbl.device_type_code, dtype=np.int16)
             hyb_mt_arr = np.asarray(
                 getattr(hyb_tbl, "meas_type_code", np.zeros(n_meas, dtype=np.int16)),
@@ -13037,11 +13268,13 @@ class HybridStateEstimator:
                         res_ha_true = residual.copy()
                         lam_ha = np.zeros(hyb_zi_rows.size, dtype=np.float64)
                         alm_hyb_solver = NormalEquationSolver(assume_fixed_pattern=False)
-                        for _ha_o in range(4):
+                        alm_outer_lim = 3 if (self.n_state >= 10000 and not converged) else 4
+                        alm_inner_lim = 2
+                        for _ha_o in range(alm_outer_lim):
                             if float(np.max(np.abs(res_ha_true[hyb_zi_rows]))) <= 1.0e-5:
                                 break
                             lam_ha = lam_ha + res_ha_true[hyb_zi_rows]
-                            for _ha_i in range(2):
+                            for _ha_i in range(alm_inner_lim):
                                 res_ha_s = res_ha_true.copy()
                                 res_ha_s[hyb_zi_rows] += lam_ha
                                 obj_ha_s = self._weighted_objective(w_ha_alm, res_ha_s)
@@ -14250,6 +14483,53 @@ class HybridStateEstimator:
         protected_keys: set = set()
         fast_final_verify = bool(getattr(self, "_bad_data_fast_final_verify", False))
         x0 = self.initial_state()
+        if (not self.flat_start) and n_base > 0:
+            v_cols_hyb0 = np.asarray(getattr(self, "voltage_cols", np.asarray([], dtype=np.int32)), dtype=np.intp)
+            raw_th_hyb0 = np.asarray(getattr(self, "ac_theta_state_col", np.asarray([], dtype=np.int32)), dtype=np.int32)
+            a_cols_hyb0 = raw_th_hyb0[raw_th_hyb0 >= 0].astype(np.intp, copy=False) if raw_th_hyb0.size else np.empty(0, dtype=np.intp)
+            chk_hyb_warm = False
+            if v_cols_hyb0.size:
+                vp_h0 = x0[v_cols_hyb0]
+                if float(vp_h0.min()) < 0.88 or float(vp_h0.max()) > 1.12:
+                    chk_hyb_warm = True
+            if (not chk_hyb_warm) and a_cols_hyb0.size:
+                if float(np.max(np.abs(x0[a_cols_hyb0]))) > 0.20:
+                    chk_hyb_warm = True
+            if chk_hyb_warm:
+                x_flat_hyb0 = self.initial_state(flat=True)
+                real_hyb_m = (
+                    (~base_is_pseudo) & (base_weights > 0.0) & (base_weights < 5000.0)
+                    if base_is_pseudo is not None
+                    else (base_weights > 0.0) & (base_weights < 5000.0)
+                )
+                if np.any(real_hyb_m):
+                    z_hyb0 = (
+                        np.asarray(base_table.value, dtype=np.float64)
+                        if base_table is not None
+                        else np.asarray([float(m.value) for m in base_measurements], dtype=np.float64)
+                    )
+                    ze_hw = np.empty(n_base, dtype=np.float64)
+                    ze_hf = np.empty(n_base, dtype=np.float64)
+                    rw_h0 = np.empty(n_base, dtype=np.float64)
+                    rf_h0 = np.empty(n_base, dtype=np.float64)
+                    self.evaluate(x0, base_measurements, out=ze_hw)
+                    self._measurement_residual(z_hyb0, ze_hw, base_measurements, out=rw_h0)
+                    self.evaluate(x_flat_hyb0, base_measurements, out=ze_hf)
+                    self._measurement_residual(z_hyb0, ze_hf, base_measurements, out=rf_h0)
+                    if np.all(np.isfinite(rf_h0[real_hyb_m])):
+                        wh_rm = np.sqrt(base_weights[real_hyb_m])
+                        wr_hw = wh_rm * np.abs(rw_h0[real_hyb_m])
+                        wr_hf = wh_rm * np.abs(rf_h0[real_hyb_m])
+                        med_hw = float(np.median(wr_hw))
+                        med_hf = float(np.median(wr_hf))
+                        q75_hw = float(np.percentile(wr_hw, 75))
+                        q75_hf = float(np.percentile(wr_hf, 75))
+                        if (
+                            not np.all(np.isfinite(rw_h0[real_hyb_m]))
+                            or (med_hw > 1.35 * max(med_hf, 1.0) and med_hw > 3.0)
+                            or (q75_hw > 1.6 * max(q75_hf, 1.5) and q75_hw > 6.0)
+                        ):
+                            x0 = x_flat_hyb0
         initial_obs = self.observability_result if self.observability_result is not None else None
         init_profile = SEScaleProfile.for_problem(self.n_state, n_base, multi_solve=(max_remove > 0))
         # 对超大规模交直流网络（n_state >= 2000）与 AC 一致启用首轮/中间批删粗估早停，避免携带大量显性坏数据时无谓精磨
@@ -14652,7 +14932,14 @@ class HybridStateEstimator:
             return None, None, None, False, False
 
         def _finalize_masked_result(cur_res: EstimateResult, cur_fac, norm_arr, *, run_terminal_alm: bool = True):
-            if run_terminal_alm and cur_res.converged and getattr(cur_res, "_alm_skipped", False):
+            if (
+                run_terminal_alm
+                and getattr(cur_res, "_alm_skipped", False)
+                and (
+                    cur_res.converged
+                    or (np.isfinite(cur_res.objective) and float(cur_res.max_correction) <= 1.0)
+                )
+            ):
                 alm_refined = self.estimate(
                     measurements=base_measurements,
                     x0=cur_res.x,
@@ -14665,7 +14952,7 @@ class HybridStateEstimator:
                     _skip_terminal_alm=False,
                     _max_iter_cap=3,
                 )
-                if alm_refined.converged:
+                if alm_refined.converged or (not cur_res.converged and np.isfinite(alm_refined.objective)):
                     alm_refined.iterations += int(cur_res.iterations)
                     cur_res = alm_refined
             if not need_slice_finalize:
@@ -14746,7 +15033,15 @@ class HybridStateEstimator:
                 return True
             prev_spd_bad = bool(getattr(prev_res, "_undamped_spd_failed", False))
             trial_spd_bad = bool(getattr(trial_res, "_undamped_spd_failed", False))
-            if trial_spd_bad or (not trial_res.converged):
+            skip_large_rank_chk = (
+                self.n_state >= 5000
+                and not trial_spd_bad
+                and (
+                    bool(getattr(trial_res, "_iter_capped", False))
+                    or bool(getattr(trial_res, "_coarse_stopped", False))
+                )
+            )
+            if (trial_spd_bad or (not trial_res.converged)) and not skip_large_rank_chk:
                 H_chk = trial_res.H if trial_res.H is not None else prev_res.H
                 if H_chk is not None and int(H_chk.shape[0]) == n_base:
                     if not check_active_structural_full_rank(H_chk, active_mask, masked_weights):
@@ -14926,6 +15221,7 @@ class HybridStateEstimator:
                             _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
+                            _max_iter_cap=(18 if self.n_state >= 10000 else None),
                         )
                         trial_obj = float(trial_res.objective) if np.isfinite(trial_res.objective) else float("inf")
                         rejected = _removal_causes_singularity(trial_res, result) or (
@@ -14987,6 +15283,7 @@ class HybridStateEstimator:
                             _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
+                            _max_iter_cap=(18 if self.n_state >= 10000 else None),
                         )
                         trial_obj = float(trial_res.objective) if np.isfinite(trial_res.objective) else float("inf")
                         rejected = _removal_causes_singularity(trial_res, result) or (
@@ -15090,6 +15387,7 @@ class HybridStateEstimator:
                 _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
+                _max_iter_cap=(18 if self.n_state >= 10000 else None),
             )
             result = trial_res
             fac_e = getattr(self, "_last_estimate_cholmod_factor", None)
@@ -15111,7 +15409,8 @@ class HybridStateEstimator:
             """单次混合电网贴边自救会话：最多连续推进 3 个子步直至收敛或全网无贴边，并刷新安全锚定初值 x0。"""
             nonlocal x0
             any_progressed = False
-            for _sub in range(3):
+            sub_lim = 1 if self.n_state >= 10000 else 3
+            for _sub in range(sub_lim):
                 if not _try_hybrid_boundary_node_rescue_once():
                     break
                 any_progressed = True
@@ -15146,6 +15445,7 @@ class HybridStateEstimator:
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
                 _hint_lm_damping=0.0,
+                _max_iter_cap=(14 if self.n_state >= 10000 else None),
             )
             prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
             cont_obj = float(cont_res.objective) if np.isfinite(cont_res.objective) else float("inf")
@@ -15186,6 +15486,7 @@ class HybridStateEstimator:
                 _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
+                _max_iter_cap=(40 if self.n_state >= 10000 else None),
             )
             prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
             flat_obj = float(flat_res.objective) if np.isfinite(flat_res.objective) else float("inf")

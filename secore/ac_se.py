@@ -10490,11 +10490,11 @@ class ACStateEstimator:
             severe_ac_warm = False
             if self.base_switch_re > self.n_angle:
                 vp_ac = x[self.n_angle : self.base_switch_re]
-                if vp_ac.size and (float(vp_ac.min()) < 0.82 or float(vp_ac.max()) > 1.18):
+                if vp_ac.size and (float(vp_ac.min()) < 0.88 or float(vp_ac.max()) > 1.12):
                     severe_ac_warm = True
             if (not severe_ac_warm) and self.n_angle > 0:
                 ap_ac = x[: self.n_angle]
-                if ap_ac.size and float(np.max(np.abs(ap_ac))) > 0.35:
+                if ap_ac.size and float(np.max(np.abs(ap_ac))) > 0.20:
                     severe_ac_warm = True
             if severe_ac_warm:
                 x_flat_ac = self.initial_state(flat=True)
@@ -10520,10 +10520,10 @@ class ACStateEstimator:
                         trim_aw = float(np.mean(np.partition(wr_aw, k85_ac - 1)[:k85_ac] ** 2))
                         trim_af = float(np.mean(np.partition(wr_af, k85_ac - 1)[:k85_ac] ** 2))
                         if np.isfinite(obj_af) and (
-                            (obj_aw > 10.0 * max(obj_af, 1.0) and obj_aw > 1.0e3)
-                            or (q75_aw > 2.5 * max(q75_af, 1.0) and q75_aw > 8.0)
-                            or (trim_aw > 4.0 * max(trim_af, 1.0) and trim_aw > 16.0)
-                            or (med_aw > 1.8 * max(med_af, 1.0) and med_aw > 3.5)
+                            (obj_aw > 8.0 * max(obj_af, 1.0) and obj_aw > 1.0e3)
+                            or (q75_aw > 1.8 * max(q75_af, 1.5) and q75_aw > 6.0)
+                            or (trim_aw > 3.0 * max(trim_af, 1.5) and trim_aw > 12.0)
+                            or (med_aw > 1.45 * max(med_af, 1.0) and med_aw > 3.0)
                         ):
                             x = x_flat_ac
                             cached_initial_H = None
@@ -10536,9 +10536,20 @@ class ACStateEstimator:
         )
         box_pin_cache: Dict = {}
         curv_aat_solver: Optional[CholmodAAtNormalEquationSolver] = None
+        cur_tbl_nf = self._common_measurement_plan_table(measurement_plan_tables).table
+        nf_zi_rows = (
+            np.flatnonzero(
+                (np.asarray(cur_tbl_nf.device_type_code, dtype=np.int16) == DEVICE_TYPE_ACPowerBalance)
+                & np.asarray(cur_tbl_nf.valid, dtype=bool)
+                & (weight > 0.0)
+            )
+            if (self.n_state >= 10000 and cur_tbl_nf is not None and int(cur_tbl_nf.idx.size) == n_meas)
+            else np.empty(0, dtype=np.int64)
+        )
         boundary_proj_streak = 0
         lm_guard_streak = 0
         frozen_fail_count = 0
+        noise_floor_streak = 0
         normal_operand = None
         gain = None
         prev_accepted_dx: Optional[np.ndarray] = None
@@ -10710,7 +10721,11 @@ class ACStateEstimator:
                 and prev_step_accepted
                 and factor_is_current_weights
                 and (
-                    (prev_max_correction < 2e-2 and last_factor_x_disp < 0.10 and frozen_steps < 3)
+                    (
+                        prev_max_correction < (5e-2 if self.n_state >= 5000 else 2e-2)
+                        and last_factor_x_disp < (0.15 if self.n_state >= 5000 else 0.10)
+                        and frozen_steps < (4 if self.n_state >= 5000 else 3)
+                    )
                     or local_warm_frozen
                 )
             ):
@@ -11622,6 +11637,17 @@ class ACStateEstimator:
                     final_quantities_current = True
                 break
 
+            if self.n_state >= 10000 and iteration >= 18 and np.isfinite(objective):
+                rel_obj_chg = abs(float(objective_change)) / max(abs(float(objective)), 1.0)
+                zi_nf_ok = bool(nf_zi_rows.size == 0 or float(np.max(np.abs(residual[nf_zi_rows]))) <= 5.0e-3)
+                if rel_obj_chg <= 2.0e-4 and prev_rms_correction <= 2.5e-2 and zi_nf_ok:
+                    noise_floor_streak += 1
+                    if noise_floor_streak >= 5 and iteration >= 22:
+                        final_quantities_current = False
+                        break
+                else:
+                    noise_floor_streak = 0
+
             coarse_v_healthy = True
             if v_cols_box.size > 0:
                 xv_c = x[v_cols_box]
@@ -11657,7 +11683,7 @@ class ACStateEstimator:
                     final_quantities_current = bool(aat_solver is not None and aat_solver.last_cholmod_factor is not None)
                     break
 
-        if not converged and flat_restart_enabled:
+        if not converged and flat_restart_enabled and not (self.n_state >= 10000 and iteration >= 18):
             restart_result = self.estimate(
                 measurements,
                 x0=self._file_state(),
@@ -11681,7 +11707,19 @@ class ACStateEstimator:
         alm_was_skipped = False
         alm_did_update_x = False
         # 交流全有效母线基尔霍夫功率守恒行终末增广拉格朗日（ALM）精修：不放大主迭代条件数即可消除混联与强粗差牵拉
-        if converged and (not coarse_stopped):
+        ac_alm_ready = (
+            (
+                converged
+                or (
+                    iteration >= 8
+                    and np.isfinite(objective)
+                    and (max_correction <= 1.0 or prev_rms_correction <= 5.0e-2)
+                    and not _state_out_of_bounds(x)
+                )
+            )
+            and (not coarse_stopped)
+        )
+        if ac_alm_ready:
             ac_tbl_alm = self._common_measurement_plan_table(measurement_plan_tables).table
             if ac_tbl_alm is not None and int(ac_tbl_alm.idx.size) == n_meas:
                 ac_dt_alm = np.asarray(ac_tbl_alm.device_type_code, dtype=np.int16)
@@ -11712,11 +11750,13 @@ class ACStateEstimator:
                             res_aa_true = residual.copy()
                             lam_ac_z = np.zeros(ac_zi_rows.size, dtype=np.float64)
                             alm_ac_solver = NormalEquationSolver(assume_fixed_pattern=False)
-                            for _ac_o in range(4):
+                            alm_ac_outer_lim = 3 if (self.n_state >= 10000 and not converged) else 4
+                            alm_ac_inner_lim = 2
+                            for _ac_o in range(alm_ac_outer_lim):
                                 if float(np.max(np.abs(res_aa_true[ac_zi_rows]))) <= 1.0e-5:
                                     break
                                 lam_ac_z = lam_ac_z + res_aa_true[ac_zi_rows]
-                                for _ac_i in range(2):
+                                for _ac_i in range(alm_ac_inner_lim):
                                     res_ac_s = res_aa_true.copy()
                                     res_ac_s[ac_zi_rows] += lam_ac_z
                                     obj_ac_s = self._weighted_objective(w_ac_alm, res_ac_s)
@@ -12419,6 +12459,51 @@ class ACStateEstimator:
         protected_keys: set = set()
         fast_final_verify = bool(getattr(self, "_bad_data_fast_final_verify", False))
         x0 = self.initial_state()
+        # 前向零分解热启动净化：避免 estimate_with_bad_data_removal 显式传入严重污染热启动 x0
+        # 绕过 estimate() 内置初值筛查，防止陷入畸变相角/电压盆地导致大批量误删健康测点
+        if (not self.flat_start) and n_base > 0:
+            chk_ac_bdr_warm = False
+            if self.base_switch_re > self.n_angle:
+                vp_bdr0 = x0[self.n_angle : self.base_switch_re]
+                if vp_bdr0.size and (float(vp_bdr0.min()) < 0.88 or float(vp_bdr0.max()) > 1.12):
+                    chk_ac_bdr_warm = True
+            if (not chk_ac_bdr_warm) and self.n_angle > 0:
+                ap_bdr0 = x0[: self.n_angle]
+                if ap_bdr0.size and float(np.max(np.abs(ap_bdr0))) > 0.20:
+                    chk_ac_bdr_warm = True
+            if chk_ac_bdr_warm:
+                x_flat_bdr0 = self.initial_state(flat=True)
+                real_bdr_m = (~base_is_pseudo) & (base_weights > 0.0) & (base_weights < 5000.0)
+                if not np.any(real_bdr_m):
+                    real_bdr_m = (~base_is_pseudo) & (base_weights > 0.0)
+                if np.any(real_bdr_m):
+                    z_bdr0 = np.asarray(base_table.value, dtype=np.float64)
+                    ze_bw = np.empty(n_base, dtype=np.float64)
+                    ze_bf = np.empty(n_base, dtype=np.float64)
+                    rw_b0 = np.empty(n_base, dtype=np.float64)
+                    rf_b0 = np.empty(n_base, dtype=np.float64)
+                    self.evaluate(x0, base_plan_tables, out=ze_bw)
+                    self._measurement_residual(z_bdr0, ze_bw, base_plan_tables, out=rw_b0)
+                    self.evaluate(x_flat_bdr0, base_plan_tables, out=ze_bf)
+                    self._measurement_residual(z_bdr0, ze_bf, base_plan_tables, out=rf_b0)
+                    if np.all(np.isfinite(rf_b0[real_bdr_m])):
+                        wb_rm = np.sqrt(base_weights[real_bdr_m])
+                        wr_bw = wb_rm * np.abs(rw_b0[real_bdr_m])
+                        wr_bf = wb_rm * np.abs(rf_b0[real_bdr_m])
+                        med_bw = float(np.median(wr_bw))
+                        med_bf = float(np.median(wr_bf))
+                        q75_bw = float(np.percentile(wr_bw, 75))
+                        q75_bf = float(np.percentile(wr_bf, 75))
+                        k85_b = max(1, int(0.85 * wr_bw.size))
+                        trim_bw = float(np.mean(np.partition(wr_bw, k85_b - 1)[:k85_b] ** 2))
+                        trim_bf = float(np.mean(np.partition(wr_bf, k85_b - 1)[:k85_b] ** 2))
+                        if (
+                            not np.all(np.isfinite(rw_b0[real_bdr_m]))
+                            or (med_bw > 1.65 * max(med_bf, 1.0) and med_bw > 4.0)
+                            or (q75_bw > 2.0 * max(q75_bf, 1.5) and q75_bw > 7.5)
+                            or (trim_bw > 3.2 * max(trim_bf, 1.5) and trim_bw > 14.0)
+                        ):
+                            x0 = x_flat_bdr0
         initial_obs = (
             self.observability_result
             if (
@@ -12804,7 +12889,14 @@ class ACStateEstimator:
             return None, None, None, False, False
 
         def _finalize_masked_result(cur_res: EstimateResult, cur_fac, norm_arr, *, run_terminal_alm: bool = True):
-            if run_terminal_alm and cur_res.converged and getattr(cur_res, "_alm_skipped", False):
+            if (
+                run_terminal_alm
+                and getattr(cur_res, "_alm_skipped", False)
+                and (
+                    cur_res.converged
+                    or (np.isfinite(cur_res.objective) and float(cur_res.max_correction) <= 1.0)
+                )
+            ):
                 alm_refined = self.estimate(
                     base_plan_tables,
                     x0=cur_res.x,
@@ -12817,7 +12909,7 @@ class ACStateEstimator:
                     _skip_terminal_alm=False,
                     _max_iter_cap=3,
                 )
-                if alm_refined.converged:
+                if alm_refined.converged or (not cur_res.converged and np.isfinite(alm_refined.objective)):
                     alm_refined.iterations += int(cur_res.iterations)
                     cur_res = alm_refined
             if not need_slice_finalize:
@@ -12896,7 +12988,15 @@ class ACStateEstimator:
                 return True
             prev_spd_bad = bool(getattr(prev_res, "_undamped_spd_failed", False))
             trial_spd_bad = bool(getattr(trial_res, "_undamped_spd_failed", False))
-            if trial_spd_bad or (not trial_res.converged):
+            skip_large_rank_chk = (
+                self.n_state >= 5000
+                and not trial_spd_bad
+                and (
+                    bool(getattr(trial_res, "_iter_capped", False))
+                    or bool(getattr(trial_res, "_coarse_stopped", False))
+                )
+            )
+            if (trial_spd_bad or (not trial_res.converged)) and not skip_large_rank_chk:
                 H_chk = trial_res.H if trial_res.H is not None else prev_res.H
                 if H_chk is not None and int(H_chk.shape[0]) == n_base:
                     if not check_active_structural_full_rank(H_chk, active_mask, masked_weights):
@@ -13097,6 +13197,7 @@ class ACStateEstimator:
                             _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
+                            _max_iter_cap=(18 if self.n_state >= 10000 else None),
                         )
                         trial_obj = float(trial_res.objective) if np.isfinite(trial_res.objective) else float("inf")
                         rejected = _removal_causes_singularity(trial_res, result) or (
@@ -13154,6 +13255,7 @@ class ACStateEstimator:
                             _value_override=masked_values,
                             _shared_aat_solver=shared_aat_solver,
                             _shared_aat_plan=shared_aat_plan,
+                            _max_iter_cap=(18 if self.n_state >= 10000 else None),
                         )
                         trial_obj = float(trial_res.objective) if np.isfinite(trial_res.objective) else float("inf")
                         rejected = _removal_causes_singularity(trial_res, result) or (
@@ -13252,6 +13354,7 @@ class ACStateEstimator:
                 _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
+                _max_iter_cap=(18 if self.n_state >= 10000 else None),
             )
             result = trial_res
             fac_p = getattr(self, "_last_estimate_cholmod_factor", None)
@@ -13269,7 +13372,8 @@ class ACStateEstimator:
             """单次贴边自救会话：最多连续推进 3 个子步直至收敛或全网无贴边，并刷新安全锚定初值 x0。"""
             nonlocal x0
             any_progressed = False
-            for _sub in range(3):
+            sub_lim = 1 if self.n_state >= 10000 else 3
+            for _sub in range(sub_lim):
                 if not _try_boundary_node_rescue_once():
                     break
                 any_progressed = True
@@ -13319,6 +13423,7 @@ class ACStateEstimator:
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
                 _hint_lm_damping=0.0,
+                _max_iter_cap=(14 if self.n_state >= 10000 else None),
             )
             prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
             cont_obj = float(cont_res.objective) if np.isfinite(cont_res.objective) else float("inf")
@@ -13355,6 +13460,7 @@ class ACStateEstimator:
                 _value_override=masked_values,
                 _shared_aat_solver=shared_aat_solver,
                 _shared_aat_plan=shared_aat_plan,
+                _max_iter_cap=(40 if self.n_state >= 10000 else None),
             )
             prev_obj = float(result.objective) if np.isfinite(result.objective) else float("inf")
             flat_obj = float(flat_res.objective) if np.isfinite(flat_res.objective) else float("inf")
