@@ -3258,6 +3258,8 @@ class FluidStateEstimator:
             micro_damp_resets = 0
             cached_z_est = cached_residual = cached_objective = None
 
+        pin_solver_cache: Dict[str, Any] = {}
+
         def _solve_step(H_cur: csr_matrix, res_cur: np.ndarray, damping_val: float, x_cur: Optional[np.ndarray] = None):
             """在无量纲标幺状态空间 x_pu = x / D_x 下组装并求解正规方程，再还原物理增量 dx = D_x * dx_pu。"""
             nonlocal aat_plan, gain
@@ -3302,7 +3304,7 @@ class FluidStateEstimator:
                     rhs_scaled = np.where(zero_mask_aat, 0.0, rhs_pu * col_scale)
                     if pinned_pot.size > 0:
                         dx_scaled, ok_pin = solve_box_pinned_normal_equations(
-                            A_scaled, None, rhs_scaled, pinned_pot, damping=eff_aat_damp
+                            A_scaled, None, rhs_scaled, pinned_pot, damping=eff_aat_damp, solver_cache=pin_solver_cache
                         )
                         if not ok_pin:
                             raise RuntimeError("Pinned fluid AAt solve failed")
@@ -3317,7 +3319,7 @@ class FluidStateEstimator:
                 else:
                     if pinned_pot.size > 0:
                         dx_raw, ok_pin = solve_box_pinned_normal_equations(
-                            A_pu, None, rhs_pu, pinned_pot, damping=0.0
+                            A_pu, None, rhs_pu, pinned_pot, damping=0.0, solver_cache=pin_solver_cache
                         )
                         if not ok_pin:
                             raise RuntimeError("Pinned fluid AAt solve failed")
@@ -3344,7 +3346,7 @@ class FluidStateEstimator:
                         rhs_scaled = rhs_pu * col_scale
                         if pinned_pot.size > 0:
                             dx_scaled, ok_pin = solve_box_pinned_normal_equations(
-                                A_scaled, None, rhs_scaled, pinned_pot, damping=1e-3
+                                A_scaled, None, rhs_scaled, pinned_pot, damping=1e-3, solver_cache=pin_solver_cache
                             )
                             if ok_pin:
                                 dx_pu = np.asarray(dx_scaled, dtype=np.float64) * col_scale
@@ -3531,9 +3533,10 @@ class FluidStateEstimator:
                 nonlocal x, z_est, residual, objective, cached_z_est, cached_residual, cached_objective
                 if pred_drop <= 0.0 or dx.size == 0 or not np.all(np.isfinite(dx)):
                     return False
+                pot_end_frac = 0.25 if float(self.network.potential_power) > 1.0 else 0.20
                 pf_end = (
-                    np.maximum(minimum, 0.25 * x[: self.n_potential])
-                    if (self.n_potential > 0 and float(self.network.potential_power) > 1.0)
+                    np.maximum(minimum, pot_end_frac * x[: self.n_potential])
+                    if self.n_potential > 0
                     else minimum
                 )
                 cand_end = np.clip(x + dx, state_lo, state_hi)
@@ -3600,11 +3603,12 @@ class FluidStateEstimator:
             # J = sum(w * r^2) 的梯度为 -2 * H^T W r = -2 * rhs
             ls_slope = -2.0 * float(np.dot(rhs, dx)) if (rhs is not None and rhs.size == dx.size) else 0.0
             obj_tol = max(1e-14, 1e-11 * (abs(objective) + 1.0))
-            # 可压缩流体（potential_power > 1.0，如蒸汽/天然气 u = P^2）采用内点法防穿零保正下界：
-            # 单步压势最多缩减至当前的 1/4，避免高压平启动首步将下游多压级节点拍入 1e-12 真空奇点（dP/du -> ∞）
+            # 对可压缩流体（u = P^2）与不可压缩水网/热网（u = P）统一启用内点法单步分数保正缓冲，
+            # 避免平启动初段大步长一步将大批盲区节点拍死在 1e-12 下界诱发贴墙锁死或真空奇点
+            pot_step_frac = 0.25 if float(self.network.potential_power) > 1.0 else 0.20
             pot_floor = (
-                np.maximum(minimum, 0.25 * x[: self.n_potential])
-                if (self.n_potential > 0 and float(self.network.potential_power) > 1.0)
+                np.maximum(minimum, pot_step_frac * x[: self.n_potential])
+                if self.n_potential > 0
                 else minimum
             )
             for _ in range(20):
@@ -4125,6 +4129,14 @@ class FluidStateEstimator:
                             break
                 finally:
                     weight = saved_f_w
+
+        pin_cached_s = pin_solver_cache.get("solver")
+        if pin_cached_s is not None and hasattr(pin_cached_s, "_reset_pardiso"):
+            try:
+                pin_cached_s._reset_pardiso()
+            except Exception:
+                pass
+        pin_solver_cache.clear()
 
         # 仅当终轮无阻尼且未开启 Huber 重加权时，缓存求解器与标幺线性因子句柄供坏数据杠杆复用
         if _huber_irls_k is None and last_used_damping == 0.0 and evaluated_at_final_x:
@@ -4713,10 +4725,15 @@ class FluidStateEstimator:
                     _max_iter_cap=final_f_cap,
                     _skip_terminal_alm=False,
                 )
+                ref_final_f_obj = (
+                    max(float(res.objective), float(getattr(res, "_wls_init_obj", res.objective)))
+                    if bool(getattr(res, "_from_huber_warmup", False))
+                    else float(res.objective)
+                )
                 if final_f_res.converged or (
                     (not res.converged)
                     and np.isfinite(final_f_res.objective)
-                    and final_f_res.objective <= res.objective * 1.05 + 1e-6
+                    and final_f_res.objective <= ref_final_f_obj * 1.05 + 1e-6
                 ):
                     if res.converged and not was_f_capped:
                         final_f_res.iterations += int(res.iterations)

@@ -9546,6 +9546,125 @@ def test_fluid_two_stage_zi_low_pressure_bdr_and_ac_corrupted_warmstart(tmp_path
     assert len(rem_ac_ids - {bad_ac_idx}) == 0
 
 
+def test_hydro_large_pinned_solver_unlock_and_interior_floor(tmp_path):
+    """验证 n_state >= 500 时贴墙约化求解器在任意低阻尼下不锁死及 600 节点高盲区高噪管网快速收敛。"""
+    from scipy.sparse import csc_matrix
+    from lfcore.hydro_lf import HydroPowerFlowCalc
+    from model.hydro_model import load_hydro_network_from_e_file
+    from secore.hydro_se import HydroStateEstimator
+    from secore.se_math import solve_box_pinned_normal_equations
+
+    # 1. 直接验证 n_state = 600 >= 500 时 solve_box_pinned_normal_equations 在 beta=0.0 与 beta=0.1 下均正常返回有限解
+    n_st = 600
+    rows_a, cols_a, vals_a = [], [], []
+    col_id = 0
+    for i in range(n_st):
+        rows_a.append(i)
+        cols_a.append(col_id)
+        vals_a.append(2.0)
+        col_id += 1
+        if i + 1 < n_st:
+            rows_a.extend([i, i + 1])
+            cols_a.extend([col_id, col_id])
+            vals_a.extend([1.0, -1.0])
+            col_id += 1
+    A_op = csc_matrix((vals_a, (rows_a, cols_a)), shape=(n_st, col_id), dtype=np.float64)
+    rhs_p = np.ones(n_st, dtype=np.float64)
+    pin_cols = np.asarray([5, 120, 480], dtype=np.intp)
+    pin_cache = {}
+    try:
+        for beta_chk in (0.0, 1.0e-3, 0.5):
+            dx_p, ok_p = solve_box_pinned_normal_equations(
+                A_op, None, rhs_p, pin_cols, damping=beta_chk, solver_cache=pin_cache
+            )
+            assert ok_p and dx_p.size == n_st and np.all(np.isfinite(dx_p))
+            assert np.all(dx_p[pin_cols] == 0.0)
+    finally:
+        ps = pin_cache.get("solver")
+        if ps is not None and hasattr(ps, "_reset_pardiso"):
+            ps._reset_pardiso()
+
+    # 2. 构造 600 节点高管导 Hydro 网络（超过 55% 盲区 + 12% 噪声 + 粗差），验证内点缓冲与低阻尼二阶收敛
+    rng = np.random.default_rng(20261129)
+    n_hy = 600
+    p0 = 22.0
+    h_lines = [
+        "<HydroMedium>",
+        "@ density compressibility molar_mass temperature flow_factor",
+        "# 0.08375 1.0 0.002016 288.15 1.0",
+        "</HydroMedium>",
+        "<HydroNode>",
+        "@ idx name pressure pressure_min pressure_max run_stat",
+    ]
+    for i in range(1, n_hy + 1):
+        h_lines.append(f"# {i} hyn_{i} {p0:.3f} 2.0 35.0 1")
+    h_lines += [
+        "</HydroNode>",
+        "<HydroSource>",
+        "@ idx name node control_type pressure_set flow_set alpha flow_min flow_max run_stat",
+        f"# 1 hysrc_1 1 PRESSURE {p0:.3f} 0.0 1.0 -9999.0 9999.0 1",
+        f"# 2 hysrc_2 150 PRESSURE {p0 + 0.15:.3f} 0.0 1.0 -9999.0 9999.0 1",
+        f"# 3 hysrc_3 300 PRESSURE {p0 + 0.10:.3f} 0.0 1.0 -9999.0 9999.0 1",
+        "</HydroSource>",
+        "<HydroLoad>",
+        "@ idx name node flow_set run_stat",
+    ]
+    zi_set = set(range(2, n_hy + 1, 3)) - {150, 300}
+    load_list = [i for i in range(2, n_hy + 1) if (i not in zi_set and i not in {150, 300})]
+    for k, nd in enumerate(load_list, start=1):
+        h_lines.append(f"# {k} hyld_{k} {nd} 0.03 1")
+    h_lines += [
+        "</HydroLoad>",
+        "<HydroPipe>",
+        "@ idx name i_node j_node conductance run_stat",
+    ]
+    for pid in range(2, n_hy + 1):
+        par = (pid - 2) // 4 + 1
+        h_lines.append(f"# {pid - 1} hyp_{pid - 1} {par} {pid} 85.0 1")
+    h_lines.append("</HydroPipe>")
+    hy_e = tmp_path / "hydro_600.e"
+    hy_e.write_text("\n".join(h_lines) + "\n", encoding="utf-8")
+
+    net_lf = load_hydro_network_from_e_file(str(hy_e))
+    lf_hy = HydroPowerFlowCalc(net_lf, parameters=LF_PARAMS.with_overrides(tol=1e-6, max_iter=80))
+    lf_hy.prepare()
+    assert lf_hy.run() == 0
+    p_arr = np.asarray(lf_hy.pressure, dtype=np.float64)
+    f_arr = np.asarray(lf_hy.edge_flow, dtype=np.float64)
+
+    m_lines = ["<Measurement>", "@ idx name dev_type dev_name meas_type weight valid value"]
+    mid = 1
+    for i in range(1, n_hy + 1):
+        vld = 1 if (i == 1 or rng.random() > 0.56) else 0
+        vp = float(p_arr[i - 1]) * (1.0 + float(rng.normal(0.0, 0.06)))
+        if i == 25 and vld == 1:
+            vp = 0.35 * float(p_arr[i - 1])
+        m_lines.append(f"# {mid} hm_{mid} HydroNode hyn_{i} PRESSURE 100.0 {vld} {vp:.5f}")
+        mid += 1
+    for e_i in range(n_hy - 1):
+        vld = 1 if rng.random() > 0.55 else 0
+        vf = float(f_arr[e_i]) * (1.0 + float(rng.normal(0.0, 0.06)))
+        m_lines.append(f"# {mid} hm_{mid} HydroPipe hyp_{e_i + 1} FLOW_FROM 25.0 {vld} {vf:.5f}")
+        mid += 1
+    m_lines.append("</Measurement>")
+    hy_m = tmp_path / "hydro_600.meas"
+    hy_m.write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+    est_hy = HydroStateEstimator(
+        load_hydro_network_from_e_file(str(hy_e)),
+        str(hy_m),
+        parameters=SE_PARAMS.with_overrides(max_iter=80, bad_threshold=4.0),
+        flat_start=True,
+    )
+    res_hy, _ = est_hy.estimate_with_bad_data_removal(threshold=4.0)
+    assert res_hy.converged and res_hy.iterations < 75
+    _, fl_hy, _ = est_hy._flow_state_arrays(res_hy.x, need_derivative=False)
+    f_ref_hy = max(float(np.max(np.abs(fl_hy))), 1.0)
+    nb_hy = np.asarray(est_hy.network.incidence @ fl_hy, dtype=np.float64)
+    zi_pos_hy = [nd_i - 1 for nd_i in sorted(zi_set)]
+    assert float(np.max(np.abs(nb_hy[zi_pos_hy]))) / f_ref_hy < 1.0e-4
+
+
 
 
 

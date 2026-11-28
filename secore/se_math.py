@@ -6056,9 +6056,10 @@ def run_huber_irls_warmup(
 
         accepted = False
         try_lam = lam
+        has_cholmod_hub = (CHOLMOD_ANALYZE_AAT is not None) or (CHOLMOD_CHOLESKY_AAT is not None)
         for _ls in range(10):
             if norm_op is not None:
-                allow_slow = (x.size < 500) or (try_lam >= 10.0)
+                allow_slow = (not has_cholmod_hub) or (x.size < 500) or (try_lam >= 10.0)
                 dx, _ = aat_solver.solve(
                     norm_op,
                     rhs,
@@ -6433,6 +6434,7 @@ def solve_box_pinned_normal_equations(
 
         pin_key = (tuple(int(c) for c in pinned_cols.tolist()), A_csc.shape, int(A_csc.nnz))
         pin_solver = None
+        own_pin_solver = False
         if solver_cache is not None:
             if solver_cache.get("key") == pin_key and solver_cache.get("solver") is not None:
                 pin_solver = solver_cache["solver"]
@@ -6444,20 +6446,27 @@ def solve_box_pinned_normal_equations(
                     except Exception:
                         pass
                 pin_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=True, ordering_method="amd")
-                pin_solver._pardiso_disabled = True
                 solver_cache["key"] = pin_key
                 solver_cache["solver"] = pin_solver
         else:
             pin_solver = CholmodAAtNormalEquationSolver(assume_fixed_pattern=False, ordering_method="amd")
-            pin_solver._pardiso_disabled = True
+            own_pin_solver = True
 
-        dx, _ = pin_solver.solve(
-            A_pin,
-            rhs_pin,
-            return_factor_diag=False,
-            damping=beta,
-            allow_slow_fallback=(n_state < 500 or beta >= 10.0),
-        )
+        has_cholmod_pin = (CHOLMOD_ANALYZE_AAT is not None) or (CHOLMOD_CHOLESKY_AAT is not None)
+        try:
+            dx, _ = pin_solver.solve(
+                A_pin,
+                rhs_pin,
+                return_factor_diag=False,
+                damping=beta,
+                allow_slow_fallback=((not has_cholmod_pin) or n_state < 500 or beta >= 10.0),
+            )
+        finally:
+            if own_pin_solver and hasattr(pin_solver, "_reset_pardiso"):
+                try:
+                    pin_solver._reset_pardiso()
+                except Exception:
+                    pass
         if dx.size == n_state and np.all(np.isfinite(dx)):
             dx[pinned_cols] = 0.0
             return dx, True
